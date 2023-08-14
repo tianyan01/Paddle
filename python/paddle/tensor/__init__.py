@@ -265,6 +265,7 @@ from .search import index_sample  # noqa: F401
 from .search import masked_select  # noqa: F401
 from .search import kthvalue  # noqa: F401
 from .search import mode  # noqa: F401
+from .search import beam_search_softmax  # noqa: F401
 
 from .stat import mean  # noqa: F401
 from .stat import std  # noqa: F401
@@ -515,6 +516,7 @@ tensor_method_func = [  # noqa
     'take',
     'bucketize',
     'sgn',
+    'beam_search_softmax',
 ]
 
 # this list used in math_op_patch.py for magic_method bind

@@ -16,6 +16,7 @@ from paddle.incubate.nn import functional as incubate_f
 from paddle.nn import Layer
 from paddle.framework import ParamAttr
 import paddle
+from paddle.nn import ParameterList
 from paddle.nn.layer.transformer import (
     _convert_attention_mask,
     _convert_param_attr_to_list,
@@ -269,6 +270,8 @@ class FusedMultiHeadAttention(Layer):
         num_heads,
         dropout_rate=0.5,
         attn_dropout_rate=0.5,
+        dropout_seed=None,
+        attn_dropout_seed=None,
         kdim=None,
         vdim=None,
         normalize_before=False,
@@ -377,6 +380,8 @@ class FusedMultiHeadAttention(Layer):
 
         self.dropout_rate = dropout_rate
         self.attn_dropout_rate = attn_dropout_rate
+        self.dropout_seed = dropout_seed
+        self.attn_dropout_seed = attn_dropout_seed
 
         self.name = name
 
@@ -434,6 +439,8 @@ class FusedMultiHeadAttention(Layer):
             attn_mask=attn_mask,
             dropout_rate=self.dropout_rate,
             attn_dropout_rate=self.attn_dropout_rate,
+            dropout_seed=self.dropout_seed,
+            attn_dropout_seed=self.attn_dropout_seed,
             ln_epsilon=self._epsilon,
             training=self.training,
             ring_id=self._ring_id,
@@ -546,6 +553,7 @@ class FusedFeedForward(Layer):
         epsilon=1e-05,
         activation="relu",
         act_dropout_rate=None,
+        seed=None,
         normalize_before=False,
         linear1_weight_attr=None,
         linear1_bias_attr=None,
@@ -582,6 +590,7 @@ class FusedFeedForward(Layer):
         self._act_dropout_rate = (
             dropout_rate if act_dropout_rate is None else act_dropout_rate
         )
+        self._seed = seed
         self._act_method = activation
         self._normalize_before = normalize_before
         self._epsilon = epsilon
@@ -661,6 +670,7 @@ class FusedFeedForward(Layer):
             self._ln2_bias,
             dropout1_rate=self._act_dropout_rate,
             dropout2_rate=self._dropout_rate,
+            seed=self._seed,
             activation=self._act_method,
             ln1_epsilon=self._epsilon,
             ln2_epsilon=self._epsilon,
@@ -1187,6 +1197,7 @@ class FusedMultiTransformer(Layer):
         trans_qkvw=True,
         ring_id=-1,
         name=None,
+        dy_to_st=False,
     ):
         super(FusedMultiTransformer, self).__init__()
 
@@ -1227,19 +1238,26 @@ class FusedMultiTransformer(Layer):
         dim_feedforward = dim_feedforward // nranks
         self._dim_feedforward = dim_feedforward
 
-        if isinstance(qkv_weight_attrs, (list, tuple)):
+        if isinstance(qkv_weight_attrs, (list, tuple, ParameterList)):
             num_layers = len(qkv_weight_attrs)
         assert num_layers > 0
 
-        self.ln_scales, self.ln_biases = [], []
-        self.qkv_weights, self.qkv_biases = [], []
-        self.linear_weights, self.linear_biases = [], []
-        self.ffn_ln_scales, self.ffn_ln_biases = [], []
-        self.ffn1_weights, self.ffn1_biases = [], []
-        self.ffn2_weights, self.ffn2_biases = [], []
-
+        # if not dy_to_st:
+        #     self.ln_scales, self.ln_biases = [], []
+        #     self.qkv_weights, self.qkv_biases = [], []
+        #     self.linear_weights, self.linear_biases = [], []
+        #     self.ffn_ln_scales, self.ffn_ln_biases = [], []
+        #     self.ffn1_weights, self.ffn1_biases = [], []
+        #     self.ffn2_weights, self.ffn2_biases = [], []
+        # else:
+        self.ln_scales, self.ln_biases = ParameterList(), ParameterList()
+        self.qkv_weights, self.qkv_biases = ParameterList(), ParameterList()
+        self.linear_weights, self.linear_biases = ParameterList(), ParameterList()
+        self.ffn_ln_scales, self.ffn_ln_biases = ParameterList(), ParameterList()
+        self.ffn1_weights, self.ffn1_biases = ParameterList(), ParameterList()
+        self.ffn2_weights, self.ffn2_biases = ParameterList(), ParameterList()
         def get_attr(attrs, idx):
-            if isinstance(attrs, (list, tuple)):
+            if isinstance(attrs, (list, tuple, ParameterList)):
                 assert len(attrs) == num_layers
                 return attrs[idx]
             return attrs
@@ -1263,9 +1281,10 @@ class FusedMultiTransformer(Layer):
                 attr=ln_scale_attr,
                 shape=[embed_dim],
                 default_initializer=Constant(value=1.0),
+                dtype="float32",
             )
             ln_bias = self.create_parameter(
-                attr=ln_bias_attr, shape=[embed_dim], is_bias=True
+                attr=ln_bias_attr, shape=[embed_dim], is_bias=True, dtype="float32"
             )
             qkv_weight = self.create_parameter(
                 shape=[3, num_heads, self.head_dim, embed_dim]
@@ -1299,9 +1318,10 @@ class FusedMultiTransformer(Layer):
                 attr=ffn_ln_scale_attr,
                 is_bias=False,
                 default_initializer=Constant(1.0),
+                dtype="float32",
             )
             ffn_ln_bias = self.create_parameter(
-                shape=[embed_dim], attr=ffn_ln_bias_attr, is_bias=True
+                shape=[embed_dim], attr=ffn_ln_bias_attr, is_bias=True, dtype="float32"
             )
             ffn1_weight = self.create_parameter(
                 shape=[embed_dim, dim_feedforward],
@@ -1418,3 +1438,20 @@ class FusedMultiTransformer(Layer):
             name=self.name,
         )
         return out
+
+    def _amp_decorate(self, dtype):
+        # tmp fix for amp.decorator(O2)
+        def trans_to_fp16(l):
+            for param in l:
+                if param is not None:
+                    with no_grad():
+                        param_applied = _to_dtype(param, dtype)
+        trans_to_fp16(self.qkv_weights)
+        trans_to_fp16(self.qkv_biases)
+        trans_to_fp16(self.linear_weights)
+        trans_to_fp16(self.linear_biases)
+        trans_to_fp16(self.ffn1_weights)
+        trans_to_fp16(self.ffn1_biases)
+        trans_to_fp16(self.ffn2_weights)
+        trans_to_fp16(self.ffn2_biases)
+        self._dtype = dtype
