@@ -40,6 +40,7 @@ def fused_feedforward(
     ln2_bias=None,
     dropout1_rate=0.5,
     dropout2_rate=0.5,
+    seed=None,
     activation="relu",
     ln1_epsilon=1e-5,
     ln2_epsilon=1e-5,
@@ -123,7 +124,7 @@ def fused_feedforward(
     _verify_dropout_rate(dropout1_rate)
     _verify_dropout_rate(dropout2_rate)
 
-    seed = None
+    # seed = None
     if mode not in ('downscale_in_infer', 'upscale_in_train'):
         raise ValueError(
             "mode argument should be 'downscale_in_infer' or 'upscale_in_train'"
@@ -133,8 +134,8 @@ def fused_feedforward(
     )  # semantic transfer
 
     if _non_static_mode():
-        if default_main_program().random_seed != 0:
-            seed = default_main_program().random_seed
+        # if default_main_program().random_seed != 0:
+        #     seed = default_main_program().random_seed
         out, _, _, _, _, _, _, _, _, _, _ = _legacy_C_ops.fused_feedforward(
             x,
             None,
@@ -221,8 +222,8 @@ def fused_feedforward(
         x.dtype, stop_gradient=True
     )
 
-    if (seed is None or seed == 0) and helper.main_program.random_seed != 0:
-        seed = helper.main_program.random_seed
+    # if (seed is None or seed == 0) and helper.main_program.random_seed != 0:
+    #     seed = helper.main_program.random_seed
 
     helper.append_op(
         type='fused_feedforward',
@@ -477,6 +478,8 @@ def fused_multi_head_attention(
     attn_mask=None,
     dropout_rate=0.5,
     attn_dropout_rate=0.5,
+    dropout_seed=None,
+    attn_dropout_seed=None,
     ln_epsilon=1e-05,
     training=True,
     mode='upscale_in_train',
@@ -602,7 +605,7 @@ def fused_multi_head_attention(
             print(output.shape)
     """
 
-    seed = None
+    # seed = None
     if mode not in ('downscale_in_infer', 'upscale_in_train'):
         raise ValueError(
             "mode argument should be 'downscale_in_infer' or 'upscale_in_train'"
@@ -612,8 +615,8 @@ def fused_multi_head_attention(
     )  # semantic transfer
 
     if _non_static_mode():
-        if default_main_program().random_seed != 0:
-            seed = default_main_program().random_seed
+        # if default_main_program().random_seed != 0:
+        #     seed = default_main_program().random_seed
         # pre_ln_mean, pre_ln_variance, pre_ln_out, qkv_out, qkv_bias_out, transpose_out, qk_out,
         # qktv_out, softmax_out, attn_dropout_mask_out, attn_dropout_out, attn_mask_out, fmha_out,
         # linear_out, dropout_mask_out, ln_mean_out, ln_var_out, bias_dropout_residual_out, final_out
@@ -678,13 +681,13 @@ def fused_multi_head_attention(
             'is_test',
             not training,
             'attn_dropout_fix_seed',
-            seed is not None,
+            attn_dropout_seed is not None,
             'dropout_fix_seed',
-            seed is not None,
+            dropout_seed is not None,
             'attn_dropout_seed',
-            seed if seed is not None else 0,
+            attn_dropout_seed if attn_dropout_seed is not None else 0,
             'dropout_seed',
-            seed if seed is not None else 0,
+            dropout_seed if dropout_seed is not None else 0,
             'attn_dropout_implementation',
             mode,
             'dropout_implementation',
@@ -735,8 +738,8 @@ def fused_multi_head_attention(
         if cache_kv:
             inputs['CacheKV'] = [cache_kv]
 
-        if (seed is None or seed == 0) and helper.main_program.random_seed != 0:
-            seed = helper.main_program.random_seed
+        # if (seed is None or seed == 0) and helper.main_program.random_seed != 0:
+        #     seed = helper.main_program.random_seed
 
         # set attrs
         attrs = {
@@ -746,10 +749,10 @@ def fused_multi_head_attention(
             'dropout_rate': dropout_rate,
             'attn_dropout_rate': attn_dropout_rate,
             'is_test': not training,
-            'attn_dropout_fix_seed': seed is not None,
-            'dropout_fix_seed': seed is not None,
-            'attn_dropout_seed': seed if seed is not None else 0,
-            'dropout_seed': seed if seed is not None else 0,
+            'attn_dropout_fix_seed': attn_dropout_seed is not None,
+            'dropout_fix_seed': dropout_seed is not None,
+            'attn_dropout_seed': attn_dropout_seed if attn_dropout_seed is not None else 0,
+            'dropout_seed': dropout_seed if dropout_seed is not None else 0,
             'attn_dropout_implementation': mode,
             'dropout_implementation': mode,
             'add_residual': add_residual,
@@ -998,21 +1001,21 @@ def fused_multi_transformer(
     if _non_static_mode():
         cache_kv_out, final_out = _legacy_C_ops.fused_multi_transformer(
             x,
-            ln_scales,
-            ln_biases,
-            qkv_weights,
-            qkv_biases,
+            list(ln_scales),
+            list(ln_biases),
+            list(qkv_weights),
+            list(qkv_biases),
             cache_kvs,
             time_step,
             attn_mask,
-            linear_weights,
-            linear_biases,
-            ffn_ln_scales,
-            ffn_ln_biases,
-            ffn1_weights,
-            ffn1_biases,
-            ffn2_weights,
-            ffn2_biases,
+            list(linear_weights),
+            list(linear_biases),
+            list(ffn_ln_scales),
+            list(ffn_ln_biases),
+            list(ffn1_weights),
+            list(ffn1_biases),
+            list(ffn2_weights),
+            list(ffn2_biases),
             cache_kvs,
             'pre_layer_norm',
             pre_layer_norm,
@@ -1048,29 +1051,29 @@ def fused_multi_transformer(
         # set inputs
         inputs = dict()
         inputs['X'] = [x]
-        inputs['LnScale'] = ln_scales
-        inputs['LnBias'] = ln_biases
-        inputs['QKVW'] = qkv_weights
+        inputs['LnScale'] = list(ln_scales)
+        inputs['LnBias'] = list(ln_biases)
+        inputs['QKVW'] = list(qkv_weights)
         if qkv_biases is not None:
-            inputs['QKVBias'] = qkv_biases
+            inputs['QKVBias'] = list(qkv_biases)
         if cache_kvs is not None:
             assert len(cache_kvs) == len(qkv_weights)
             inputs['CacheKV'] = cache_kvs
             if time_step is not None:
                 inputs['TimeStep'] = time_step
         inputs['SrcMask'] = attn_mask
-        inputs['OutLinearW'] = linear_weights
+        inputs['OutLinearW'] = list(linear_weights)
         if linear_biases is not None:
-            inputs['OutLinearBias'] = linear_biases
+            inputs['OutLinearBias'] = list(linear_biases)
 
-        inputs['FFNLnScale'] = ffn_ln_scales
-        inputs['FFNLnBias'] = ffn_ln_biases
-        inputs['FFN1Weight'] = ffn1_weights
+        inputs['FFNLnScale'] = list(ffn_ln_scales)
+        inputs['FFNLnBias'] = list(ffn_ln_biases)
+        inputs['FFN1Weight'] = list(ffn1_weights)
         if ffn1_biases is not None:
-            inputs['FFN1Bias'] = ffn1_biases
-        inputs['FFN2Weight'] = ffn2_weights
+            inputs['FFN1Bias'] = list(ffn1_biases)
+        inputs['FFN2Weight'] = list(ffn2_weights)
         if ffn2_biases is not None:
-            inputs['FFN2Bias'] = ffn2_biases
+            inputs['FFN2Bias'] = list(ffn2_biases)
 
         # set attrs
         attrs = {

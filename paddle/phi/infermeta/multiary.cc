@@ -674,6 +674,57 @@ void BatchNormInferInferMeta(const MetaTensor& x,
                      config);
 }
 
+void BeamSearchSoftmaxInferMeta(const MetaTensor& logits,
+                                const MetaTensor& cum_scores,
+                                const MetaTensor& sequence_lengths,
+                                const MetaTensor& stop_flags,
+                                const MetaTensor& end_ids,
+                                const MetaTensor& step_ids,
+                                const MetaTensor& last_cache_ids,
+                                const MetaTensor& last_beam_offsets,
+                                int beam_size,
+                                int max_seq_len,
+                                int max_dec_len,
+                                bool fuse_softmax,
+                                bool early_stop,
+                                MetaTensor* ids_this_time,
+                                MetaTensor* out_cum_scores,
+                                MetaTensor* cache_ids,
+                                MetaTensor* beam_offsets,
+                                MetaTensor* parent_idx,
+                                MetaTensor* stop_flags_out,
+                                MetaTensor* seq_lens_out,
+                                MetaTensor* step_ids_out) {
+  auto logits_dims = logits.dims();
+  auto logits_dtype = logits.dtype();
+  int bbm = logits_dims[0];
+
+  ids_this_time->set_dims({bbm, 1});
+  ids_this_time->share_lod(cum_scores);
+  ids_this_time->set_dtype(DataType::INT32);
+  cache_ids->set_dims({bbm, max_dec_len});
+  cache_ids->share_lod(cum_scores);
+  cache_ids->set_dtype(DataType::INT32);
+  beam_offsets->set_dims({1, bbm, max_seq_len + max_dec_len});
+  beam_offsets->share_lod(cum_scores);
+  beam_offsets->set_dtype(DataType::INT32);
+  parent_idx->set_dims({bbm});
+  parent_idx->share_lod(cum_scores);
+  parent_idx->set_dtype(DataType::INT32);
+  out_cum_scores->set_dims({bbm});
+  out_cum_scores->share_lod(cum_scores);
+  out_cum_scores->set_dtype(logits_dtype);
+  stop_flags_out->set_dims({bbm, 1});
+  stop_flags_out->share_lod(cum_scores);
+  stop_flags_out->set_dtype(DataType::BOOL);
+  seq_lens_out->set_dims({bbm, 1});
+  seq_lens_out->share_lod(cum_scores);
+  seq_lens_out->set_dtype(DataType::INT32);
+  step_ids_out->set_dims({bbm, 1});
+  step_ids_out->share_lod(cum_scores);
+  step_ids_out->set_dtype(DataType::INT32);
+}
+
 void BilinearTensorProductInferMeta(const MetaTensor& x,
                                     const MetaTensor& y,
                                     const MetaTensor& weight,
