@@ -186,13 +186,13 @@ def pure_fp16_initialize(models):
             if (layer._dtype == 'float16') or isinstance(
                     layer, (paddle.nn.BatchNorm, paddle.nn.BatchNorm1D,
                             paddle.nn.BatchNorm2D, paddle.nn.BatchNorm3D,
-                            paddle.nn.LayerNorm, paddle.nn.SyncBatchNorm,
-                            paddle.nn.ParameterList)):
+                            paddle.nn.LayerNorm, paddle.nn.SyncBatchNorm, paddle.nn.ParameterList)):
                 # tianyan01 add paddle.nn.ParameterList, hack
                 continue
             if isinstance(layer, (paddle.incubate.nn.FusedFeedForward,
                                   paddle.incubate.nn.FusedMultiHeadAttention,
-                                  paddle.incubate.nn.FusedMultiTransformer)):
+                                  paddle.incubate.nn.FusedMultiTransformer,
+                                  paddle.incubate.nn.FusedMoELayer)):
                 layer._amp_decorate(dtype='float16')
                 continue
             layer._to_impl(dtype='float16',

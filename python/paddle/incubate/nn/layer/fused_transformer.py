@@ -16,6 +16,8 @@ from paddle.incubate.nn import functional as incubate_f
 from paddle.nn import Layer
 from paddle.framework import ParamAttr
 import paddle
+import paddle.nn as nn
+from paddle import _legacy_C_ops
 from paddle.nn import ParameterList
 from paddle.nn.layer.transformer import (
     _convert_attention_mask,
@@ -1454,4 +1456,170 @@ class FusedMultiTransformer(Layer):
         trans_to_fp16(self.ffn1_biases)
         trans_to_fp16(self.ffn2_weights)
         trans_to_fp16(self.ffn2_biases)
+        self._dtype = dtype
+
+
+class FusedMoELayer(Layer):
+    """FusedMoE Layer
+    Args:
+        d_model: (int) model dimention
+        num_expert: (int) expert count
+        top_k: (int) top-k number
+        some weights and bias...
+        moe_group: moe group for experts communication
+        mp_group: mp group for mp commutication
+    Examples:
+        .. code-block:: python
+        # required: gpu
+        import paddle
+        from paddle.incubate.nn import FusedMoELayer
+
+        # input: [batch_size, src_len, d_model]
+        input = paddle.rand((2, 4, 128))
+        # dim_feedforward = 128
+        fused_moe_layer = FusedMoELayer(128, 128, 4, 2)
+        output = fused_moe_layer(input)  # [2, 4, 128]
+        
+    """
+
+    def __init__(self,
+                 d_model,
+                 dim_feedforward,
+                 num_expert,
+                 top_k,
+                 ln_scale=None,
+                 ln_bias=None,
+                 gate_weight=None,
+                 gate_bias=None,
+                 linear1_weights=None,
+                 linear1_biases=None,
+                 linear2_weights=None,
+                 linear2_biases=None,
+                 moe_group=None,
+                 mp_group=None):
+        super(FusedMoELayer, self).__init__()
+        # only support mp/dp
+        self.group = moe_group
+
+        self.world_size = 1
+        if self.group is not None:
+            self.world_size = self.group.nranks
+        self.num_expert = num_expert
+
+        self.mp_group = mp_group
+        self.mp_rank = 0
+        self.mp_size = 1
+        if mp_group is not None and mp_group.nranks > 1:
+            self.mp_rank = mp_group.rank
+            self.mp_size = mp_group.nranks
+        self.d_model = d_model
+        self.top_k = top_k
+        self.ln_scale = self.create_parameter(
+                shape=[d_model],
+                attr=None,
+                is_bias=False
+            )
+        self.ln_bias = self.create_parameter(
+            shape=[d_model], attr=None, is_bias=True
+        )
+        self.gate_weight = self.create_parameter(
+                shape=[d_model, num_expert * self.world_size],
+                attr=None,
+                dtype=self._dtype,
+                is_bias=False
+            )
+        self.gate_bias = self.create_parameter(
+            shape=[num_expert * self.world_size], 
+            attr=None, 
+            dtype=self._dtype,
+            is_bias=True
+        )
+
+        self.linear1_weights = ParameterList()
+        self.linear2_weights = ParameterList()
+        self.linear1_biases = ParameterList()
+        self.linear2_biases = ParameterList()
+        def get_attr(attrs, idx):
+            if isinstance(attrs, (list, tuple, ParameterList)):
+                assert len(attrs) == num_expert
+                return attrs[idx]
+            return attrs
+        for i in range(num_expert):
+            w1 = get_attr(linear1_weights, i)
+            b1 = get_attr(linear1_biases, i)
+            w2 = get_attr(linear2_weights, i)
+            b2 = get_attr(linear2_biases, i)
+
+            self.linear1_weights.append(self.create_parameter(
+                                            shape=[d_model, dim_feedforward],
+                                            attr=w1,
+                                            dtype=self._dtype,
+                                            is_bias=False,
+                                            default_initializer=nn.initializer.KaimingUniform()
+            ))
+            self.linear2_weights.append(self.create_parameter(
+                                            shape=[dim_feedforward, d_model],
+                                            attr=w2,
+                                            dtype=self._dtype,
+                                            is_bias=False,
+                                            default_initializer=nn.initializer.KaimingUniform()
+            ))
+            self.linear1_biases.append(self.create_parameter(
+                                            shape=[dim_feedforward],
+                                            attr=b1,
+                                            dtype=self._dtype,
+                                            is_bias=True,
+                                            default_initializer=nn.initializer.Constant(value=0.0)
+            ))
+            self.linear2_biases.append(self.create_parameter(
+                                            shape=[d_model],
+                                            attr=b2,
+                                            dtype=self._dtype,
+                                            is_bias=True,
+                                            default_initializer=nn.initializer.Constant(value=0.0)
+            ))
+        
+    def forward(self, inp):
+        inp = _legacy_C_ops.fused_moe(
+            inp,
+            self.gate_weight,
+            self.gate_bias,
+            self.ln_scale,
+            self.ln_bias,
+            list(self.linear1_weights),
+            list(self.linear1_biases),
+            list(self.linear2_weights),
+            list(self.linear2_biases),
+            'pre_layer_norm',
+            True,
+            'ln_epsilon',
+            1e-5,
+            'topk',
+            self.top_k,
+            'mp_size',
+            self.mp_size,
+            'mp_rank',
+            self.mp_rank,
+            'num_expert',
+            self.num_expert,
+            'world_size',
+            self.world_size,
+            'moe_ring_id',
+            -1 if self.group is None else self.group.id
+        )
+        return inp
+    
+    def _amp_decorate(self, dtype):
+        # tmp fix for amp.decorator(O2)
+        def trans_to_fp16(l):
+            for param in l:
+                if param is not None:
+                    with paddle.no_grad():
+                        param_applied = _to_dtype(param, dtype)
+        trans_to_fp16(self.linear1_weights)
+        trans_to_fp16(self.linear1_biases)
+        trans_to_fp16(self.linear2_weights)
+        trans_to_fp16(self.linear2_biases)
+        _ = _to_dtype(self.gate_weight, dtype)
+        _ = _to_dtype(self.gate_bias, dtype)
         self._dtype = dtype

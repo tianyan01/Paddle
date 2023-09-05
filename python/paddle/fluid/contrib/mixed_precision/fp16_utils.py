@@ -112,6 +112,8 @@ def _keep_fp32_input(op, in_name):
         }
     if op_type == 'fused_multi_transformer':
         return in_name in {'LnScale', 'LnBias', 'FFNLnScale', 'FFNLnBias'}
+    if op_type == 'fused_moe':
+        return in_name in {'LnScale', 'LnBias'}
     return False
 
 
