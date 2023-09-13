@@ -17,7 +17,7 @@ from paddle.nn import Layer
 from paddle.framework import ParamAttr
 import paddle
 import paddle.nn as nn
-from paddle import _legacy_C_ops
+from paddle import _legacy_C_ops, _C_ops
 from paddle.nn import ParameterList
 from paddle.nn.layer.transformer import (
     _convert_attention_mask,
@@ -1487,6 +1487,9 @@ class FusedMoELayer(Layer):
                  dim_feedforward,
                  num_expert,
                  top_k,
+                 approximate,
+                 moe_group=None,
+                 mp_group=None,
                  ln_scale=None,
                  ln_bias=None,
                  gate_weight=None,
@@ -1494,9 +1497,7 @@ class FusedMoELayer(Layer):
                  linear1_weights=None,
                  linear1_biases=None,
                  linear2_weights=None,
-                 linear2_biases=None,
-                 moe_group=None,
-                 mp_group=None):
+                 linear2_biases=None):
         super(FusedMoELayer, self).__init__()
         # only support mp/dp
         self.group = moe_group
@@ -1514,6 +1515,7 @@ class FusedMoELayer(Layer):
             self.mp_size = mp_group.nranks
         self.d_model = d_model
         self.top_k = top_k
+        self.approximate = approximate
         self.ln_scale = self.create_parameter(
                 shape=[d_model],
                 attr=None,
@@ -1578,9 +1580,13 @@ class FusedMoELayer(Layer):
                                             is_bias=True,
                                             default_initializer=nn.initializer.Constant(value=0.0)
             ))
+            self.linear1_weights[i].name = "expert_" + self.linear1_weights[i].name
+            self.linear2_weights[i].name = "expert_" + self.linear2_weights[i].name
+            self.linear1_biases[i].name = "expert_" + self.linear1_biases[i].name
+            self.linear2_biases[i].name = "expert_" + self.linear2_biases[i].name
         
     def forward(self, inp):
-        inp = _legacy_C_ops.fused_moe(
+        inp = _C_ops.fused_moe_kernel(
             inp,
             self.gate_weight,
             self.gate_bias,
@@ -1590,22 +1596,15 @@ class FusedMoELayer(Layer):
             list(self.linear1_biases),
             list(self.linear2_weights),
             list(self.linear2_biases),
-            'pre_layer_norm',
             True,
-            'ln_epsilon',
             1e-5,
-            'topk',
             self.top_k,
-            'mp_size',
             self.mp_size,
-            'mp_rank',
             self.mp_rank,
-            'num_expert',
             self.num_expert,
-            'world_size',
             self.world_size,
-            'moe_ring_id',
-            -1 if self.group is None else self.group.id
+            -1 if self.group is None else self.group.id,
+            self.approximate
         )
         return inp
     
