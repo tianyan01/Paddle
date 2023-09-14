@@ -166,7 +166,6 @@ gray_list = {
     'concat',
     'split',
     'fused_feedforward',
-    'fused_moe',
     'fused_attention',
     'fused_multi_transformer',
 }

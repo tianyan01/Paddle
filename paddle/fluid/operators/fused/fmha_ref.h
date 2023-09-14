@@ -117,7 +117,7 @@ class FMHARef {
       out_seq_len = cache_kv_out_tensor->dims()[3];
     } else {
       if (cache_kv_out_tensor) {
-	*cache_kv_out_tensor = transpose_2_out_tensor->Slice(1, 3);
+        *cache_kv_out_tensor = transpose_2_out_tensor->Slice(1, 3);
       }
     }
 

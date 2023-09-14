@@ -2253,6 +2253,13 @@ void MultiplexInferMeta(const std::vector<const MetaTensor*>& ins,
   out->set_dtype(ins[0]->dtype());
 }
 
+void NumberCountInferMeta(const MetaTensor& numbers,
+                          int upper_range,
+                          MetaTensor* out) {
+  out->set_dims({upper_range});
+  out->set_dtype(DataType::INT64);
+}
+
 void PsroiPoolInferMeta(const MetaTensor& x,
                         const MetaTensor& rois,
                         const MetaTensor& rois_num,
@@ -2939,6 +2946,29 @@ void GraphSendUVInferMeta(const MetaTensor& x,
                                      axis);
   out_dims_array.insert(out_dims_array.begin(), src_index_dims[0]);
   out->set_dims(phi::make_ddim(out_dims_array));
+}
+
+void FusedMoeInferMeta(const MetaTensor& x,
+                       const MetaTensor& gate_weight,
+                       const MetaTensor& gate_bias,
+                       const MetaTensor& ln_scale,
+                       const MetaTensor& ln_bias,
+                       const std::vector<const MetaTensor*>& experts_weight1,
+                       const std::vector<const MetaTensor*>& experts_bias1,
+                       const std::vector<const MetaTensor*>& experts_weight2,
+                       const std::vector<const MetaTensor*>& experts_bias2,
+                       bool pre_layer_norm,
+                       float ln_epsilon,
+                       int topk,
+                       int mp_size,
+                       int mp_rank,
+                       int num_expert,
+                       int world_size,
+                       int moe_ring_id,
+                       bool approximate,
+                       MetaTensor* out) {
+  out->set_dims(x.dims());
+  out->set_dtype(x.dtype());
 }
 
 }  // namespace phi

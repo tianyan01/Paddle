@@ -427,6 +427,10 @@ void MultiplexInferMeta(const std::vector<const MetaTensor*>& ins,
                         const MetaTensor& ids,
                         MetaTensor* out);
 
+void NumberCountInferMeta(const MetaTensor& numbers,
+                          int upper_range,
+                          MetaTensor* out);
+
 void PsroiPoolInferMeta(const MetaTensor& x,
                         const MetaTensor& rois,
                         const MetaTensor& rois_num,
@@ -540,4 +544,23 @@ void GraphSendUVInferMeta(const MetaTensor& x,
                           const std::string& message_op,
                           MetaTensor* out);
 
+void FusedMoeInferMeta(const MetaTensor& x,
+                       const MetaTensor& gate_weight,
+                       const MetaTensor& gate_bias,
+                       const MetaTensor& ln_scale,
+                       const MetaTensor& ln_bias,
+                       const std::vector<const MetaTensor*>& experts_weight1,
+                       const std::vector<const MetaTensor*>& experts_bias1,
+                       const std::vector<const MetaTensor*>& experts_weight2,
+                       const std::vector<const MetaTensor*>& experts_bias2,
+                       bool pre_layer_norm,
+                       float ln_epsilon,
+                       int topk,
+                       int mp_size,
+                       int mp_rank,
+                       int num_expert,
+                       int world_size,
+                       int moe_ring_id,
+                       bool approximate,
+                       MetaTensor* out);
 }  // namespace phi
