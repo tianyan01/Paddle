@@ -190,6 +190,28 @@ void BatchNormInferInferMeta(const MetaTensor& x,
                              MetaTensor* variance_out,
                              MetaConfig config = MetaConfig());
 
+void BeamSearchSoftmaxInferMeta(const MetaTensor& logits,
+                                const MetaTensor& cum_scores,
+                                const MetaTensor& sequence_lengths,
+                                const MetaTensor& stop_flags,
+                                const MetaTensor& end_ids,
+                                const MetaTensor& step_ids,
+                                const MetaTensor& last_cache_ids,
+                                const MetaTensor& last_beam_offsets,
+                                int beam_size,
+                                int max_seq_len,
+                                int max_dec_len,
+                                bool fuse_softmax,
+                                bool early_stop,
+                                MetaTensor* ids_this_time,
+                                MetaTensor* out_cum_scores,
+                                MetaTensor* cache_ids,
+                                MetaTensor* beam_offsets,
+                                MetaTensor* parent_idx,
+                                MetaTensor* stop_flags_out,
+                                MetaTensor* seq_lens_out,
+                                MetaTensor* step_ids_out);
+
 void BilinearTensorProductInferMeta(const MetaTensor& x,
                                     const MetaTensor& y,
                                     const MetaTensor& weight,
@@ -405,6 +427,10 @@ void MultiplexInferMeta(const std::vector<const MetaTensor*>& ins,
                         const MetaTensor& ids,
                         MetaTensor* out);
 
+void NumberCountInferMeta(const MetaTensor& numbers,
+                          int upper_range,
+                          MetaTensor* out);
+
 void PsroiPoolInferMeta(const MetaTensor& x,
                         const MetaTensor& rois,
                         const MetaTensor& rois_num,
@@ -518,4 +544,23 @@ void GraphSendUVInferMeta(const MetaTensor& x,
                           const std::string& message_op,
                           MetaTensor* out);
 
+void FusedMoeInferMeta(const MetaTensor& x,
+                       const MetaTensor& gate_weight,
+                       const MetaTensor& gate_bias,
+                       const MetaTensor& ln_scale,
+                       const MetaTensor& ln_bias,
+                       const std::vector<const MetaTensor*>& experts_weight1,
+                       const std::vector<const MetaTensor*>& experts_bias1,
+                       const std::vector<const MetaTensor*>& experts_weight2,
+                       const std::vector<const MetaTensor*>& experts_bias2,
+                       bool pre_layer_norm,
+                       float ln_epsilon,
+                       int topk,
+                       int mp_size,
+                       int mp_rank,
+                       int num_expert,
+                       int world_size,
+                       int moe_ring_id,
+                       bool approximate,
+                       MetaTensor* out);
 }  // namespace phi

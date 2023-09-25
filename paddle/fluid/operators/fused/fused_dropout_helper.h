@@ -212,31 +212,57 @@ class FusedDropoutHelper {
                       const float quant_next_in_scale = 1.0,
                       const int quant_round_type = 1,
                       const float quant_max_bound = 127.0,
-                      const float quant_min_bound = -127.0) {
+                      const float quant_min_bound = -127.0,
+                      bool approximate = false) {
     auto increment = GetIncrement(ctx);
     if (act_method == "gelu") {
-      GeluFunctor<T> gelu;
-      LaunchDropoutActBias<T, MaskType, GeluFunctor<T>, InType, OutType>(
-          gelu,
-          dropout_param_.seed,
-          rows_,
-          cols_,
-          dropout_param_.increment,
-          dropout_param_.dropout_prob,
-          dropout_param_.is_upscale_in_train,
-          dropout_param_.is_test,
-          src,
-          bias,
-          out,
-          mask,
-          ctx,
-          quant_last_in_scale,
-          dequant_out_scale_data,
-          quant_out_scale_offset,
-          quant_next_in_scale,
-          quant_round_type,
-          quant_max_bound,
-          quant_min_bound);
+      if (approximate) {
+        phi::funcs::GeluFunctor<T> gelu;
+        LaunchDropoutActBias<T, MaskType, phi::funcs::GeluFunctor<T>, InType, OutType>(
+            gelu,
+            dropout_param_.seed,
+            rows_,
+            cols_,
+            dropout_param_.increment,
+            dropout_param_.dropout_prob,
+            dropout_param_.is_upscale_in_train,
+            dropout_param_.is_test,
+            src,
+            bias,
+            out,
+            mask,
+            ctx,
+            quant_last_in_scale,
+            dequant_out_scale_data,
+            quant_out_scale_offset,
+            quant_next_in_scale,
+            quant_round_type,
+            quant_max_bound,
+            quant_min_bound);
+      } else {
+        GeluFunctor<T> gelu;
+        LaunchDropoutActBias<T, MaskType, GeluFunctor<T>, InType, OutType>(
+            gelu,
+            dropout_param_.seed,
+            rows_,
+            cols_,
+            dropout_param_.increment,
+            dropout_param_.dropout_prob,
+            dropout_param_.is_upscale_in_train,
+            dropout_param_.is_test,
+            src,
+            bias,
+            out,
+            mask,
+            ctx,
+            quant_last_in_scale,
+            dequant_out_scale_data,
+            quant_out_scale_offset,
+            quant_next_in_scale,
+            quant_round_type,
+            quant_max_bound,
+            quant_min_bound);
+      }
     } else if (act_method == "relu") {
       phi::funcs::ReluFunctor<T> relu;
       LaunchDropoutActBias<T,

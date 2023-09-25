@@ -208,3 +208,30 @@
   kernel :
     func : flip
   backward : flip_grad
+
+- op : beam_search_softmax
+  args : (Tensor logits, Tensor cum_scores, Tensor sequence_lengths, Tensor stop_flags, Tensor end_ids, Tensor step_ids,  Tensor last_cache_ids,  Tensor last_beam_offsets, int beam_size, int max_seq_len, int max_dec_len, bool fuse_softmax, bool early_stop)
+  output : Tensor(ids_this_time), Tensor(out_cum_scores), Tensor(cache_ids), Tensor(beam_offsets), Tensor(parent_idx), Tensor(stop_flags_out), Tensor(seq_lens_out), Tensor(step_ids_out)
+  infer_meta :
+    func : BeamSearchSoftmaxInferMeta
+  kernel :
+    func : beam_search_softmax
+    data_type : logits
+
+- op : number_count_v2
+  args : (Tensor numbers, int upper_range)
+  output : Tensor(out)
+  infer_meta :
+    func : NumberCountInferMeta
+  kernel :
+    func : number_count_v2
+    data_type : numbers
+
+- op : fused_moe_kernel
+  args : (Tensor x, Tensor gate_weight, Tensor gate_bias, Tensor ln_scale, Tensor ln_bias, Tensor[] experts_weight1, Tensor[] experts_bias1, Tensor[] experts_weight2, Tensor[] experts_bias2, bool pre_layer_norm, float ln_epsilon, int topk, int mp_size, int mp_rank, int num_expert, int world_size, int moe_ring_id, bool approximate)
+  output : Tensor(out)
+  infer_meta :
+    func : FusedMoeInferMeta
+  kernel :
+    func : fused_moe_kernel
+    data_type : x

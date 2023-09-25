@@ -86,8 +86,8 @@ __global__ void FusedDropoutActBias(
     const int quant_round_type = 1,
     const float quant_max_bound = 127.0,
     const float quant_min_bound = -127.0) {
-  int col_id = blockDim.x * blockIdx.x + threadIdx.x;
-  int row_id = blockIdx.y;
+  int col_id = threadIdx.x;
+  int row_id = gridDim.y * blockIdx.x + blockIdx.y;
   int idx = row_id * cols + col_id;
 
   curandStatePhilox4_32_10_t state;
@@ -95,9 +95,11 @@ __global__ void FusedDropoutActBias(
 
   const T factor = GetFactor<T>(dropout_prob, is_upscale_in_train, is_test);
 
-  for (int r = row_id; r < rows; r += blockDim.y * gridDim.y) {
-    for (int i = col_id * VecSize; i < cols;
-         i += blockDim.x * gridDim.x * VecSize) {
+  int i = col_id * VecSize;
+  int r = row_id;
+  int stride = blockDim.x * VecSize;
+  for (; r < rows; r += blockDim.y * gridDim.y * gridDim.x) {
+    for (; i < cols; i += stride) {
       FusedResidualDropoutBiasOneThread<T,
                                         MaskType,
                                         VecSize,

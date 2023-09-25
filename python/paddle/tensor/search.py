@@ -1106,3 +1106,93 @@ def kthvalue(x, k, axis=None, keepdim=False, name=None):
                      attrs=attrs)
     indices.stop_gradient = True
     return values, indices
+
+
+def beam_search_softmax(
+    logits,
+    cum_scores,
+    sequence_lengths,
+    stop_flags,
+    end_ids,
+    step_ids,
+    last_cache_ids,
+    last_beam_offsets,
+    beam_size,
+    max_seq_len,
+    max_dec_len,
+    fuse_softmax,
+    early_stop,
+    name=None,
+):
+    if in_dygraph_mode():
+        return _C_ops.beam_search_softmax(
+            logits,
+            cum_scores,
+            sequence_lengths,
+            stop_flags,
+            end_ids,
+            step_ids,
+            last_cache_ids,
+            last_beam_offsets,
+            beam_size,
+            max_seq_len,
+            max_dec_len,
+            fuse_softmax,
+            early_stop
+        )
+
+    inputs = {
+        "logits": logits,
+        "cum_scores": cum_scores,
+        "sequence_lengths": sequence_lengths,
+        "stop_flags": stop_flags,
+        "end_ids": end_ids,
+        "step_ids": step_ids,
+        "last_cache_ids": last_cache_ids,
+        "last_beam_offsets": last_beam_offsets,
+    }
+    attrs = {}
+    attrs['beam_size'] = beam_size
+    attrs['max_seq_len'] = max_seq_len
+    attrs['max_dec_len'] = max_dec_len
+    attrs['fuse_softmax'] = fuse_softmax
+    attrs['early_stop'] = early_stop
+
+    helper = LayerHelper('beam_search_softmax', **locals())
+    ids_this_time = helper.create_variable_for_type_inference(dtype="int32")
+    cache_ids = helper.create_variable_for_type_inference(dtype="int32")
+    beam_offsets = helper.create_variable_for_type_inference(dtype="int32")
+    parent_idx = helper.create_variable_for_type_inference(dtype="int32")
+    out_cum_scores = helper.create_variable_for_type_inference(
+        dtype=logits.dtype
+    )
+    stop_flags_out = helper.create_variable_for_type_inference(
+        dtype=stop_flags.dtype
+    )
+    seq_lens_out = helper.create_variable_for_type_inference(dtype="int32")
+    step_ids_out = helper.create_variable_for_type_inference(dtype="int32")
+    helper.append_op(
+        type='beam_search_softmax',
+        inputs=inputs,
+        outputs={
+            "ids_this_time": ids_this_time,
+            "out_cum_scores": out_cum_scores,
+            "cache_ids": cache_ids,
+            "beam_offsets": beam_offsets,
+            "parent_idx": parent_idx,
+            "stop_flags_out": stop_flags_out,
+            "seq_lens_out": seq_lens_out,
+            "step_ids_out": step_ids_out,
+        },
+        attrs=attrs,
+    )
+    return (
+        ids_this_time,
+        out_cum_scores,
+        cache_ids,
+        beam_offsets,
+        parent_idx,
+        stop_flags_out,
+        seq_lens_out,
+        step_ids_out
+    )
