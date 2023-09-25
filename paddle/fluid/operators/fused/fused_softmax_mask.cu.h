@@ -62,14 +62,16 @@ __global__ void FusedSoftmaxMaskVecKernel(T* dst,
   // gridDim/blockIdx = (DIV_UP(seq_len, warps_per_block), batch_size, head_num)
   // every block processes 4(warps_per_block) sequences
   // seq_id = seq_id * 4 + warp_id, eg.seq_len=128, 127=31*4+3
-  int seq_id = blockIdx.x * warps_per_block + threadIdx.y;
+  // int seq_id = blockIdx.x * warps_per_block + threadIdx.y;
+  // FIX
+  int64_t seq_id = blockIdx.x * warps_per_block + threadIdx.y;
   if (seq_id >= seq_len) return;
 
   // ((bid*head_num + hid)*seq_len + seq_id) * seq_len
-  int offset =
+  int64_t offset =
       ((blockIdx.y * gridDim.z + blockIdx.z) * seq_len + seq_id) * seq_len;
   // (bid * seq_len + seq_id) * seq_len
-  int mask_offset = (blockIdx.y * seq_len + seq_id) * seq_len;
+  int64_t mask_offset = (blockIdx.y * seq_len + seq_id) * seq_len;
   src += offset;
   dst += offset;
   mask += mask_offset;
