@@ -57,10 +57,14 @@ inline platform::GpuLaunchConfig Get1DBlocksAnd2DGrids(
                          std::min(tmp_cols,
                                   static_cast<uint32_t>(std::min(
                                       ctx.GetMaxThreadsPerBlock(), 512))));
-  const auto blocks_x =
+  auto blocks_x =
       std::max(static_cast<uint32_t>(1), (tmp_cols + threads - 1) / threads);
-  const auto blocks_y = std::max(static_cast<uint32_t>(1), rows);
+  auto blocks_y = std::max(static_cast<uint32_t>(1), rows);
   platform::GpuLaunchConfig config;
+  while (blocks_y > 65535) {
+    blocks_x *= 2;
+    blocks_y /= 2;
+  }
   config.block_per_grid.x = blocks_x;
   config.block_per_grid.y = blocks_y;
   config.thread_per_block.x = threads;
