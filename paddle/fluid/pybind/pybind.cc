@@ -2536,6 +2536,7 @@ All parameter, weight, gradient are variables in Paddle.
 #ifdef PADDLE_WITH_BOX_PS
   BindBoxWrapper(&m);
 #endif
+BindTrieManager(&m);
 #if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
   BindNCCLWrapper(&m);
 #endif

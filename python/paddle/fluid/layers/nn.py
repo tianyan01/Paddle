@@ -16657,3 +16657,38 @@ def unbind(input, axis=0):
         attrs={"axis": axis},
     )
     return outs
+
+def trie_search_start(parent_idx, ids):
+    """
+    """
+    helper = LayerHelper("trie_search_start", **locals())
+
+    out = helper.create_variable_for_type_inference(dtype=ids.dtype)
+
+    helper.append_op(
+        type="trie_search_start",
+        inputs={
+            "parent_idx": parent_idx,
+            "ids": ids
+        },
+        outputs={"Out": out}
+    )
+
+    return out
+
+def trie_search_wait(mask):
+    """
+    """
+    helper = LayerHelper("trie_search_wait", **locals())
+
+    out = helper.create_variable_for_type_inference(dtype=mask.dtype)
+
+    helper.append_op(
+        type="trie_search_wait",
+        inputs={
+            "X": mask
+        },
+        outputs={"Out": out},
+    )
+
+    return out

@@ -29,6 +29,7 @@ limitations under the License. */
 #include "paddle/fluid/framework/data_feed.pb.h"
 #include "paddle/fluid/framework/fleet/box_wrapper.h"
 #include "paddle/fluid/pybind/box_helper_py.h"
+#include "paddle/fluid/framework/trie_manager.h"
 #ifdef PADDLE_WITH_BOX_PS
 #include <boxps_public.h>
 #endif
@@ -112,6 +113,38 @@ void BindBoxWrapper(py::module* m) {
            py::call_guard<py::gil_scoped_release>());
 }  // end BoxWrapper
 #endif
+
+void BindTrieManager(py::module* m) {
+  py::class_<framework::Trie, std::shared_ptr<framework::Trie>>(
+      *m, "Trie")
+      .def(py::init([]() {
+          return std::make_shared<framework::Trie>(); }))
+      .def("load",
+          &framework::Trie::load,
+          py::arg("dir"),
+          py::arg("thr_num")=20u,
+          py::call_guard<py::gil_scoped_release>())
+      .def("label",
+          &framework::Trie::label,
+          py::call_guard<py::gil_scoped_release>())
+      .def("aleaf",
+          &framework::Trie::aleaf,
+          py::call_guard<py::gil_scoped_release>());
+
+  py::class_<framework::TrieManager, std::shared_ptr<framework::TrieManager>>(
+      *m, "TrieManager")
+      .def(py::init([](int endid) {
+          // return std::make_shared<framework::TrieManager>(endid); }))
+          return framework::TrieManager::SetInstance(endid); }))
+      .def("load",
+          &framework::TrieManager::load,
+          py::arg("dir"),
+          py::arg("thr_num")=20u,
+          py::call_guard<py::gil_scoped_release>())
+      .def("reset",
+          &framework::TrieManager::reset,
+          py::call_guard<py::gil_scoped_release>());
+}  // end TrieManager
 
 }  // end namespace pybind
 }  // end namespace paddle
