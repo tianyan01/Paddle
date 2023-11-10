@@ -18,13 +18,15 @@ from .layer.fused_transformer import FusedTransformerEncoderLayer  # noqa: F401
 from .layer.fused_transformer import FusedMultiTransformer  # noqa: F401
 from .layer.fused_linear import FusedLinear  # noqa: F401
 from .layer.fused_transformer import FusedBiasDropoutResidualLayerNorm  # noqa: F401
-from .layer.fused_transformer import FusedMoELayer # tianyan01 add
+from .layer.fused_transformer import FusedMoELayer # noqa: F401
+from .layer.fused_transformer import FusedMultiTransformerMoe # noqa: F401
 
 __all__ = [  #noqa
     'FusedMultiHeadAttention',
     'FusedFeedForward',
     'FusedTransformerEncoderLayer',
     'FusedMultiTransformer',
+    'FusedMultiTransformerMoe',
     'FusedLinear',
     'FusedBiasDropoutResidualLayerNorm',
     'FusedMoELayer',

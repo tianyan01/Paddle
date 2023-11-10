@@ -19,108 +19,10 @@ using Tensor = DenseTensor;
 namespace framework = paddle::framework;
 namespace platform = paddle::platform;
 
-template <typename T>
-static void AllToAll(Tensor& tensor,  // NOLINT
-                     Tensor& out,
-                     const int ring_id,
-                     const phi::GPUContext& ctx) {
-  if (ring_id == -1) return;
-#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
-  auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
-
-  if (map->has(ring_id)) {
-    paddle::distributed::ProcessGroup* pg = map->get(ring_id);
-    auto pg_nccl = static_cast<paddle::distributed::ProcessGroupNCCL*>(pg);
-
-    std::vector<Tensor> in_tensor;
-    std::vector<Tensor> out_tensor;
-    in_tensor.push_back(tensor);
-    out_tensor.push_back(out);
-    auto task = pg_nccl->AllToAll(in_tensor, out_tensor, true, true);
-    task->Wait();
-  } else {
-    auto dtype = platform::ToNCCLDataType(
-        framework::TransToProtoVarType(tensor.dtype()));
-    int64_t send_numel = tensor.numel(); // send_numel
-    auto place = ctx.GetPlace();
-    auto comm = platform::NCCLCommContext::Instance().Get(ring_id, place);
-    int nranks = comm->nranks();
-    auto stream = ctx.stream();
-
-    framework::DDim x_dims = tensor.dims();
-    framework::DDim out_dims(x_dims);
-    PADDLE_ENFORCE_EQ(
-        x_dims[0] % nranks,
-        0,
-        platform::errors::InvalidArgument(
-            "The first dimension size (%d) of the input tensor must be "
-            "divisible by the number of ranks (%d).",
-            x_dims[0],
-            nranks));
-    auto send_buf = tensor.data<T>();
-    auto recv_buf = out.mutable_data<T>(out_dims, place);
-    size_t offset = 0;
-    send_numel /= nranks;
-    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupStart());
-    for (auto i = 0; i < nranks; ++i) {
-      PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclSend(
-          send_buf + offset, send_numel, dtype, i, comm->comm(), stream));
-      PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclRecv(
-          recv_buf + offset, send_numel, dtype, i, comm->comm(), stream));
-      offset += send_numel;
-    }
-    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupEnd());
-  }
-#else
-  PADDLE_THROW(platform::errors::Unimplemented(
-      "PaddlePaddle should compile with NCCL or RCCL when used tensor model "
-      "parallel op."));
-#endif
-}
-
-template <typename T>
-static void AllGather(Tensor& tensor,  // NOLINT
-                      Tensor& out,
-                      const int ring_id,
-                      const phi::GPUContext& ctx) {
-  if (ring_id == -1) return;
-#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
-  auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
-
-  if (map->has(ring_id)) {
-    paddle::distributed::ProcessGroup* pg = map->get(ring_id);
-    auto pg_nccl = static_cast<paddle::distributed::ProcessGroupNCCL*>(pg);
-
-    std::vector<Tensor> in_tensor;
-    std::vector<Tensor> out_tensor;
-    in_tensor.push_back(tensor);
-    out_tensor.push_back(out);
-    auto task = pg_nccl->AllGather(in_tensor, out_tensor, true, true);
-    task->Wait();
-  } else {
-    auto dtype = platform::ToNCCLDataType(
-        framework::TransToProtoVarType(tensor.dtype()));
-    int64_t numel = tensor.numel();
-    auto place = ctx.GetPlace();
-    auto comm = platform::NCCLCommContext::Instance().Get(ring_id, place);
-    auto stream = ctx.stream();
-    auto out_dims = tensor.dims();
-    int nranks = comm->nranks();
-    out_dims[0] *= nranks;
-    out.mutable_data<T>(out_dims, place);
-    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclAllGather(
-        tensor.data<T>(), out.data<T>(), numel, dtype, comm->comm(), stream));
-  }
-#else
-  PADDLE_THROW(platform::errors::Unimplemented(
-      "PaddlePaddle should compile with NCCL or RCCL when used tensor model "
-      "parallel op."));
-#endif
-}
-
 template <typename T, typename DeviceContext>
 void FusedMoeKernel(const DeviceContext& dev_ctx,
                     const DenseTensor& x,
+                    const DenseTensor& residual,
                     const DenseTensor& gate_weight,
                     const DenseTensor& gate_bias,
                     const DenseTensor& ln_scale,
@@ -138,18 +40,21 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
                     int world_size,
                     int moe_ring_id,
                     bool approximate,
+                    int bsz,
+                    int seq_len,
+                    int d_model,
+                    int dim_feedforward,
                     DenseTensor* out) {
   using U = paddle::operators::LayerNormParamType<T>;
-  // output
-  dev_ctx.template Alloc<T>(out);
   // dim
   auto x_dim = x.dims();
-  int bsz = x_dim[0];
-  int seq_len = x_dim[1];
+  // output
+  out->Resize(x_dim);
+  dev_ctx.template Alloc<T>(out);
+  // auto out_dim = out->dims();
   int bsz_seq = bsz * seq_len;
-  int d_model = x_dim[2];
   int tot_expert = world_size * num_expert;
-  int dim_feedforward = experts_weight1[0]->dims()[1];
+  // VLOG(0) << "moe, get dim: bsz_seq:" << bsz_seq << ", x.dim:" << x_dim << ", out.dim:" << out_dim;
 
   // pre_layer_norm
   const U* ln_scale_ptr = ln_scale.data<U>();
@@ -165,6 +70,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   Tensor ln_out;
   ln_out.Resize({{bsz, seq_len, d_model}});
   auto *ln_out_data = dev_ctx.template Alloc<T>(&ln_out);
+  // VLOG(0) << "moe, alloc pre layer norm";
   // after slice, bsz_seq should be change
   int sliced_bsz_seq = bsz_seq;
   int start = 0;
@@ -228,8 +134,11 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   all_gather_out.Resize({{bsz_seq, d_model}});
   dev_ctx.template Alloc<T>(&all_gather_out);
   paddle::operators::DropoutParam dropout_param(false, 0, true, true, 0.0, nullptr, 0);
+  // for naccl comm
+  auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
 
   // step1 layer norm
+  // VLOG(0) << "moe, layer norm";
   if (pre_layer_norm) {
     pre_layernorm_helper.LayerNorm(dev_ctx,
                                    x.data<T>(),
@@ -241,6 +150,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   } else {
     ln_out = x;
   }
+  // VLOG(0) << "moe, resize and slice ln_out";
   // step2 resize and slice ln_out
   ln_out.Resize({{bsz_seq, d_model}});
   if (mp_size > 1) {
@@ -248,6 +158,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   } else {
     sliced_inp = ln_out;
   }
+  // VLOG(0) << "moe, gate & topk";
   // step3 gate & topk
   MatMulAndAdd<T>(dev_ctx, 
                   &gate_weight, 
@@ -268,8 +179,10 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
                                &topk_idx);
   // step4 prepare forward
   // step4.1 number count
+  // VLOG(0) << "moe, number count";
   NumberCountKernel<int64_t, DeviceContext>(dev_ctx, topk_idx, tot_expert, &local_expert_count);
   // step4.2 all_to_all
+  // VLOG(0) << "moe, all_to_all";
   if (world_size > 1) {
     AllToAll<int64_t>(local_expert_count, global_expert_count, moe_ring_id, dev_ctx);
   } else {
@@ -278,6 +191,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   // global expert count resize
   global_expert_count.Resize({{world_size, num_expert}});
   // fwd expert count
+  // VLOG(0) << "moe, fwd expert count";
   SumKernel<int64_t, DeviceContext>(dev_ctx, 
                                     global_expert_count, 
                                     IntArray({0}),
@@ -285,6 +199,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
                                     false,
                                     &fwd_expert_count);
   // fwd batch size
+  // VLOG(0) << "moe, fwd batch size";
   SumKernel<int64_t, DeviceContext>(dev_ctx, 
                                     fwd_expert_count, 
                                     IntArray({}), // axis is None
@@ -292,6 +207,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
                                     false,
                                     &fwd_batch_size);
   // step4.3 cumsum & assign pos
+  // VLOG(0) << "moe, cumsum & assign pos";
   CumsumKernel<int64_t, DeviceContext>(dev_ctx, 
                                        local_expert_count, 
                                        Scalar(0),
@@ -332,10 +248,12 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   // step 5, MOEScatter
   // step 5.1, index select
   // suppose tmp_pos->shape != [0]
+  // VLOG(0) << "moe, index select";
   IndexSelectKernel<T, DeviceContext>(dev_ctx, sliced_inp, temp_pos, 0, &index_select_out);
   if (world_size > 1) {
-    auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
+    // auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
     // step 5.2, global_scatter
+    // VLOG(0) << "moe, global_scatter";
     if (map->has(moe_ring_id)) {
       GlobalScatterProcessGroupFunctor<T>(dev_ctx, 
                                           &index_select_out, 
@@ -358,6 +276,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   }
 
   // step 6, Expert Computation
+  // VLOG(0) << "moe, Expert Computation";
   if (fwd_bsz != 0) {
     int last_index = 0;
     for (int idx = 0; idx < num_expert; idx++) {
@@ -380,6 +299,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
       
       Tensor tmp_inp = global_scatter_out.Slice(last_index, end);
       // linear1 matmul
+      // VLOG(0) << "moe, Expert Computation, linear1 mul";
       MatMulAndAdd<T>(dev_ctx, 
                       experts_weight1[idx], 
                       &tmp_inp, 
@@ -390,6 +310,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
                       &expert_out1, 
                       nullptr);
       // bias gelu
+      // VLOG(0) << "moe, Expert Computation, add bias & gelu";
       fused_act_dropout_helper.DropoutActBias(dev_ctx,
                                               expert_out1.data<T>(),
                                               experts_bias1[idx]->data<T>(),
@@ -405,6 +326,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
                                               -127.0,
                                               approximate);
       // linear2 matmul & add
+      // VLOG(0) << "moe, Expert Computation, linear2 matmul & add";
       MatMulAndAdd<T>(dev_ctx, 
                       experts_weight2[idx], 
                       &act_bias_out, 
@@ -423,8 +345,9 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
     all_expert_out = global_scatter_out;
   }
   // step7. MOEGather
+  // VLOG(0) << "moe, MOEGather";
   if (world_size > 1) {
-    auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
+    // auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
     // step 7.1, global_gather
     if (map->has(moe_ring_id)) {
       GlobalGatherProcessGroupFunctor<T>(dev_ctx, 
@@ -448,6 +371,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   }
   // step 7.2, local_gather or scatter
   // suppose pos->shape != [0]
+  // VLOG(0) << "moe, local_gather or scatter";
   ScatterKernel<T, DeviceContext>(dev_ctx, 
                                   moe_gather_out, 
                                   pos, 
@@ -456,11 +380,13 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
                                   &moe_gather_out);
   // step 8, reshape & bmm
   // moe gather out reshape
+  // VLOG(0) << "moe, reshape & bmm";
   moe_gather_out.Resize({{sliced_bsz_seq, topk, d_model}});
   topk_value.Resize({{sliced_bsz_seq, 1, topk}});
   BmmKernel<T, DeviceContext>(dev_ctx, topk_value, moe_gather_out, &bmm_out);
   bmm_out.Resize({{sliced_bsz_seq, d_model}});
   // step 9, AllGather
+  // VLOG(0) << "moe, AllGather";
   if (mp_size > 1) {
     // all gather
     AllGather<T>(bmm_out, all_gather_out, moe_ring_id, dev_ctx);
@@ -468,9 +394,20 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
     all_gather_out = bmm_out;
   }
   // step 10, reshape
+  // VLOG(0) << "moe, reshape";
   all_gather_out.Resize(x_dim);
   // step 11, add residual
-  AddKernel<T, DeviceContext>(dev_ctx, all_gather_out, x, out);
+  // VLOG(0) << "moe, add residual";
+  AddKernel<T, DeviceContext>(dev_ctx, all_gather_out, residual, out);
+  if (!pre_layer_norm) {
+    pre_layernorm_helper.LayerNorm(dev_ctx,
+                                   out->data<T>(),
+                                   ln_scale_ptr,
+                                   ln_bias_ptr,
+                                   out->data<T>(),
+                                   ln_mean_data,
+                                   ln_variance_data);
+  }
 }
 
 }  // namespace phi

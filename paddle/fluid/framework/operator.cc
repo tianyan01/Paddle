@@ -1420,6 +1420,8 @@ void OperatorWithKernel::RunImpl(const Scope& scope,
   // result of HasAttr.
   if (!enable_cache_runtime_context_ && HasAttr(kEnableCacheRuntimeContext))
     enable_cache_runtime_context_ = true;
+  if (this->Type() == "fused_multi_transformer_int8" || this->Type() == "fused_multi_transformer_moe_int8")
+    enable_cache_runtime_context_ = true;
   if (!all_kernels_must_compute_runtime_shape_ &&
       HasAttr(kAllKernelsMustComputeRuntimeShape))
     all_kernels_must_compute_runtime_shape_ = true;
