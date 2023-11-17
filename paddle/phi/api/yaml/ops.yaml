@@ -228,7 +228,10 @@
     data_type : numbers
 
 - op : fused_moe_kernel
-  args : (Tensor x, Tensor gate_weight, Tensor gate_bias, Tensor ln_scale, Tensor ln_bias, Tensor[] experts_weight1, Tensor[] experts_bias1, Tensor[] experts_weight2, Tensor[] experts_bias2, bool pre_layer_norm, float ln_epsilon, int topk, int mp_size, int mp_rank, int num_expert, int world_size, int moe_ring_id, bool approximate)
+  args : (Tensor x, Tensor residual, Tensor gate_weight, Tensor gate_bias, Tensor ln_scale, Tensor ln_bias, 
+          Tensor[] experts_weight1, Tensor[] experts_bias1, Tensor[] experts_weight2, Tensor[] experts_bias2, 
+          bool pre_layer_norm, float ln_epsilon, int topk, int mp_size, int mp_rank, int num_expert, int world_size, 
+          int moe_ring_id, bool approximate, int bsz, int seq_len, int d_model, int dim_feedforward)
   output : Tensor(out)
   infer_meta :
     func : FusedMoeInferMeta

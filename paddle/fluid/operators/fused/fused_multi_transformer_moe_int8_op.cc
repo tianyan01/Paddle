@@ -21,9 +21,11 @@ limitations under the License. */
 namespace paddle {
 namespace operators {
 
-class FusedMultiTransformerOp : public framework::OperatorWithKernel {
+using Tensor = phi::DenseTensor;
+
+class FusedMultiTransformerMoeINT8Op : public framework::OperatorWithKernel {
  private:
-  static constexpr const char *OpName = "FusedMultiTransformerOp";
+  static constexpr const char *OpName = "FusedMultiTransformerMoeINT8Op";
 
  public:
   using framework::OperatorWithKernel::OperatorWithKernel;
@@ -52,9 +54,17 @@ class FusedMultiTransformerOp : public framework::OperatorWithKernel {
       CHECK_OUTPUTS(CacheKVOut);
     }
 
-    // ffn
-    CHECK_INPUTS(FFN1Weight);
-    CHECK_INPUTS(FFN2Weight);
+    // moe
+    CHECK_INPUTS(GateWeight);
+    CHECK_INPUTS(GateBias);
+    CHECK_INPUTS(ExpertWeight1);
+    CHECK_INPUTS(ExpertWeight2);
+
+    // scale
+    CHECK_INPUTS(QKVOutScale);
+    CHECK_INPUTS(OutLinearOutScale);
+    CHECK_INPUTS(ExpertWeight1OutScale);
+    CHECK_INPUTS(ExpertWeight2OutScale);
 
     CHECK_OUTPUT(Out);
 
@@ -91,6 +101,7 @@ class FusedMultiTransformerOp : public framework::OperatorWithKernel {
             x_dim,
             y_dim));
 
+
     if (ctx->HasInputs("CacheKV")) {
       // [2, batch_size, num_head, max_seq_len, head_size]
       const auto &c_dims = ctx->GetInputsDim("CacheKV");
@@ -106,6 +117,7 @@ class FusedMultiTransformerOp : public framework::OperatorWithKernel {
                         paddle::platform::errors::InvalidArgument(
                             "The first dim of CacheKV must be 2, but got %d",
                             c_dim[0]));  // 2
+
       PADDLE_ENFORCE_EQ(c_dim[2],
                         trans_qkvw ? y_dim[1] : y_dim[2],
                         paddle::platform::errors::InvalidArgument(
@@ -113,6 +125,7 @@ class FusedMultiTransformerOp : public framework::OperatorWithKernel {
                             "head %d, but got %d",
                             trans_qkvw ? y_dim[1] : y_dim[2],
                             c_dim[2]));  // num_head
+
       PADDLE_ENFORCE_EQ(c_dim[4],
                         trans_qkvw ? y_dim[2] : y_dim[3],
                         paddle::platform::errors::InvalidArgument(
@@ -134,7 +147,7 @@ class FusedMultiTransformerOp : public framework::OperatorWithKernel {
 
   framework::OpKernelType GetKernelTypeForVar(
       const std::string &var_name,
-      const phi::DenseTensor &tensor,
+      const Tensor &tensor,
       const framework::OpKernelType &expected_kernel_type) const override {
     if (var_name == "TimeStep") {
       VLOG(10) << "var_name:" << var_name << " need not to transform";
@@ -145,7 +158,7 @@ class FusedMultiTransformerOp : public framework::OperatorWithKernel {
   }
 };
 
-class FusedMultiTransformerOpOpMaker
+class FusedMultiTransformerMoeINT8OpMaker
     : public framework::OpProtoAndCheckerMaker {
  public:
   void Make() override {
@@ -160,6 +173,7 @@ class FusedMultiTransformerOpOpMaker
         .AsDuplicable();
     AddInput("QKVW", "The qkv weight tensor.").AsDuplicable();
     AddInput("QKVBias", "The qkv bias tensor.").AsDispensable().AsDuplicable();
+
     AddInput("CacheKV", "(optional) The cached KV for generation inference.")
         .AsDispensable()
         .AsDuplicable();
@@ -184,53 +198,59 @@ class FusedMultiTransformerOpOpMaker
     AddInput("OutLinearBias", "The out_linear bias tensor.")
         .AsDispensable()
         .AsDuplicable();
+
+    AddInput("GateWeight", "The gate_weights in moe")
+        .AsDuplicable();
+    AddInput("GateBias", "The gate_biases in moe")
+        .AsDuplicable();
     AddInput("FFNLnScale", "The layer_norm scale of FusedFeedForward op")
         .AsDuplicable();
     AddInput("FFNLnBias", "The layer_norm bias of FusedFeedForward op")
         .AsDuplicable();
-    AddInput("FFN1Weight", "The linear1 weight of FusedFeedForward op")
+    AddInput("ExpertWeight1", "The expert_weights1 in moe")
         .AsDuplicable();
-    AddInput("FFN1Bias", "The linear1 bias of FusedFeedForward op")
+    AddInput("ExpertBias1", "The expert_biases1 in moe")
+        .AsDuplicable();
+    AddInput("ExpertWeight2", "The expert_weights2 in moe")
+        .AsDuplicable();
+    AddInput("ExpertBias2", "The expert_biases2 in moe")
+        .AsDuplicable();
+
+    // out scale
+    AddInput("QKVOutScale",
+             "QKVOutScale is used to dequantize qkv output tensor."
+             "In order to keep consistent with the PTQ/QAT calculation logic,"
+             "QKVOutScale should be max_bound * max_bound / max_range."
+             "Here max_range is per-channel weight scale."
+             "The shape of QKVOutScale is [num_layers]")
         .AsDispensable()
         .AsDuplicable();
-    AddInput("FFN2Weight", "The linear2 weight of FusedFeedForward op")
-        .AsDuplicable();
-    AddInput("FFN2Bias", "The linear2 bias input of FusedFeedForward op")
+    AddInput("OutLinearOutScale",
+             "OutLinearOutScale is used to dequantize out_linear output tensor."
+             "The definition and shape is the same as QKVOutScale")
         .AsDispensable()
         .AsDuplicable();
-    AddInput("QKVWScale", "QKVWScale")        
+    AddInput("ExpertWeight1OutScale",
+             "ExpertWeight1OutScale is used to dequantize ffn1 output tensor."
+             "The definition and shape is num_layers * num_expert")
         .AsDispensable()
         .AsDuplicable();
-    AddInput("OutLinearWScale", "OutLinearWScale")        
+    AddInput("ExpertWeight2OutScale",
+             "ExpertWeight2OutScale is used to dequantize ffn2 output tensor."
+             "The definition and shape is num_layers * num_expert")
         .AsDispensable()
         .AsDuplicable();
-    AddInput("FFN1WeightScale", "FFN1WeightScale")        
-        .AsDispensable()
-        .AsDuplicable();
-    AddInput("FFN2WeightScale", "FFN2WeightScale")        
-        .AsDispensable()
-        .AsDuplicable();
+
     AddOutput("CacheKVOut", "The updated cache KV. Inplace with CacheKV")
         .AsDispensable()
         .AsDuplicable();
     AddOutput("Out", "Result after multi .");
+
     AddAttr<bool>("pre_layer_norm",
                   "if true, the attention op uses pre_layer_norm architecure, "
                   "else, uses post_layer_norm architecuture. "
                   "[default true].")
         .SetDefault(true);
-    AddAttr<int>("rotary_emb_dims",
-                 "the Attr(dims) for RotaryPosEmb's Computation  [default 0].")
-        .SetDefault(0)
-        .AddCustomChecker([](const int &rotary_emb_dims) {
-          PADDLE_ENFORCE_EQ(
-              rotary_emb_dims >= 0 && rotary_emb_dims <= 2,
-              true,
-              platform::errors::InvalidArgument(
-                  "'rotary_emb_dims' in Op(Rotray) should be between"
-                  "0 and 2, But received [%s].",
-                  rotary_emb_dims));
-        });
     AddAttr<float>("epsilon",
                    "Constant for numerical stability [default 1e-5].")
         .SetDefault(1e-5)
@@ -269,17 +289,7 @@ class FusedMultiTransformerOpOpMaker
                   "dropout_implementation can only be downgrade_in_infer or "
                   "upscale_in_train"));
         });
-    AddAttr<std::string>("act_method", "act_method")
-        .SetDefault("gelu")
-        .AddCustomChecker([](const std::string &act_type) {
-          PADDLE_ENFORCE_EQ(
-              act_type == "gelu" || act_type == "geglu" || act_type == "relu" || act_type == "none",
-              true,
-              platform::errors::InvalidArgument(
-                  "Only support `gelu`, `geglu`, `relu`, `none` activation in "
-                  "FusedMultiTransformer. "));
-        });
-
+    AddAttr<std::string>("act_method", "act_method").SetDefault("gelu");
     AddAttr<bool>(
         "trans_qkvw",
         "Whether the weights of qkv should be transposed. If true,"
@@ -287,15 +297,85 @@ class FusedMultiTransformerOpOpMaker
         "Otherwise the shape of weights of qkv should be"
         "[dim_embed, 3, num_head, dim_head]")
         .SetDefault(true);
-
-    AddAttr<bool>("quant_weight","Whether do weight quant")
-        .SetDefault(false);
-
     AddAttr<int>(
         "ring_id",
         "ring id for tensor model parallel. distributed training and inference")
         .SetDefault(-1);
-    
+
+    // for moe layer
+    AddAttr<int>(
+        "topk",
+        "gate's topk im moe")
+        .SetDefault(2);
+    AddAttr<int>(
+        "mp_size",
+        "mp size")
+        .SetDefault(1);
+    AddAttr<int>(
+        "mp_rank",
+        "mp rank")
+        .SetDefault(0);
+    AddAttr<int>(
+        "num_expert",
+        "experts num im moe")
+        .SetDefault(1);
+    AddAttr<int>(
+        "world_size",
+        "world size")
+        .SetDefault(1);
+    AddAttr<int>(
+        "moe_ring_id",
+        "experts communicate group's ring id")
+        .SetDefault(1);
+    AddAttr<bool>(
+        "approximate",
+        "approximate in expert compute gelu")
+        .SetDefault(true);
+
+    // int8 add
+    // AddAttr<int>("num_head", "num_head").SetDefault(0);
+    // AddAttr<int>("dim_head", "dim_head").SetDefault(0);
+    // AddAttr<int>("dim_ffn", "dim_ffn").SetDefault(0);
+
+    AddAttr<std::vector<float>>(
+        "qkv_in_scale",
+        "qkv_in_scale is used to quantize qkv input tensor."
+        "in_scale is generated by PTQ or QAT, which represents valid max range "
+        "of this tensor."
+        "the size of qkv_in_scale should be num_layers, which is equal to "
+        "QKVW.dims()[0]")
+        .SetDefault({});
+    AddAttr<std::vector<float>>(
+        "out_linear_in_scale",
+        "out_linear_in_scale is used to quantize out_linear input tensor."
+        "the size of out_linear_in_scale is the same as qkv_in_scale")
+        .SetDefault({});
+    AddAttr<std::vector<float>>(
+        "expert_weight1_in_scale",
+        "expert_weight1_in_scale is used to quantize ffn1 input tensor."
+        "the size of expert_weight1_in_scale should be num_layers * num_expert")
+        .SetDefault({});
+    AddAttr<std::vector<float>>(
+        "expert_weight2_in_scale",
+        "expert_weight2_in_scale is used to quantize ffn2 input tensor."
+        "the size of expert_weight2_in_scale should be num_layers * num_expert")
+        .SetDefault({});
+
+    AddAttr<int>(
+        "quant_round_type",
+        "(int, default 1) The round type of fp32 to int."
+        "0: rounding to nearest ties to even. Eg: round(1.5)=2, round(2.5)=2"
+        "1: rounding to nearest ties away from zero. Eg: round(1.5)=2, "
+        "round(-2.5)=-3")
+        .SetDefault(1);
+    AddAttr<float>(
+        "quant_max_bound",
+        "(float, default 127.0) the max bound of float type to int type")
+        .SetDefault(127.0);
+    AddAttr<float>(
+        "quant_min_bound",
+        "(float, default -127.0) the min bound of float type to int type")
+        .SetDefault(-127.0);
     AddComment(R"DOC(fused multi transformer layers op)DOC");
   }
 };
@@ -305,18 +385,8 @@ class FusedMultiTransformerOpOpMaker
 
 namespace ops = paddle::operators;
 REGISTER_OPERATOR(
-    fused_multi_transformer,
-    ops::FusedMultiTransformerOp,
-    ops::FusedMultiTransformerOpOpMaker,
+    fused_multi_transformer_moe_int8,
+    ops::FusedMultiTransformerMoeINT8Op,
+    ops::FusedMultiTransformerMoeINT8OpMaker,
     paddle::framework::EmptyGradOpMaker<paddle::framework::OpDesc>,
     paddle::framework::EmptyGradOpMaker<paddle::imperative::OpBase>);
-
-REGISTER_OP_VERSION(fused_multi_transformer)
-    .AddCheckpoint(
-        R"ROC(
-              Add a new attribute [trans_qkvw] )ROC",
-        paddle::framework::compatible::OpVersionDesc().NewAttr(
-            "trans_qkvw",
-            "A flag to indicate whether to transpose for weights of qkv.",
-            true));
-

@@ -21,9 +21,9 @@ limitations under the License. */
 namespace paddle {
 namespace operators {
 
-class FusedMultiTransformerOp : public framework::OperatorWithKernel {
+class FusedMultiTransformerMoeOp : public framework::OperatorWithKernel {
  private:
-  static constexpr const char *OpName = "FusedMultiTransformerOp";
+  static constexpr const char *OpName = "FusedMultiTransformerMoeOp";
 
  public:
   using framework::OperatorWithKernel::OperatorWithKernel;
@@ -52,10 +52,13 @@ class FusedMultiTransformerOp : public framework::OperatorWithKernel {
       CHECK_OUTPUTS(CacheKVOut);
     }
 
-    // ffn
-    CHECK_INPUTS(FFN1Weight);
-    CHECK_INPUTS(FFN2Weight);
+    // moe
+    CHECK_INPUTS(GateWeight);
+    CHECK_INPUTS(GateBias);
+    CHECK_INPUTS(ExpertWeight1);
+    CHECK_INPUTS(ExpertWeight2);
 
+    // out
     CHECK_OUTPUT(Out);
 
     // x: qkv's input [batch_size, seq_len, dim_embed]
@@ -145,7 +148,7 @@ class FusedMultiTransformerOp : public framework::OperatorWithKernel {
   }
 };
 
-class FusedMultiTransformerOpOpMaker
+class FusedMultiTransformerMoeOpOpMaker
     : public framework::OpProtoAndCheckerMaker {
  public:
   void Make() override {
@@ -184,31 +187,21 @@ class FusedMultiTransformerOpOpMaker
     AddInput("OutLinearBias", "The out_linear bias tensor.")
         .AsDispensable()
         .AsDuplicable();
+    AddInput("GateWeight", "The gate_weights in moe")
+        .AsDuplicable();
+    AddInput("GateBias", "The gate_biases in moe")
+        .AsDuplicable();
     AddInput("FFNLnScale", "The layer_norm scale of FusedFeedForward op")
         .AsDuplicable();
     AddInput("FFNLnBias", "The layer_norm bias of FusedFeedForward op")
         .AsDuplicable();
-    AddInput("FFN1Weight", "The linear1 weight of FusedFeedForward op")
+    AddInput("ExpertWeight1", "The expert_weights1 in moe")
         .AsDuplicable();
-    AddInput("FFN1Bias", "The linear1 bias of FusedFeedForward op")
-        .AsDispensable()
+    AddInput("ExpertBias1", "The expert_biases1 in moe")
         .AsDuplicable();
-    AddInput("FFN2Weight", "The linear2 weight of FusedFeedForward op")
+    AddInput("ExpertWeight2", "The expert_weights2 in moe")
         .AsDuplicable();
-    AddInput("FFN2Bias", "The linear2 bias input of FusedFeedForward op")
-        .AsDispensable()
-        .AsDuplicable();
-    AddInput("QKVWScale", "QKVWScale")        
-        .AsDispensable()
-        .AsDuplicable();
-    AddInput("OutLinearWScale", "OutLinearWScale")        
-        .AsDispensable()
-        .AsDuplicable();
-    AddInput("FFN1WeightScale", "FFN1WeightScale")        
-        .AsDispensable()
-        .AsDuplicable();
-    AddInput("FFN2WeightScale", "FFN2WeightScale")        
-        .AsDispensable()
+    AddInput("ExpertBias2", "The expert_biases2 in moe")
         .AsDuplicable();
     AddOutput("CacheKVOut", "The updated cache KV. Inplace with CacheKV")
         .AsDispensable()
@@ -219,18 +212,6 @@ class FusedMultiTransformerOpOpMaker
                   "else, uses post_layer_norm architecuture. "
                   "[default true].")
         .SetDefault(true);
-    AddAttr<int>("rotary_emb_dims",
-                 "the Attr(dims) for RotaryPosEmb's Computation  [default 0].")
-        .SetDefault(0)
-        .AddCustomChecker([](const int &rotary_emb_dims) {
-          PADDLE_ENFORCE_EQ(
-              rotary_emb_dims >= 0 && rotary_emb_dims <= 2,
-              true,
-              platform::errors::InvalidArgument(
-                  "'rotary_emb_dims' in Op(Rotray) should be between"
-                  "0 and 2, But received [%s].",
-                  rotary_emb_dims));
-        });
     AddAttr<float>("epsilon",
                    "Constant for numerical stability [default 1e-5].")
         .SetDefault(1e-5)
@@ -288,14 +269,39 @@ class FusedMultiTransformerOpOpMaker
         "[dim_embed, 3, num_head, dim_head]")
         .SetDefault(true);
 
-    AddAttr<bool>("quant_weight","Whether do weight quant")
-        .SetDefault(false);
-
     AddAttr<int>(
         "ring_id",
         "ring id for tensor model parallel. distributed training and inference")
         .SetDefault(-1);
-    
+    // for moe layer
+    AddAttr<int>(
+        "topk",
+        "gate's topk im moe")
+        .SetDefault(2);
+    AddAttr<int>(
+        "mp_size",
+        "mp size")
+        .SetDefault(1);
+    AddAttr<int>(
+        "mp_rank",
+        "mp rank")
+        .SetDefault(0);
+    AddAttr<int>(
+        "num_expert",
+        "experts num im moe")
+        .SetDefault(1);
+    AddAttr<int>(
+        "world_size",
+        "world size")
+        .SetDefault(1);
+    AddAttr<int>(
+        "moe_ring_id",
+        "experts communicate group's ring id")
+        .SetDefault(1);
+    AddAttr<bool>(
+        "approximate",
+        "approximate in expert compute gelu")
+        .SetDefault(true);
     AddComment(R"DOC(fused multi transformer layers op)DOC");
   }
 };
@@ -305,18 +311,9 @@ class FusedMultiTransformerOpOpMaker
 
 namespace ops = paddle::operators;
 REGISTER_OPERATOR(
-    fused_multi_transformer,
-    ops::FusedMultiTransformerOp,
-    ops::FusedMultiTransformerOpOpMaker,
+    fused_multi_transformer_moe,
+    ops::FusedMultiTransformerMoeOp,
+    ops::FusedMultiTransformerMoeOpOpMaker,
     paddle::framework::EmptyGradOpMaker<paddle::framework::OpDesc>,
     paddle::framework::EmptyGradOpMaker<paddle::imperative::OpBase>);
-
-REGISTER_OP_VERSION(fused_multi_transformer)
-    .AddCheckpoint(
-        R"ROC(
-              Add a new attribute [trans_qkvw] )ROC",
-        paddle::framework::compatible::OpVersionDesc().NewAttr(
-            "trans_qkvw",
-            "A flag to indicate whether to transpose for weights of qkv.",
-            true));
 

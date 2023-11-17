@@ -168,6 +168,7 @@ gray_list = {
     'fused_feedforward',
     'fused_attention',
     'fused_multi_transformer',
+    'fused_multi_transformer_moe',
 }
 
 # The set of ops that don't support fp16 calculation

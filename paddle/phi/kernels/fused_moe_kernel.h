@@ -49,8 +49,108 @@
 #endif
 
 namespace phi {
+using Tensor = DenseTensor;
 namespace framework = paddle::framework;
 namespace platform = paddle::platform;
+
+template <typename T>
+static void AllToAll(Tensor& tensor,  // NOLINT
+                     Tensor& out,
+                     const int ring_id,
+                     const phi::GPUContext& ctx) {
+  if (ring_id == -1) return;
+#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
+  auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
+
+  if (map->has(ring_id)) {
+    paddle::distributed::ProcessGroup* pg = map->get(ring_id);
+    auto pg_nccl = static_cast<paddle::distributed::ProcessGroupNCCL*>(pg);
+
+    std::vector<Tensor> in_tensor;
+    std::vector<Tensor> out_tensor;
+    in_tensor.push_back(tensor);
+    out_tensor.push_back(out);
+    auto task = pg_nccl->AllToAll(in_tensor, out_tensor);
+    task->Wait();
+  } else {
+    auto dtype = platform::ToNCCLDataType(
+        framework::TransToProtoVarType(tensor.dtype()));
+    int64_t send_numel = tensor.numel(); // send_numel
+    auto place = ctx.GetPlace();
+    auto comm = platform::NCCLCommContext::Instance().Get(ring_id, place);
+    int nranks = comm->nranks();
+    auto stream = ctx.stream();
+
+    framework::DDim x_dims = tensor.dims();
+    framework::DDim out_dims(x_dims);
+    PADDLE_ENFORCE_EQ(
+        x_dims[0] % nranks,
+        0,
+        platform::errors::InvalidArgument(
+            "The first dimension size (%d) of the input tensor must be "
+            "divisible by the number of ranks (%d).",
+            x_dims[0],
+            nranks));
+    auto send_buf = tensor.data<T>();
+    auto recv_buf = out.mutable_data<T>(out_dims, place);
+    size_t offset = 0;
+    send_numel /= nranks;
+    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupStart());
+    for (auto i = 0; i < nranks; ++i) {
+      PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclSend(
+          send_buf + offset, send_numel, dtype, i, comm->comm(), stream));
+      PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclRecv(
+          recv_buf + offset, send_numel, dtype, i, comm->comm(), stream));
+      offset += send_numel;
+    }
+    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupEnd());
+  }
+#else
+  PADDLE_THROW(platform::errors::Unimplemented(
+      "PaddlePaddle should compile with NCCL or RCCL when used tensor model "
+      "parallel op."));
+#endif
+}
+
+template <typename T>
+static void AllGather(Tensor& tensor,  // NOLINT
+                      Tensor& out,
+                      const int ring_id,
+                      const phi::GPUContext& ctx) {
+  if (ring_id == -1) return;
+#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
+  auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
+
+  if (map->has(ring_id)) {
+    paddle::distributed::ProcessGroup* pg = map->get(ring_id);
+    auto pg_nccl = static_cast<paddle::distributed::ProcessGroupNCCL*>(pg);
+
+    std::vector<Tensor> in_tensor;
+    std::vector<Tensor> out_tensor;
+    in_tensor.push_back(tensor);
+    out_tensor.push_back(out);
+    auto task = pg_nccl->AllGather(in_tensor, out_tensor, true, true);
+    task->Wait();
+  } else {
+    auto dtype = platform::ToNCCLDataType(
+        framework::TransToProtoVarType(tensor.dtype()));
+    int64_t numel = tensor.numel();
+    auto place = ctx.GetPlace();
+    auto comm = platform::NCCLCommContext::Instance().Get(ring_id, place);
+    auto stream = ctx.stream();
+    auto out_dims = tensor.dims();
+    int nranks = comm->nranks();
+    out_dims[0] *= nranks;
+    out.mutable_data<T>(out_dims, place);
+    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclAllGather(
+        tensor.data<T>(), out.data<T>(), numel, dtype, comm->comm(), stream));
+  }
+#else
+  PADDLE_THROW(platform::errors::Unimplemented(
+      "PaddlePaddle should compile with NCCL or RCCL when used tensor model "
+      "parallel op."));
+#endif
+}
 
 template <typename T>
 void GlobalScatterFunctor(const phi::GPUContext& ctx,
@@ -142,6 +242,11 @@ void GlobalScatterFunctor(const phi::GPUContext& ctx,
     }
     PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupEnd());
   }
+#ifdef PADDLE_WITH_CUDA
+  PADDLE_ENFORCE_GPU_SUCCESS(cudaDeviceSynchronize());
+#else
+  PADDLE_ENFORCE_GPU_SUCCESS(hipDeviceSynchronize());
+#endif
 
 #else
   PADDLE_THROW(
@@ -337,6 +442,13 @@ void GlobalGatherFunctor(const phi::GPUContext& ctx,
     }
     PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupEnd());
   }
+
+#ifdef PADDLE_WITH_CUDA
+  PADDLE_ENFORCE_GPU_SUCCESS(cudaDeviceSynchronize());
+#else
+  PADDLE_ENFORCE_GPU_SUCCESS(hipDeviceSynchronize());
+#endif
+
 #else
   PADDLE_THROW(
       platform::errors::Unavailable("NCCL version >= 2.7.3 is needed."));
@@ -480,6 +592,7 @@ void MatMulAndAdd(const phi::GPUContext& dev_ctx,
 template <typename T, typename DeviceContext>
 void FusedMoeKernel(const DeviceContext& context,
                     const DenseTensor& x,
+                    const DenseTensor& residual,
                     const DenseTensor& gate_weight,
                     const DenseTensor& gate_bias,
                     const DenseTensor& ln_scale,
@@ -497,6 +610,10 @@ void FusedMoeKernel(const DeviceContext& context,
                     int world_size,
                     int moe_ring_id,
                     bool approximate,
+                    int bsz,
+                    int seq_len,
+                    int d_model,
+                    int dim_feedforward,
                     DenseTensor* out);
 
 }  // namespace phi
