@@ -54,7 +54,6 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   // auto out_dim = out->dims();
   int bsz_seq = bsz * seq_len;
   int tot_expert = world_size * num_expert;
-  // VLOG(0) << "moe, get dim: bsz_seq:" << bsz_seq << ", x.dim:" << x_dim << ", out.dim:" << out_dim;
 
   // pre_layer_norm
   const U* ln_scale_ptr = ln_scale.data<U>();
@@ -70,7 +69,6 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   Tensor ln_out;
   ln_out.Resize({{bsz, seq_len, d_model}});
   auto *ln_out_data = dev_ctx.template Alloc<T>(&ln_out);
-  // VLOG(0) << "moe, alloc pre layer norm";
   // after slice, bsz_seq should be change
   int sliced_bsz_seq = bsz_seq;
   int start = 0;

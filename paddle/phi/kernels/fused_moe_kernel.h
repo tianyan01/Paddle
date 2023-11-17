@@ -72,7 +72,6 @@ static void AllToAll(Tensor& tensor,  // NOLINT
     out_tensor.push_back(out);
     auto task = pg_nccl->AllToAll(in_tensor, out_tensor);
     task->Wait();
-    VLOG(0) << "wait, all to all success !";
   } else {
     auto dtype = platform::ToNCCLDataType(
         framework::TransToProtoVarType(tensor.dtype()));
@@ -245,7 +244,6 @@ void GlobalScatterFunctor(const phi::GPUContext& ctx,
   }
 #ifdef PADDLE_WITH_CUDA
   PADDLE_ENFORCE_GPU_SUCCESS(cudaDeviceSynchronize());
-  // VLOG(0) << "GlobalScatterFunctor cudaDeviceSynchronize success !";
 #else
   PADDLE_ENFORCE_GPU_SUCCESS(hipDeviceSynchronize());
 #endif
@@ -334,12 +332,10 @@ void GlobalScatterProcessGroupFunctor(const phi::GPUContext& ctx,
       }
     }
     PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupEnd());
-    // VLOG(0) << "GlobalScatterProcessGroupFunctor ncclGroupEnd " << i;
   }
 
 #ifdef PADDLE_WITH_CUDA
   PADDLE_ENFORCE_GPU_SUCCESS(cudaDeviceSynchronize());
-  // VLOG(0) << "GlobalScatterProcessGroupFunctor cudaDeviceSynchronize success!";
 #else
   PADDLE_ENFORCE_GPU_SUCCESS(hipDeviceSynchronize());
 #endif
@@ -449,7 +445,6 @@ void GlobalGatherFunctor(const phi::GPUContext& ctx,
 
 #ifdef PADDLE_WITH_CUDA
   PADDLE_ENFORCE_GPU_SUCCESS(cudaDeviceSynchronize());
-  // VLOG(0) << "GlobalGatherFunctor cudaDeviceSynchronize success !";
 #else
   PADDLE_ENFORCE_GPU_SUCCESS(hipDeviceSynchronize());
 #endif
@@ -542,7 +537,6 @@ void GlobalGatherProcessGroupFunctor(const phi::GPUContext& ctx,
 
 #ifdef PADDLE_WITH_CUDA
   PADDLE_ENFORCE_GPU_SUCCESS(cudaDeviceSynchronize());
-  // VLOG(0) << "GlobalGatherProcessGroupFunctor cudaDeviceSynchronize success !";
 #else
   PADDLE_ENFORCE_GPU_SUCCESS(hipDeviceSynchronize());
 #endif

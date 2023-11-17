@@ -429,7 +429,6 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
       } else {
         sliced_inp = buf0;
       }
-      VLOG(0) << "sliced_inp shape[0]: " << sliced_inp.dims()[0];
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, gate & topk";
 #endif
@@ -825,12 +824,10 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
 
       // phi::AddKernel<T, phi::GPUContext>(dev_ctx, all_gather_out, bias_dropout_residual_out, &moe_out);
       x_data = moe_out.data<T>();
-      VLOG(0) << "layer " << i + 1 << " end";
 
     } // layers loop end
     moe_out.Resize({{bsz, seq_len, dim_embed}});
     *out = moe_out;
-    VLOG(0) << "kernel end";
   }
 };
 
