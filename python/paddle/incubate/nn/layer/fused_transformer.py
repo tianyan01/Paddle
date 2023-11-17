@@ -1516,7 +1516,6 @@ class FusedMoELayer(Layer):
             self.mp_rank = mp_group.rank
             self.mp_size = mp_group.nranks
         self.d_model = d_model
-        self.dim_feedforward = dim_feedforward
         self.top_k = top_k
         self.approximate = approximate
         self.ln_scale = self.create_parameter(
@@ -1589,10 +1588,7 @@ class FusedMoELayer(Layer):
             self.linear2_biases[i].name = "expert_" + self.linear2_biases[i].name
         
     def forward(self, inp):
-        bsz = inp.shape[0]
-        seq_len = inp.shape[1]
-        out = _C_ops.fused_moe_kernel(
-            inp,
+        inp = _C_ops.fused_moe_kernel(
             inp,
             self.gate_weight,
             self.gate_bias,
@@ -1610,13 +1606,9 @@ class FusedMoELayer(Layer):
             self.num_expert,
             self.world_size,
             -1 if self.group is None else self.group.id,
-            self.approximate,
-            bsz,
-            seq_len,
-            self.d_model,
-            self.dim_feedforward
+            self.approximate
         )
-        return out
+        return inp
     
     def _amp_decorate(self, dtype):
         # tmp fix for amp.decorator(O2)

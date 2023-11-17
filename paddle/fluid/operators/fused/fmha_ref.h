@@ -18,12 +18,15 @@ limitations under the License. */
 #include "paddle/fluid/operators/dropout_impl.cu.h"
 #include "paddle/fluid/operators/fused/fused_softmax_mask.cu.h"
 #include "paddle/fluid/operators/transpose_op.cu.h"
+#include "paddle/phi/kernels/flash_attn_grad_kernel.h"
+#include "paddle/phi/kernels/flash_attn_kernel.h"
 #include "paddle/phi/kernels/funcs/broadcast_function.h"
 #include "paddle/phi/kernels/funcs/concat_and_split_functor.h"
 #include "paddle/phi/kernels/funcs/elementwise_base.h"
 #include "paddle/phi/kernels/funcs/elementwise_functor.h"
 #include "paddle/phi/kernels/funcs/functors.h"
 #include "paddle/phi/kernels/gpudnn/softmax_gpudnn.h"
+#include "paddle/utils/optional.h"
 
 namespace paddle {
 namespace operators {
@@ -769,6 +772,150 @@ class FMHARef {
   AttnDropoutParam dropout_param_;
 };
 
+template <typename T>
+class FlashAttnFMHARef {
+ public:
+  FlashAttnFMHARef(const phi::GPUContext& dev_ctx,
+                   int64_t batch_size,
+                   int64_t seq_len,
+                   int64_t num_head,
+                   int64_t head_dim,
+                   AttnDropoutParam param)
+      : dev_ctx_(dev_ctx),
+        batch_size_(batch_size),
+        seq_len_(seq_len),
+        num_head_(num_head),
+        head_dim_(head_dim),
+        dropout_param_(param) {}
+
+  ~FlashAttnFMHARef() {}
+
+  void ComputeForward(const phi::DenseTensor& qkv_input_tensor,
+                      const phi::DenseTensor* cache_kv_tensor,
+                      const phi::DenseTensor* src_mask_tensor,
+                      phi::DenseTensor* transpose_2_out_tensor,
+                      phi::DenseTensor* cache_kv_out_tensor,
+                      phi::DenseTensor* softmax_lse_out_tensor,
+                      phi::DenseTensor* seed_offset,
+                      phi::DenseTensor* softmax_out_tensor,
+                      phi::DenseTensor* fmha_out_tensor) {
+    // input shape: [bs, seq_len, 3, num_head, head_dim]
+    // transpose with perm [2, 0, 1, 3, 4],
+    // output_shape: [3, bs, seq_len, num_head, head_dim]
+    std::vector<int> perm_1 = {2, 0, 1, 3, 4};
+    TransposeGPUKernelDriver<T>(
+        dev_ctx_, qkv_input_tensor, perm_1, transpose_2_out_tensor);
+
+    phi::DenseTensor q, k, v;
+    q = transpose_2_out_tensor->Slice(0, 1);
+    auto dim = phi::make_ddim({batch_size_, seq_len_, num_head_, head_dim_});
+    q.Resize(dim);
+    if (cache_kv_tensor) {
+      // kv [2, bs, seq_len, num_head, head_dim]
+      auto kv_tensor = transpose_2_out_tensor->Slice(1, 3);
+      phi::funcs::ConcatFunctor<phi::GPUContext, T> concat;
+      // out [2, bs, cache_seq_len + seq_len, num_head,  head_dim]
+      concat(dev_ctx_, {*cache_kv_tensor, kv_tensor}, 2, cache_kv_out_tensor);
+      dim[1] = cache_kv_out_tensor->dims()[3];
+      k = cache_kv_out_tensor->Slice(0, 1);
+      v = cache_kv_out_tensor->Slice(1, 2);
+    } else {
+      if (cache_kv_out_tensor) {
+        *cache_kv_out_tensor = transpose_2_out_tensor->Slice(1, 3);
+      }
+      k = transpose_2_out_tensor->Slice(1, 2);
+      v = transpose_2_out_tensor->Slice(2, 3);
+    }
+    k.Resize(dim);
+    v.Resize(dim);
+
+    auto seed = paddle::make_optional(
+        (dropout_param_.is_fix_seed_ && dropout_param_.seed_ != nullptr),
+        *dropout_param_.seed_);
+    auto mask =
+        paddle::make_optional((src_mask_tensor != nullptr), *src_mask_tensor);
+    bool return_softmax =
+        (!dropout_param_.is_test_ && dropout_param_.dropout_prob_ > 0.0f);
+    // q.shape[1] != 1,
+    phi::FlashAttnKernel<T, phi::GPUContext>(
+        dev_ctx_,
+        q,
+        k,
+        v,
+        seed,
+        mask,
+        dropout_param_.dropout_prob_,
+        (seq_len_ != 1),
+        return_softmax,
+        dropout_param_.is_test_,
+        "",
+        fmha_out_tensor,
+        softmax_out_tensor,      // softmax
+        softmax_lse_out_tensor,  // softmax_lse
+        seed_offset);            // seed_offset
+  }
+  void ComputeBackward(const phi::DenseTensor& transpose_2_out_tensor,
+                       const phi::DenseTensor* src_mask_tensor,
+                       const phi::DenseTensor& softmax_out_tensor,
+                       const phi::DenseTensor& seed_offset_tensor,
+                       const phi::DenseTensor& fmha_out_tensor,
+                       const phi::DenseTensor& fmha_out_grad_tensor,
+                       phi::DenseTensor* transpose_2_out_grad_tensor,
+                       phi::DenseTensor* qkv_input_grad_tensor) {
+    // transpose_2_out_tensor: [3, bs, seq_len, num_head, head_dim]
+    phi::DenseTensor q, k, v;
+    q = transpose_2_out_tensor.Slice(0, 1);
+    k = transpose_2_out_tensor.Slice(1, 2);
+    v = transpose_2_out_tensor.Slice(2, 3);
+
+    auto dim = phi::make_ddim({batch_size_, seq_len_, num_head_, head_dim_});
+    q.Resize(dim);
+    k.Resize(dim);
+    v.Resize(dim);
+
+    phi::DenseTensor dq, dk, dv;
+    dq = transpose_2_out_grad_tensor->Slice(0, 1);
+    dk = transpose_2_out_grad_tensor->Slice(1, 2);
+    dv = transpose_2_out_grad_tensor->Slice(2, 3);
+    dq.Resize(dim);
+    dk.Resize(dim);
+    dv.Resize(dim);
+
+    auto mask =
+        paddle::make_optional((src_mask_tensor != nullptr), *src_mask_tensor);
+    phi::FlashAttnGradKernel<T, phi::GPUContext>(
+        dev_ctx_,
+        q,
+        k,
+        v,
+        fmha_out_tensor,               // out
+        softmax_out_tensor,            // softmax_lse
+        seed_offset_tensor,            // seed_offset
+        mask,                          // attn_mask
+        fmha_out_grad_tensor,          // dout
+        dropout_param_.dropout_prob_,  // dropout
+        (seq_len_ != 1),               // causal
+        &dq,
+        &dk,
+        &dv);
+
+    // transpose_2_out_grad_tensor [3, bs, seq_len, num_head, head_dim]
+    // input grad shape: [bs, seq_len, 3, num_head, head_dim]
+    std::vector<int> perm_1 = {1, 2, 0, 3, 4};
+    TransposeGPUKernelDriver<T>(
+        dev_ctx_, *transpose_2_out_grad_tensor, perm_1, qkv_input_grad_tensor);
+  }
+
+ private:
+  const phi::GPUContext& dev_ctx_;
+
+  int64_t batch_size_;
+  int64_t seq_len_;
+  int64_t num_head_;
+  int64_t head_dim_;
+
+  AttnDropoutParam dropout_param_;
+};
+
 }  // namespace operators
 }  // namespace paddle
-

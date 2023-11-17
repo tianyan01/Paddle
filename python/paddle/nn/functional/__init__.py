@@ -129,6 +129,12 @@ from .extension import gather_tree  # noqa: F401
 from .extension import temporal_shift  # noqa: F401
 
 from .sparse_attention import sparse_attention
+from .flash_attention import (  # noqa: F401
+    scaled_dot_product_attention,
+    sdp_kernel,
+    flash_attention,
+    flash_attn_unpadded,
+)
 
 __all__ = [  # noqa
     'celu',
@@ -242,4 +248,7 @@ __all__ = [  # noqa
     'triplet_margin_with_distance_loss',
     'triplet_margin_loss',
     'soft_margin_loss',
+    'scaled_dot_product_attention',
+    'flash_attention',
+    'flash_attn_unpadded'
 ]

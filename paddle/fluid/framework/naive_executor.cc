@@ -25,6 +25,8 @@
 #if PADDLE_WITH_TENSORRT
 #include "paddle/fluid/operators/tensorrt/tensorrt_engine_op.h"
 #endif
+#include "paddle/fluid/framework/executor_gc_helper.h"
+#include "paddle/fluid/string/string_helper.h"
 
 namespace paddle {
 namespace framework {
@@ -37,9 +39,20 @@ void NaiveExecutor::Prepare(Scope *scope,
   } else {
     scope_ = scope;
   }
+  root_scope_ = scope;
+  while (root_scope_->parent()) {
+    root_scope_ = root_scope_->parent();
+  }
 
-  VLOG(3) << "NaiveExecutor init with scope " << scope;
+  gc_ = nullptr;
+  int64_t max_memory_size = GetEagerDeletionThreshold();
+  if (FLAGS_enable_opt_infer_gc_var && max_memory_size >= 0) {
+    auto gc = CreateGarbageCollector(place_, max_memory_size);
+    gc_ = gc.release();
+  }
+
   CreateOps(program_desc, block_id, with_feed_fetch_ops);
+  VLOG(3) << "NaiveExecutor init with scope " << scope;
 }
 
 void NaiveExecutor::Run() {
@@ -104,7 +117,21 @@ void NaiveExecutor::CreateVariables(const ProgramDesc &desc,
 void NaiveExecutor::CreateOps(const ProgramDesc &desc,
                               int block_id,
                               bool with_feed_fetch_ops) {
-  for (const auto &op_desc : desc.Block(block_id).AllOps()) {
+  auto &global_block = desc.Block(block_id);
+  // create op
+  auto ops_desc = global_block.AllOps();
+  for (const auto &op_desc : ops_desc) {
+    // gc var
+    if (gc_) {
+      if (op_desc->Type() == "feed" || op_desc->Type() == "fetch") {
+        for (auto &o : op_desc->Inputs()) {
+          skip_vars_.insert(skip_vars_.end(), o.second.begin(), o.second.end());
+        }
+        for (auto &o : op_desc->Outputs()) {
+          skip_vars_.insert(skip_vars_.end(), o.second.begin(), o.second.end());
+        }
+      }
+    }
     if (!with_feed_fetch_ops &&
         (op_desc->Type() == "feed" || op_desc->Type() == "fetch")) {
       LOG(INFO) << "---  skip [" << op_desc->Input("X")[0] << "], "
@@ -113,6 +140,11 @@ void NaiveExecutor::CreateOps(const ProgramDesc &desc,
     }
     ops_.emplace_back(OpRegistry::CreateOp(*op_desc));
   }
+  if (!gc_) {
+    return;
+  }
+  // get used
+  unused_vars_ = GetUnusedVars(global_block, ops_, skip_vars_);
 }
 
 LoDTensor *NaiveExecutor::FindTensor(const std::string &name) {
@@ -136,6 +168,12 @@ void NaiveExecutor::CleanFeedFetchOps() {
   }
   ops_.swap(ops);
 }
+void NaiveExecutor::AddSkipVars(const std::vector<std::string> &skip_vars) {
+  if (skip_vars.empty()) {
+    return;
+  }
+  skip_vars_.insert(skip_vars_.end(), skip_vars.begin(), skip_vars.end());
+}
 
 NaiveExecutor::~NaiveExecutor() {
 #ifdef PADDLE_WITH_MKLDNN
@@ -143,6 +181,10 @@ NaiveExecutor::~NaiveExecutor() {
   // this is needed to have mkl-dnn unit tests working
   platform::ClearMKLDNNCache(place_, this);
 #endif
+  if (gc_) {
+    delete gc_;
+    gc_ = nullptr;
+  }
 }
 
 void NaiveExecutor::ResetTrtOps(int num) {

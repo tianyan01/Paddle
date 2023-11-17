@@ -174,6 +174,8 @@ bool IsGPUManagedMemoryOversubscriptionSupported(int dev_id);
 //! Get the primitive pointer return from cudaMalloc, just implemented with
 //! testing, do not use for release
 void *GetGpuBasePtr(void *ptr, int dev_id);
+//! is support flash attn
+bool IsSupportFlashAttn(int dev_id);
 
 }  // namespace platform
 }  // namespace paddle

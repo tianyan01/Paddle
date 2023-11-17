@@ -168,7 +168,7 @@ void GlobalScatterFunctor(const phi::GPUContext& ctx,
   if (platform::is_cpu_place(local_count->place())) {
     cpu_local_count_data = local_count->data<int64_t>();
   } else {
-    framework::TensorCopySync(
+    framework::TensorCopy(
         *local_count, platform::CPUPlace(), &cpu_local_count);
     cpu_local_count_data = cpu_local_count.data<int64_t>();
   }
@@ -178,11 +178,12 @@ void GlobalScatterFunctor(const phi::GPUContext& ctx,
     cpu_global_count_data = global_count->data<int64_t>();
     global_count_len = global_count->numel();
   } else {
-    framework::TensorCopySync(
+    framework::TensorCopy(
         *global_count, platform::CPUPlace(), &cpu_global_count);
     cpu_global_count_data = cpu_global_count.data<int64_t>();
     global_count_len = cpu_global_count.numel();
   }
+  ctx.Wait();
 
   ncclDataType_t dtype =
       platform::ToNCCLDataType(framework::TransToProtoVarType(x->dtype()));
@@ -274,7 +275,7 @@ void GlobalScatterProcessGroupFunctor(const phi::GPUContext& ctx,
   if (platform::is_cpu_place(local_count->place())) {
     cpu_local_count_data = local_count->data<int64_t>();
   } else {
-    framework::TensorCopySync(
+    framework::TensorCopy(
         *local_count, platform::CPUPlace(), &cpu_local_count);
     cpu_local_count_data = cpu_local_count.data<int64_t>();
   }
@@ -284,11 +285,12 @@ void GlobalScatterProcessGroupFunctor(const phi::GPUContext& ctx,
     cpu_global_count_data = global_count->data<int64_t>();
     global_count_len = global_count->numel();
   } else {
-    framework::TensorCopySync(
+    framework::TensorCopy(
         *global_count, platform::CPUPlace(), &cpu_global_count);
     cpu_global_count_data = cpu_global_count.data<int64_t>();
     global_count_len = cpu_global_count.numel();
   }
+  ctx.Wait();
 
   PADDLE_ENFORCE_GE(
       ring_id,
@@ -369,7 +371,7 @@ void GlobalGatherFunctor(const phi::GPUContext& ctx,
     cpu_local_count_data = local_count->data<int64_t>();
     local_count_len = local_count->numel();
   } else {
-    framework::TensorCopySync(
+    framework::TensorCopy(
         *local_count, platform::CPUPlace(), &cpu_local_count);
     cpu_local_count_data = cpu_local_count.data<int64_t>();
     local_count_len = cpu_local_count.numel();
@@ -379,10 +381,11 @@ void GlobalGatherFunctor(const phi::GPUContext& ctx,
   if (platform::is_cpu_place(global_count->place())) {
     cpu_global_count_data = global_count->data<int64_t>();
   } else {
-    framework::TensorCopySync(
+    framework::TensorCopy(
         *global_count, platform::CPUPlace(), &cpu_global_count);
     cpu_global_count_data = cpu_global_count.data<int64_t>();
   }
+  ctx.Wait();
 
   ncclDataType_t dtype =
       platform::ToNCCLDataType(framework::TransToProtoVarType(x->dtype()));
@@ -478,7 +481,7 @@ void GlobalGatherProcessGroupFunctor(const phi::GPUContext& ctx,
     cpu_local_count_data = local_count->data<int64_t>();
     local_count_len = local_count->numel();
   } else {
-    framework::TensorCopySync(
+    framework::TensorCopy(
         *local_count, platform::CPUPlace(), &cpu_local_count);
     cpu_local_count_data = cpu_local_count.data<int64_t>();
     local_count_len = cpu_local_count.numel();
@@ -488,10 +491,11 @@ void GlobalGatherProcessGroupFunctor(const phi::GPUContext& ctx,
   if (platform::is_cpu_place(global_count->place())) {
     cpu_global_count_data = global_count->data<int64_t>();
   } else {
-    framework::TensorCopySync(
+    framework::TensorCopy(
         *global_count, platform::CPUPlace(), &cpu_global_count);
     cpu_global_count_data = cpu_global_count.data<int64_t>();
   }
+  ctx.Wait();
 
   PADDLE_ENFORCE_GE(
       ring_id,
@@ -592,7 +596,6 @@ void MatMulAndAdd(const phi::GPUContext& dev_ctx,
 template <typename T, typename DeviceContext>
 void FusedMoeKernel(const DeviceContext& context,
                     const DenseTensor& x,
-                    const DenseTensor& residual,
                     const DenseTensor& gate_weight,
                     const DenseTensor& gate_bias,
                     const DenseTensor& ln_scale,
@@ -610,10 +613,6 @@ void FusedMoeKernel(const DeviceContext& context,
                     int world_size,
                     int moe_ring_id,
                     bool approximate,
-                    int bsz,
-                    int seq_len,
-                    int d_model,
-                    int dim_feedforward,
                     DenseTensor* out);
 
 }  // namespace phi
