@@ -27,6 +27,9 @@
 #endif
 #include "paddle/fluid/framework/executor_gc_helper.h"
 #include "paddle/fluid/string/string_helper.h"
+PADDLE_DEFINE_EXPORTED_bool(enable_opt_infer_gc_var,
+                            false,
+                            "enable opt infer gc var");
 
 namespace paddle {
 namespace framework {

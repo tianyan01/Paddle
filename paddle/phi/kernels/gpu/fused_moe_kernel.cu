@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "paddle/phi/kernels/gpu/fused_moe_kernel.cu.h"
+#include "paddle/phi/kernels/funcs/scatter.cu.h"
 
 namespace phi {
 using Tensor = DenseTensor;
@@ -380,7 +381,14 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   // step 11, add residual
   // VLOG(0) << "moe, add residual";
   AddKernel<T, DeviceContext>(dev_ctx, all_gather_out, x, out);
+  // layer norm
   if (!pre_layer_norm) {
+    auto* ln_mean_data = dev_ctx.template Alloc<U>(&ln_mean);
+	auto* ln_variance_data = dev_ctx.template Alloc<U>(&ln_variance);
+	auto* ln_out_data = dev_ctx.template Alloc<T>(&ln_out);
+
+	const U* ln_scale_ptr = ln_scale.data<U>();
+	const U* ln_bias_ptr = ln_bias.data<U>();
     pre_layernorm_helper.LayerNorm(dev_ctx,
                                    out->data<T>(),
                                    ln_scale_ptr,
