@@ -36,14 +36,14 @@ class PDTraits;
 
 template <>
 class PDTraits<paddle::DataType::FLOAT32> {
-public:
+ public:
   typedef float DataType;
   typedef float data_t;
 };
 
 template <>
 class PDTraits<paddle::DataType::FLOAT16> {
-public:
+ public:
   typedef half DataType;
   typedef paddle::float16 data_t;
 };
@@ -207,7 +207,9 @@ class FMHARef {
       out_seq_len = cache_kv_out_tensor->dims()[3];
     } else {
       if (cache_kv_out_tensor) {
-        *cache_kv_out_tensor = transpose_2_out_tensor->Slice(1, 3);
+        auto kv_tensor = transpose_2_out_tensor->Slice(1, 3);
+        framework::TensorCopy(
+            kv_tensor, kv_tensor.place(), cache_kv_out_tensor);
       }
     }
 
@@ -821,7 +823,8 @@ class FlashAttnFMHARef {
       v = cache_kv_out_tensor->Slice(1, 2);
     } else {
       if (cache_kv_out_tensor) {
-        *cache_kv_out_tensor = transpose_2_out_tensor->Slice(1, 3);
+        auto kv_tensor = transpose_2_out_tensor->Slice(1, 3);
+        framework::TensorCopy(kv_tensor, kv_tensor.place(), cache_kv_out_tensor);
       }
       k = transpose_2_out_tensor->Slice(1, 2);
       v = transpose_2_out_tensor->Slice(2, 3);

@@ -312,9 +312,8 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   // step7. MOEGather
   Tensor global_gather_out;
   if (world_size > 1) {
-    global_gather_out.ShareDataWith(*out);
     global_gather_out.Resize({{out_batch_size, d_model}});
-    //	dev_ctx.template Alloc<T>(&global_gather_out);
+    dev_ctx.template Alloc<T>(&global_gather_out);
     auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
     // step 7.1, global_gather
     if (map->has(moe_ring_id)) {
@@ -341,7 +340,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   // suppose pos->shape != [0]
   Tensor moe_gather_out;
   if (pre_layer_norm) {
-    moe_gather_out.ShareDataWith(ln_out);
+    moe_gather_out.ShareDataWith(index_select_out);
     moe_gather_out.Resize({{out_batch_size, d_model}});
   } else {
     moe_gather_out.Resize({{out_batch_size, d_model}});
