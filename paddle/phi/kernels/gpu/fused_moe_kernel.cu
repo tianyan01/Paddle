@@ -358,6 +358,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   bmm_out.Resize({{sliced_bsz_seq, 1, d_model}});
   //	dev_ctx.template Alloc<T>(&bmm_out);
   BmmKernel<T, DeviceContext>(dev_ctx, topk_value, moe_gather_out, &bmm_out);
+  bmm_out.Resize({{sliced_bsz_seq, d_model}});
 
   Tensor all_gather_out;
   // step 9, AllGather
