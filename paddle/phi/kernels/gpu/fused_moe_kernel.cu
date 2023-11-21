@@ -352,17 +352,12 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   // step 8, reshape & bmm
   // moe gather out reshape
   Tensor bmm_out;
-  if (topk > 1) {
-    moe_gather_out.Resize({{sliced_bsz_seq, topk, d_model}});
-    topk_value.Resize({{sliced_bsz_seq, 1, topk}});
-    bmm_out.ShareDataWith(*out);
-    bmm_out.Resize({{sliced_bsz_seq, 1, d_model}});
-    //	dev_ctx.template Alloc<T>(&bmm_out);
-    BmmKernel<T, DeviceContext>(dev_ctx, topk_value, moe_gather_out, &bmm_out);
-  } else {
-    bmm_out = moe_gather_out;
-  }
-  bmm_out.Resize({{sliced_bsz_seq, d_model}});
+  moe_gather_out.Resize({{sliced_bsz_seq, topk, d_model}});
+  topk_value.Resize({{sliced_bsz_seq, 1, topk}});
+  bmm_out.ShareDataWith(*out);
+  bmm_out.Resize({{sliced_bsz_seq, 1, d_model}});
+  //	dev_ctx.template Alloc<T>(&bmm_out);
+  BmmKernel<T, DeviceContext>(dev_ctx, topk_value, moe_gather_out, &bmm_out);
 
   Tensor all_gather_out;
   // step 9, AllGather
