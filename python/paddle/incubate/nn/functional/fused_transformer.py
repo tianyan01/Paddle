@@ -847,6 +847,8 @@ def fused_multi_transformer(
     pre_layer_norm=True,
     epsilon=1e-05,
     cache_kvs=None,
+    beam_offset=None,
+    seq_lens=None,
     time_step=None,
     attn_mask=None,
     dropout_rate=0.0,
@@ -1006,7 +1008,9 @@ def fused_multi_transformer(
             list(qkv_weights),
             list(qkv_biases),
             cache_kvs,
+            beam_offset,
             time_step,
+            seq_lens,
             attn_mask,
             list(linear_weights),
             list(linear_biases),
@@ -1054,6 +1058,8 @@ def fused_multi_transformer(
         inputs['LnScale'] = list(ln_scales)
         inputs['LnBias'] = list(ln_biases)
         inputs['QKVW'] = list(qkv_weights)
+        if seq_lens is not None:
+            inputs['SeqLengths'] = seq_lens
         if qkv_biases is not None:
             inputs['QKVBias'] = list(qkv_biases)
         if cache_kvs is not None:
@@ -1061,6 +1067,8 @@ def fused_multi_transformer(
             inputs['CacheKV'] = cache_kvs
             if time_step is not None:
                 inputs['TimeStep'] = time_step
+        if beam_offset is not None:
+            inputs['BeamCacheOffset'] = beam_offset
         inputs['SrcMask'] = attn_mask
         inputs['OutLinearW'] = list(linear_weights)
         if linear_biases is not None:

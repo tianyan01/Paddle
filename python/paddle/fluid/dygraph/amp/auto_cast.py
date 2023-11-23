@@ -192,6 +192,7 @@ def pure_fp16_initialize(models):
             if isinstance(layer, (paddle.incubate.nn.FusedFeedForward,
                                   paddle.incubate.nn.FusedMultiHeadAttention,
                                   paddle.incubate.nn.FusedMultiTransformer,
+                                  paddle.incubate.nn.FusedMultiTransformerMoe,
                                   paddle.incubate.nn.FusedMoELayer)):
                 layer._amp_decorate(dtype='float16')
                 continue

@@ -21,7 +21,7 @@ limitations under the License. */
 namespace paddle {
 namespace operators {
 
-using Tensor = framework::Tensor;
+using Tensor = phi::DenseTensor;
 
 class FusedMultiTransformerINT8Op : public framework::OperatorWithKernel {
  private:
@@ -58,6 +58,12 @@ class FusedMultiTransformerINT8Op : public framework::OperatorWithKernel {
     CHECK_INPUTS(FFN1Weight);
     CHECK_INPUTS(FFN2Weight);
 
+    // scale
+    CHECK_INPUTS(QKVOutScale);
+    CHECK_INPUTS(OutLinearOutScale);
+    CHECK_INPUTS(FFN1OutScale);
+    CHECK_INPUTS(FFN2OutScale);
+
     CHECK_OUTPUT(Out);
 
     // x: qkv's input [batch_size, seq_len, dim_embed]
@@ -93,26 +99,6 @@ class FusedMultiTransformerINT8Op : public framework::OperatorWithKernel {
             x_dim,
             y_dim));
 
-    if (ctx->Attrs().Get<int>("ring_id") == -1) {
-      if (trans_qkvw) {
-        PADDLE_ENFORCE_EQ(y_dim[1] * y_dim[2],
-                          y_dim[3],
-                          platform::errors::InvalidArgument(
-                              "The dimensions of qkv_weight must be 4"
-                              "(3, num_head, dim_head, dim_embed),"
-                              "and must satisfy the limitations: "
-                              "(num_head * dim_head == dim_embed)"));
-
-      } else {
-        PADDLE_ENFORCE_EQ(y_dim[2] * y_dim[3],
-                          y_dim[0],
-                          platform::errors::InvalidArgument(
-                              "The dimensions of qkv_weight must be 4"
-                              "(dim_embed, 3, num_head, dim_head),"
-                              "and must satisfy the limitations: "
-                              "(num_head * dim_head == dim_embed)"));
-      }
-    }
 
     if (ctx->HasInputs("CacheKV")) {
       // [2, batch_size, num_head, max_seq_len, head_size]
@@ -129,13 +115,7 @@ class FusedMultiTransformerINT8Op : public framework::OperatorWithKernel {
                         paddle::platform::errors::InvalidArgument(
                             "The first dim of CacheKV must be 2, but got %d",
                             c_dim[0]));  // 2
-      PADDLE_ENFORCE_EQ(c_dim[1],
-                        x_dim[0],
-                        paddle::platform::errors::InvalidArgument(
-                            "The second dim of CacheKV must be equal with "
-                            "batch size %d, but got %d",
-                            x_dim[0],
-                            c_dim[1]));  // batch_size
+
       PADDLE_ENFORCE_EQ(c_dim[2],
                         trans_qkvw ? y_dim[1] : y_dim[2],
                         paddle::platform::errors::InvalidArgument(
@@ -143,12 +123,7 @@ class FusedMultiTransformerINT8Op : public framework::OperatorWithKernel {
                             "head %d, but got %d",
                             trans_qkvw ? y_dim[1] : y_dim[2],
                             c_dim[2]));  // num_head
-      PADDLE_ENFORCE_GT(
-          c_dim[3],
-          0,
-          paddle::platform::errors::InvalidArgument(
-              "The forth dim of CacheKV must be greater than 0, but got %d",
-              c_dim[3]));  // cache_seq_len
+
       PADDLE_ENFORCE_EQ(c_dim[4],
                         trans_qkvw ? y_dim[2] : y_dim[3],
                         paddle::platform::errors::InvalidArgument(
@@ -200,8 +175,20 @@ class FusedMultiTransformerINT8OpMaker
     AddInput("CacheKV", "(optional) The cached KV for generation inference.")
         .AsDispensable()
         .AsDuplicable();
+    AddInput("PreCaches",
+             "(optional) The prefix caches for generation inference.")
+        .AsDispensable()
+        .AsDuplicable();
+    AddInput("RotaryPosEmb",
+             "(optional) The RoPE embeddings for generation inference.")
+        .AsDispensable();
+    AddInput("BeamCacheOffset",
+             "(optional) The offset of CacheKV when using BeamSearch.")
+        .AsDispensable();
     AddInput("TimeStep",
              "(optional, int) The time step for generation inference.")
+        .AsDispensable();
+    AddInput("SeqLengths", "(optional) The sequence length tensor of inputs.")
         .AsDispensable();
     AddInput("SrcMask", "(optional) The attention mask tensor in fmha.")
         .AsDispensable();
@@ -232,20 +219,24 @@ class FusedMultiTransformerINT8OpMaker
              "In order to keep consistent with the PTQ/QAT calculation logic,"
              "QKVOutScale should be max_bound * max_bound / max_range."
              "Here max_range is per-channel weight scale."
-             "The shape of QKVOutScale is [num_layers, num_channels]")
-        .AsDispensable();
+             "The shape of QKVOutScale is [num_channels]")
+        .AsDispensable()
+        .AsDuplicable();
     AddInput("OutLinearOutScale",
              "OutLinearOutScale is used to dequantize out_linear output tensor."
              "The definition and shape is the same as QKVOutScale")
-        .AsDispensable();
+        .AsDispensable()
+        .AsDuplicable();
     AddInput("FFN1OutScale",
              "FFN1OutScale is used to dequantize ffn1 output tensor."
              "The definition and shape is the same as QKVOutScale")
-        .AsDispensable();
+        .AsDispensable()
+        .AsDuplicable();
     AddInput("FFN2OutScale",
              "FFN2OutScale is used to dequantize ffn2 output tensor."
              "The definition and shape is the same as QKVOutScale")
-        .AsDispensable();
+        .AsDispensable()
+        .AsDuplicable();
 
     AddOutput("CacheKVOut", "The updated cache KV. Inplace with CacheKV")
         .AsDispensable()
@@ -352,6 +343,18 @@ class FusedMultiTransformerINT8OpMaker
         "quant_min_bound",
         "(float, default -127.0) the min bound of float type to int type")
         .SetDefault(-127.0);
+    AddAttr<int>("rotary_emb_dims",
+                 "the Attr(dims) for RotaryPosEmb's Computation  [default 0].")
+        .SetDefault(0)
+        .AddCustomChecker([](const int &rotary_emb_dims) {
+          PADDLE_ENFORCE_EQ(
+              rotary_emb_dims >= 0 && rotary_emb_dims <= 2,
+              true,
+              platform::errors::InvalidArgument(
+                  "'rotary_emb_dims' in Op(Rotray) should be between"
+                  "0 and 2, But received [%s].",
+                  rotary_emb_dims));
+        });
 
     AddComment(R"DOC(fused multi transformer layers op)DOC");
   }
