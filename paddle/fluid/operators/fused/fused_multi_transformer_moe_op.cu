@@ -208,7 +208,7 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
     topk_value.Resize({{sliced_bsz_seq, topk}});
     dev_ctx.Alloc<T>(&topk_value, topk_value.numel() * sizeof(T));
     topk_idx.Resize({{sliced_bsz_seq, topk}});
-    dev_ctx.Alloc<T>(&topk_idx, topk_idx.numel() * sizeof(T));
+    dev_ctx.Alloc<int64_t>(&topk_idx, topk_idx.numel() * sizeof(int64_t));
     // local expert count, global expert count
     Tensor local_expert_count, global_expert_count;
     local_expert_count.Resize({{tot_expert}});
@@ -642,7 +642,6 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
           
           Tensor tmp_inp = global_scatter_out.Slice(last_index, end);
           int expert_idx = i * num_expert + idx;
-
           // linear1 matmul
           // VLOG(0) << "moe, Expert Computation, linear1 mul";
           phi::MatMulAndAdd<T>(dev_ctx, 

@@ -837,6 +837,7 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
             ffn1_dropout_mask_data,
             ffn1_in_scale[i],
             ffn1_out_scales[i]->data<float>(),
+            0,
             ffn2_in_scale[i],
             quant_round_type,
             quant_max_bound,
