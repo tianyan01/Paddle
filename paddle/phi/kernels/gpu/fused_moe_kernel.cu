@@ -261,11 +261,18 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
       expert_out1.Resize({{cur_expert_count, dim_feedforward}});
       dev_ctx.template Alloc<T>(&expert_out1);
 
-      paddle::operators::FusedDropoutHelper<T, uint8_t>
-          fused_act_dropout_helper(
-              dev_ctx, cur_expert_count, dim_feedforward, dropout_param);
-
       Tensor tmp_inp = global_scatter_out.Slice(last_index, end);
+      // cuda 11.4
+#if (CUDA_VERSION >= 11040)
+      MatMulAndAddGelu<T>(dev_ctx,
+						  experts_weight1[idx],
+						  &tmp_inp,
+						  experts_bias1[idx],
+						  false,
+						  false,
+						  false,  // dont compute bias
+						  &expert_out1);
+#else
       // linear1 matmul
       MatMulAndAdd<T>(dev_ctx,
                       experts_weight1[idx],
@@ -276,6 +283,10 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
                       false,  // dont compute bias
                       &expert_out1,
                       nullptr);
+      
+      paddle::operators::FusedDropoutHelper<T, uint8_t>
+                fused_act_dropout_helper(
+                dev_ctx, cur_expert_count, dim_feedforward, dropout_param);
       // bias gelu
       fused_act_dropout_helper.DropoutActBias(dev_ctx,
                                               expert_out1.data<T>(),
@@ -291,7 +302,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
                                               127.0,
                                               -127.0,
                                               approximate);
-
+#endif
       Tensor expert_out2 = all_expert_out.Slice(last_index, end);
       //      expert_out2.Resize({{cur_expert_count, d_model}});
       // linear2 matmul & add

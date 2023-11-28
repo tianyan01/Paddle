@@ -20,6 +20,9 @@ limitations under the License. */
 #include "paddle/phi/kernels/funcs/blas/blas.h"
 #include "paddle/phi/kernels/funcs/broadcast_function.h"
 #include "paddle/phi/kernels/funcs/elementwise_functor.h"
+#if (defined(PADDLE_WITH_CUDA) && CUDA_VERSION >= 11040)
+#include "paddle/phi/kernels/funcs/blas/blaslt_impl.cu.h"
+#endif
 
 namespace paddle {
 namespace operators {
@@ -54,6 +57,24 @@ class AttnMatMul {
                       framework::Tensor* bias_out) {
     // Note: for blas.GEMM API in Paddle, it treats all inputs as row-major.
     // here: (transa, transb): nt, input * weight.
+#if (CUDA_VERSION >= 11040)
+    if (compute_bias_ && bias != nullptr) {
+      phi::funcs::LinearWithCublasLt<T>::Run(
+          dev_ctx_,
+          input,                                      // x
+          weight,                                     // y
+          bias_out,                                   // out
+          static_cast<const void*>(bias->data<T>()),  // bias
+          nullptr,
+          bsz_seq_,      // M   bsz_seq
+          output_size_,  // N   output_size
+          input_size_,   // K   input_size
+          transA_,
+          transB_,
+          phi::funcs::MatmulFusedType::kMatmulBias);
+      return;
+    }
+#endif
     CBLAS_TRANSPOSE transA = transA_ ? CblasTrans : CblasNoTrans;
     CBLAS_TRANSPOSE transB = transB_ ? CblasTrans : CblasNoTrans;
     T alpha = static_cast<T>(1.0);
@@ -71,7 +92,7 @@ class AttnMatMul {
               weight->data<T>(),
               beta,
               output->data<T>());
-    if (compute_bias_) {
+    if (compute_bias_ && bias != nullptr) {
       // bias_out = output + bias
       std::vector<const Tensor*> ins = {output, bias};
       std::vector<Tensor*> outs = {bias_out};

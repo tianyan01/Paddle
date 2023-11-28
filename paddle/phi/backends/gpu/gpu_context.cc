@@ -216,6 +216,8 @@ struct GPUContext::Impl {
     stream_ = new CUDAStream(place_);
     InitEigenDevice();
     InitDnnWorkspace();
+    GetDnnHandle();
+    GetBlasHandle();
   }
 
   void PartialInitWithoutAllocator() {
@@ -231,6 +233,8 @@ struct GPUContext::Impl {
                            &max_threads_per_block_,
                            &max_grid_dim_size_);
     stream_ = new CUDAStream(place_);
+    GetDnnHandle();
+    GetBlasHandle();
   }
 
   void PartialInitWithAllocator() {
@@ -238,6 +242,8 @@ struct GPUContext::Impl {
     stream_owned_ = true;
     backends::gpu::GPUDeviceGuard guard(place_.device);
     InitDnnWorkspace();
+    GetDnnHandle();
+    GetBlasHandle();
   }
 
   explicit Impl(const GPUPlace& place) : place_(place) {}

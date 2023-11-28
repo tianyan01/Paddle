@@ -205,13 +205,15 @@ class CudnnAlgorithmsCacheMap {
 size_t TransposeKey(const std::vector<int64_t>& x_dims,
                     const std::vector<int32_t>& perm,
                     phi::DataType dtype);
-
-template <typename AlgorithmT>
+template <typename KeyT,
+          typename AlgorithmT,
+          typename HashT = std::hash<KeyT>,
+          typename KeyEqualT = std::equal_to<KeyT>>
 class AlgorithmsCache {
  public:
-  AlgorithmsCache() : cache_mutex_(new std::mutex()) { hash_.clear(); }
+  AlgorithmsCache() : cache_mutex_(new std::mutex()) {}
 
-  AlgorithmT Get(const size_t& key) {
+  AlgorithmT Get(const KeyT& key) {
     std::lock_guard<std::mutex> lock(*cache_mutex_);
     PADDLE_ENFORCE_NE(
         hash_.find(key),
@@ -220,7 +222,7 @@ class AlgorithmsCache {
     return hash_[key];
   }
 
-  bool Find(const size_t& key) {
+  bool Find(const KeyT& key) {
     bool ret = false;
     std::lock_guard<std::mutex> lock(*cache_mutex_);
     if (hash_.find(key) != hash_.end()) {
@@ -239,7 +241,7 @@ class AlgorithmsCache {
     cache_misses_ = 0;
   }
 
-  void Set(const size_t& key, AlgorithmT algo) {
+  void Set(const KeyT& key, AlgorithmT algo) {
     std::lock_guard<std::mutex> lock(*cache_mutex_);
     hash_[key] = algo;
   }
@@ -260,12 +262,41 @@ class AlgorithmsCache {
 
   int64_t Size() const { return hash_.size(); }
 
- private:
-  std::unordered_map<size_t, AlgorithmT> hash_;
+ protected:
+  std::unordered_map<KeyT, AlgorithmT, HashT, KeyEqualT> hash_;
   std::shared_ptr<std::mutex> cache_mutex_;
 
   int64_t cache_hits_{0};
   int64_t cache_misses_{0};
+};
+
+template <typename KeyT, typename AlgorithmT>
+class MatmulAlgorithmsCache : public AlgorithmsCache<KeyT, AlgorithmT> {
+ public:
+  MatmulAlgorithmsCache() : AlgorithmsCache<KeyT, AlgorithmT>() {}
+
+  bool FindSubKey(const KeyT& sub_key) {
+    std::lock_guard<std::mutex> lock(*(this->cache_mutex_));
+    bool ret = (sub_hash_.find(sub_key) != sub_hash_.end()) ? true : false;
+    return ret;
+  }
+
+  void SetSubKey(const KeyT& sub_key, void* algo) {
+    std::lock_guard<std::mutex> lock(*(this->cache_mutex_));
+    sub_hash_[sub_key] = algo;
+  }
+
+  void* GetSubKey(const KeyT& sub_key) {
+    std::lock_guard<std::mutex> lock(*(this->cache_mutex_));
+    PADDLE_ENFORCE_NE(
+        sub_hash_.find(sub_key),
+        sub_hash_.end(),
+        phi::errors::PreconditionNotMet("The key does not exist."));
+    return sub_hash_[sub_key];
+  }
+
+ private:
+  std::unordered_map<KeyT, void*> sub_hash_;
 };
 
 enum class AlgorithmType {
@@ -278,11 +309,12 @@ enum class AlgorithmType {
 
 // AlgorithmsConfigKey -> AlgorithmsID
 // (todo. hong) use cudnnConvolutionFwdAlgo_t
-using AlgorithmsCacheMap = AlgorithmsCache<int64_t>;
+using AlgorithmsCacheMap = AlgorithmsCache<int64_t, int64_t>;
 // AlgorithmType -> AlgorithmsCache
 using AlgorithmsTypeMap = std::unordered_map<int64_t, AlgorithmsCacheMap>;
 using CudnnAlgorithmsTypeMap =
     std::unordered_map<int64_t, CudnnAlgorithmsCacheMap>;
+using MatmulAlgorithmsCacheMap = MatmulAlgorithmsCache<size_t, int64_t>;
 
 class AutoTuneCache {
  public:
@@ -300,6 +332,8 @@ class AutoTuneCache {
   }
 
   AlgorithmsCacheMap& GetTranspose() { return Get(AlgorithmType::kTranspose); }
+
+  MatmulAlgorithmsCacheMap& GetMatmul() { return matmul_auto_tune_map_; }
 
   void Clean() {
     for (auto& v : auto_tune_map_) {
@@ -358,6 +392,7 @@ class AutoTuneCache {
 
   AlgorithmsTypeMap auto_tune_map_;
   CudnnAlgorithmsTypeMap cudnn_auto_tune_map_;
+  MatmulAlgorithmsCacheMap matmul_auto_tune_map_;
   std::shared_ptr<std::mutex> autotune_cache_mutex_;
   int64_t total_cache_hits_{0};
   int64_t total_cache_misses_{0};

@@ -142,17 +142,17 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
     transpose_out_2.Resize({{3, bsz, num_head, seq_len, dim_head}});
     auto *transpose_out_2_data =
         dev_ctx.Alloc<T>(&transpose_out_2, transpose_out_2.numel() * sizeof(T));
-    qk_out.Resize({{bsz, num_head, seq_len, out_seq_len}});
-    auto *qk_out_data = dev_ctx.Alloc<T>(&qk_out, qk_out.numel() * sizeof(T));
 
     Tensor softmax_out;
     Tensor attn_dropout_mask_out, attn_dropout_out;
     Tensor qktv_out, fmha_out;
     if (!is_support_flash_attn) {
+      qk_out.Resize({{bsz, num_head, seq_len, out_seq_len}});
+      auto *qk_out_data = dev_ctx.Alloc<T>(&qk_out, qk_out.numel() * sizeof(T));
+
       softmax_out.Resize({{bsz, num_head, seq_len, out_seq_len}});
       auto *softmax_out_data =
           dev_ctx.Alloc<T>(&softmax_out, softmax_out.numel() * sizeof(T));
-
       qktv_out.Resize({{bsz, num_head, seq_len, dim_head}});
       auto *qktv_out_data =
           dev_ctx.Alloc<T>(&qktv_out, qktv_out.numel() * sizeof(T));
@@ -363,6 +363,7 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
           // input: [bs, seq_len, 3, num_head, head_dim]
           // output: [3, bs, num_head, seq_len, head_dim]
           std::vector<int> perm_1 = {2, 0, 3, 1, 4};
+          transpose_out_2.Resize({{3, bsz, num_head, seq_len, dim_head}});
           TransposeGPUKernelDriver<T>(
               dev_ctx, qkv_out, perm_1, &transpose_out_2);
         } else {
@@ -405,6 +406,26 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
                           seq_len,
                           max_seq_len,
                           dim_head);
+        //        if (dev_ctx.GetPlace().GetDeviceId() == 0) {
+        //		  VLOG(0) << "layer=" << i << ", debug flash attn dims[" <<
+        //				  bsz << ", " << num_head << "," << seq_len << "," << dim_head
+        //<< "]"
+        //				  << "bs=" << qkv_out.dims()[0] << ", seq_len=" <<
+        //qkv_out.dims()[1]
+        //				  << ", max_seq_len=" << cache_kv_out->dims()[3];
+        //		  if (i == 0 || i == 1) {
+        //			  char szname[512] = {0};
+        //			  char szinname[512] = {0};
+        //			  snprintf(szinname, sizeof(szinname), "./%d_input.txt", i);
+        //			  snprintf(szname, sizeof(szname), "./%d_output.txt", i);
+        //			  if (access(szname, 0) != 0) {
+        //				  std::ofstream fout(szinname, std::ios::binary |
+        //std::ofstream::out | std::ofstream::app); 				  fout << qkv_out;
+        //				  std::ofstream fout2(szname, std::ios::binary |
+        //std::ofstream::out | std::ofstream::app); 				  fout2 << fmha_out;
+        //			  }
+        //		  }
+        //		}
       } else {  // not generation
         VLOG(0) << "not support!";
       }
@@ -601,12 +622,19 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
           expert_out1.Resize({{cur_expert_count, dim_feedforward}});
           dev_ctx.Alloc<T>(&expert_out1, expert_out1.numel() * sizeof(T));
 
-          FusedDropoutHelper<T, uint8_t> fused_act_dropout_helper(
-              dev_ctx, cur_expert_count, dim_feedforward, dropout_param);
-
           Tensor tmp_inp = global_scatter_out.Slice(last_index, end);
           int expert_idx = i * num_expert + idx;
-
+          // cuda 11.4
+#if (CUDA_VERSION >= 11040)
+          phi::MatMulAndAddGelu<T>(dev_ctx,
+                                   expert_weights1[expert_idx],
+                                   &tmp_inp,
+                                   expert_biases1[expert_idx],
+                                   false,
+                                   false,
+                                   false,  // dont compute bias
+                                   &expert_out1);
+#else
           // linear1 matmul
           // VLOG(0) << "moe, Expert Computation, linear1 mul";
           phi::MatMulAndAdd<T>(dev_ctx,
@@ -619,6 +647,8 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
                                &expert_out1,
                                nullptr);
           // bias gelu
+          FusedDropoutHelper<T, uint8_t> fused_act_dropout_helper(
+              dev_ctx, cur_expert_count, dim_feedforward, dropout_param);
           // VLOG(0) << "moe, Expert Computation, add bias & gelu";
           // inplace
           fused_act_dropout_helper.DropoutActBias(
@@ -636,7 +666,7 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
               127.0,
               -127.0,
               approximate);
-
+#endif
           // linear2 matmul & add
           // VLOG(0) << "moe, Expert Computation, linear2 matmul & add";
           Tensor expert_out2 = all_expert_out.Slice(last_index, end);

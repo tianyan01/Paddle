@@ -47,7 +47,9 @@
 #include "paddle/fluid/platform/collective_helper.h"
 #include "paddle/fluid/platform/device/gpu/nccl_helper.h"
 #endif
-
+#if (defined(PADDLE_WITH_CUDA) && CUDA_VERSION >= 11040)
+#include "paddle/phi/kernels/funcs/blas/blaslt_impl.cu.h"
+#endif
 namespace phi {
 using Tensor = DenseTensor;
 namespace framework = paddle::framework;
@@ -556,6 +558,32 @@ void GlobalGatherProcessGroupFunctor(const phi::GPUContext& ctx,
 }
 
 template <typename T>
+void MatMulAndAddGelu(const phi::GPUContext& dev_ctx,
+                  const framework::Tensor* weight,
+                  const framework::Tensor* input,
+                  const framework::Tensor* bias,
+                  bool istransA,
+                  bool istransB,
+                  bool compute_bias,
+                  framework::Tensor* output) {
+#if (defined(PADDLE_WITH_CUDA) && CUDA_VERSION >= 11040)
+  phi::funcs::LinearWithCublasLt<T>::Run(
+			  dev_ctx,
+	          input,         // x
+	          weight,        // y
+	          output,        // out
+			  ((compute_bias) ? static_cast<const void*>(bias->data<T>()): nullptr),      // bias
+	          nullptr,
+			  input->dims()[0],      // M  bsz_seq
+			  weight->dims()[1],     // N  output_size
+			  input->dims()[1],      // K  input_size
+			  istransA,
+			  istransB,
+			  ((compute_bias) ? phi::funcs::MatmulFusedType::kMatmulBiasGelu: phi::funcs::MatmulFusedType::kMatmulGelu));
+#endif
+}
+
+template <typename T>
 void MatMulAndAdd(const phi::GPUContext& dev_ctx,
                   const framework::Tensor* weight,
                   const framework::Tensor* input,
@@ -565,6 +593,24 @@ void MatMulAndAdd(const phi::GPUContext& dev_ctx,
                   bool compute_bias,
                   framework::Tensor* output,
                   framework::Tensor* bias_out) {
+#if (CUDA_VERSION >= 11040)
+  if (compute_bias) {
+    phi::funcs::LinearWithCublasLt<T>::Run(
+			  dev_ctx,
+	          input,                                      // x
+	          weight,                                     // y
+	          bias_out,          					      // out
+	          static_cast<const void*>(bias->data<T>()),  // bias
+	          nullptr,
+			  input->dims()[0],      // M   bsz_seq
+			  weight->dims()[1],     // N   output_size
+			  input->dims()[1],      // K   input_size
+			  istransA,
+			  istransB,
+			  phi::funcs::MatmulFusedType::kMatmulBias);
+    return;
+  }
+#endif
   // Note: for blas.GEMM API in Paddle, it treats all inputs as row-major.
   // here: (transa, transb): nt, input * weight.
   CBLAS_TRANSPOSE transA = istransA ? CblasTrans : CblasNoTrans;

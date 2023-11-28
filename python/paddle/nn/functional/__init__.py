@@ -134,6 +134,7 @@ from .flash_attention import (  # noqa: F401
     sdp_kernel,
     flash_attention,
     flash_attn_unpadded,
+    _math_attention,
 )
 
 __all__ = [  # noqa

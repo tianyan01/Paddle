@@ -207,9 +207,7 @@ class FMHARef {
       out_seq_len = cache_kv_out_tensor->dims()[3];
     } else {
       if (cache_kv_out_tensor) {
-        auto kv_tensor = transpose_2_out_tensor->Slice(1, 3);
-        framework::TensorCopy(
-            kv_tensor, kv_tensor.place(), cache_kv_out_tensor);
+        *cache_kv_out_tensor = transpose_2_out_tensor->Slice(1, 3);
       }
     }
 
@@ -810,6 +808,7 @@ class FlashAttnFMHARef {
 
     phi::DenseTensor q, k, v;
     q = transpose_2_out_tensor->Slice(0, 1);
+    // bs, seq_len, num_head, head_dim
     auto dim = phi::make_ddim({batch_size_, seq_len_, num_head_, head_dim_});
     q.Resize(dim);
     if (cache_kv_tensor) {
@@ -823,8 +822,7 @@ class FlashAttnFMHARef {
       v = cache_kv_out_tensor->Slice(1, 2);
     } else {
       if (cache_kv_out_tensor) {
-        auto kv_tensor = transpose_2_out_tensor->Slice(1, 3);
-        framework::TensorCopy(kv_tensor, kv_tensor.place(), cache_kv_out_tensor);
+        *cache_kv_out_tensor = transpose_2_out_tensor->Slice(1, 3);
       }
       k = transpose_2_out_tensor->Slice(1, 2);
       v = transpose_2_out_tensor->Slice(2, 3);
@@ -834,9 +832,8 @@ class FlashAttnFMHARef {
 
     auto seed = paddle::make_optional(
         (dropout_param_.is_fix_seed_ && dropout_param_.seed_ != nullptr),
-        *dropout_param_.seed_);
-    auto mask =
-        paddle::make_optional((src_mask_tensor != nullptr), *src_mask_tensor);
+         *dropout_param_.seed_);
+    auto mask = paddle::make_optional(*src_mask_tensor);
     bool return_softmax =
         (!dropout_param_.is_test_ && dropout_param_.dropout_prob_ > 0.0f);
     // q.shape[1] != 1,
@@ -848,8 +845,8 @@ class FlashAttnFMHARef {
         seed,
         mask,
         dropout_param_.dropout_prob_,
-        (seq_len_ != 1),
-        return_softmax,
+		(seq_len_ != 1 && src_mask_tensor == nullptr),
+		return_softmax,
         dropout_param_.is_test_,
         "",
         fmha_out_tensor,
@@ -897,7 +894,7 @@ class FlashAttnFMHARef {
         mask,                          // attn_mask
         fmha_out_grad_tensor,          // dout
         dropout_param_.dropout_prob_,  // dropout
-        (seq_len_ != 1),               // causal
+		(seq_len_ != 1 && src_mask_tensor == nullptr),               // causal
         &dq,
         &dk,
         &dv);
