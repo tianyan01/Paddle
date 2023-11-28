@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "paddle/phi/kernels/gpu/fused_moe_kernel.cu.h"
 #include "paddle/phi/kernels/funcs/scatter.cu.h"
+#include "paddle/phi/kernels/gpu/fused_moe_kernel.cu.h"
 
 namespace phi {
 using Tensor = DenseTensor;
@@ -265,13 +265,13 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
       // cuda 11.4
 #if (CUDA_VERSION >= 11040)
       MatMulAndAddGelu<T>(dev_ctx,
-						  experts_weight1[idx],
-						  &tmp_inp,
-						  experts_bias1[idx],
-						  false,
-						  false,
-						  false,  // dont compute bias
-						  &expert_out1);
+                          experts_weight1[idx],
+                          &tmp_inp,
+                          experts_bias1[idx],
+                          false,
+                          false,
+                          false,  // dont compute bias
+                          &expert_out1);
 #else
       // linear1 matmul
       MatMulAndAdd<T>(dev_ctx,
@@ -283,10 +283,10 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
                       false,  // dont compute bias
                       &expert_out1,
                       nullptr);
-      
+
       paddle::operators::FusedDropoutHelper<T, uint8_t>
-                fused_act_dropout_helper(
-                dev_ctx, cur_expert_count, dim_feedforward, dropout_param);
+          fused_act_dropout_helper(
+              dev_ctx, cur_expert_count, dim_feedforward, dropout_param);
       // bias gelu
       fused_act_dropout_helper.DropoutActBias(dev_ctx,
                                               expert_out1.data<T>(),
@@ -390,11 +390,11 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   // layer norm
   if (!pre_layer_norm) {
     auto* ln_mean_data = dev_ctx.template Alloc<U>(&ln_mean);
-	auto* ln_variance_data = dev_ctx.template Alloc<U>(&ln_variance);
-	auto* ln_out_data = dev_ctx.template Alloc<T>(&ln_out);
+    auto* ln_variance_data = dev_ctx.template Alloc<U>(&ln_variance);
+    auto* ln_out_data = dev_ctx.template Alloc<T>(&ln_out);
 
-	const U* ln_scale_ptr = ln_scale.data<U>();
-	const U* ln_bias_ptr = ln_bias.data<U>();
+    const U* ln_scale_ptr = ln_scale.data<U>();
+    const U* ln_bias_ptr = ln_bias.data<U>();
     pre_layernorm_helper.LayerNorm(dev_ctx,
                                    out->data<T>(),
                                    ln_scale_ptr,

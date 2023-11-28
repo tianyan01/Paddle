@@ -406,26 +406,6 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
                           seq_len,
                           max_seq_len,
                           dim_head);
-        //        if (dev_ctx.GetPlace().GetDeviceId() == 0) {
-        //		  VLOG(0) << "layer=" << i << ", debug flash attn dims[" <<
-        //				  bsz << ", " << num_head << "," << seq_len << "," << dim_head
-        //<< "]"
-        //				  << "bs=" << qkv_out.dims()[0] << ", seq_len=" <<
-        //qkv_out.dims()[1]
-        //				  << ", max_seq_len=" << cache_kv_out->dims()[3];
-        //		  if (i == 0 || i == 1) {
-        //			  char szname[512] = {0};
-        //			  char szinname[512] = {0};
-        //			  snprintf(szinname, sizeof(szinname), "./%d_input.txt", i);
-        //			  snprintf(szname, sizeof(szname), "./%d_output.txt", i);
-        //			  if (access(szname, 0) != 0) {
-        //				  std::ofstream fout(szinname, std::ios::binary |
-        //std::ofstream::out | std::ofstream::app); 				  fout << qkv_out;
-        //				  std::ofstream fout2(szname, std::ios::binary |
-        //std::ofstream::out | std::ofstream::app); 				  fout2 << fmha_out;
-        //			  }
-        //		  }
-        //		}
       } else {  // not generation
         VLOG(0) << "not support!";
       }
