@@ -14,7 +14,7 @@ limitations under the License. */
 
 #include "paddle/fluid/operators/fused/fused_multi_transformer_moe_op.h"
 #include "paddle/fluid/operators/fused/layernorm_quant_dequant.h"
-
+#include "paddle/phi/kernels/funcs/scatter.cu.h"
 namespace paddle {
 namespace operators {
 
@@ -22,16 +22,16 @@ using Tensor = phi::DenseTensor;
 // #define _DEBUG_FUSED_MULTI_TRANSFORMER
 
 template <typename T>
-static void PrintMatrix(const T* mat_d, int num, std::string name) {
+static void PrintMatrix(const T *mat_d, int num, std::string name) {
   std::vector<T> tmp(num);
   cudaMemcpy(tmp.data(), mat_d, sizeof(T) * num, cudaMemcpyDeviceToHost);
 
   std::ofstream outfile;
-  outfile.open(name+".txt", std::ios::out);
+  outfile.open(name + ".txt", std::ios::out);
   std::stringstream ss;
 
   for (int i = 0; i < num; ++i) {
-    if(std::is_same<T, int8_t>::value) {
+    if (std::is_same<T, int8_t>::value) {
       ss << static_cast<int>(tmp[i]) << std::endl;
     } else {
       ss << std::setprecision(8) << tmp[i] << std::endl;
@@ -40,7 +40,15 @@ static void PrintMatrix(const T* mat_d, int num, std::string name) {
   outfile << ss.str();
   outfile.close();
 }
-
+// #define _DEBUG_FUSED_MULTI_TRANSFORMER
+inline bool CheckFlashAttn(const phi::GPUContext &dev_ctx,
+                           const phi::DenseTensor &x) {
+  int dev = dev_ctx.GetPlace().GetDeviceId();
+  if (!paddle::platform::IsSupportFlashAttn(dev)) {
+    return false;
+  }
+  return (x.dtype() == DataType::FLOAT16);
+}
 template <typename T>
 class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
  public:
@@ -65,23 +73,26 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     auto out_linear_in_scale =
         ctx.Attr<std::vector<float>>("out_linear_in_scale");
     // moe expert scales, vector, size = num_expert * num_layers
-    auto expert_weight1_in_scale = ctx.Attr<std::vector<float>>("expert_weight1_in_scale");
-    auto expert_weight2_in_scale = ctx.Attr<std::vector<float>>("expert_weight2_in_scale");
+    auto expert_weight1_in_scale =
+        ctx.Attr<std::vector<float>>("expert_weight1_in_scale");
+    auto expert_weight2_in_scale =
+        ctx.Attr<std::vector<float>>("expert_weight2_in_scale");
 
     // quant round type and bound
     auto quant_round_type = ctx.Attr<int>("quant_round_type");
     auto quant_max_bound = ctx.Attr<float>("quant_max_bound");
     auto quant_min_bound = ctx.Attr<float>("quant_min_bound");
 
-    // dequant output scales, vertor<tensor>, size = [num_layers, n], n is gemm output
-    // size
+    // dequant output scales, vertor<tensor>, size = [num_layers, n], n is gemm
+    // output size
     auto qkv_out_scales = ctx.MultiInput<Tensor>("QKVOutScale");
-    auto out_linear_out_scales =
-        ctx.MultiInput<Tensor>("OutLinearOutScale");
-    // dequant output scales, tensor, size = [num_layers * num_expert, n], n is gemm output
-    // size
-    auto expert_weight1_out_scales = ctx.MultiInput<Tensor>("ExpertWeight1OutScale");
-    auto expert_weight2_out_scales = ctx.MultiInput<Tensor>("ExpertWeight2OutScale");
+    auto out_linear_out_scales = ctx.MultiInput<Tensor>("OutLinearOutScale");
+    // dequant output scales, tensor, size = [num_layers * num_expert, n], n is
+    // gemm output size
+    auto expert_weight1_out_scales =
+        ctx.MultiInput<Tensor>("ExpertWeight1OutScale");
+    auto expert_weight2_out_scales =
+        ctx.MultiInput<Tensor>("ExpertWeight2OutScale");
 
     auto *sequence_lengths = ctx.Input<Tensor>("SeqLengths");
     auto *beam_cache_offset = ctx.Input<Tensor>("BeamCacheOffset");
@@ -133,8 +144,12 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
         dev_ctx.Alloc<T>(&qkv_out, qkv_out.numel() * sizeof(T));
 
     // 3. fmha
+    // check support flash attn
     AttnDropoutParam attn_param(
-        true, "upscale_in_train", 0.0, true, true, 0, nullptr);
+           true, "upscale_in_train", 0.0, true, true, 0, nullptr);
+    bool is_support_flash_attn = CheckFlashAttn(dev_ctx, *input_x);
+    auto fmha_fa_compute = FlashAttnFMHARef<plat::float16>(
+        dev_ctx, bsz, seq_len, num_head, dim_head, attn_param);
     auto fmha_compute =
         FMHARef<T>(dev_ctx, bsz, seq_len, num_head, dim_head, attn_param);
     auto *src_mask = ctx.Input<Tensor>("SrcMask");
@@ -152,19 +167,21 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     transpose_out_2.Resize({{3, bsz, num_head, seq_len, dim_head}});
     auto *transpose_out_2_data =
         dev_ctx.Alloc<T>(&transpose_out_2, transpose_out_2.numel() * sizeof(T));
-    qk_out.Resize({{bsz, num_head, seq_len, out_seq_len}});
-    auto *qk_out_data = dev_ctx.Alloc<T>(&qk_out, qk_out.numel() * sizeof(T));
 
     Tensor softmax_out;
     Tensor attn_dropout_mask_out, attn_dropout_out;
     Tensor qktv_out, fmha_out;
-    softmax_out.Resize({{bsz, num_head, seq_len, out_seq_len}});
-    auto *softmax_out_data =
-        dev_ctx.Alloc<T>(&softmax_out, softmax_out.numel() * sizeof(T));
+    if (!is_support_flash_attn) {
+      qk_out.Resize({{bsz, num_head, seq_len, out_seq_len}});
+      auto *qk_out_data = dev_ctx.Alloc<T>(&qk_out, qk_out.numel() * sizeof(T));
+      softmax_out.Resize({{bsz, num_head, seq_len, out_seq_len}});
+      auto *softmax_out_data =
+          dev_ctx.Alloc<T>(&softmax_out, softmax_out.numel() * sizeof(T));
 
-    qktv_out.Resize({{bsz, num_head, seq_len, dim_head}});
-    auto *qktv_out_data =
-        dev_ctx.Alloc<T>(&qktv_out, qktv_out.numel() * sizeof(T));
+      qktv_out.Resize({{bsz, num_head, seq_len, dim_head}});
+      auto *qktv_out_data =
+          dev_ctx.Alloc<T>(&qktv_out, qktv_out.numel() * sizeof(T));
+    }
     fmha_out.Resize({{bsz, seq_len, num_head, dim_head}});
     auto *fmha_out_data =
         dev_ctx.Alloc<T>(&fmha_out, fmha_out.numel() * sizeof(T));
@@ -180,7 +197,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     // 5. ln(residual + bias)
     DropoutParam dropout_param(false, 0, true, true, 0.0, nullptr, 0);
 
-    using LayerNormComputeType = float; 
+    using LayerNormComputeType = float;
     auto ffn_ln_scales = ctx.MultiInput<Tensor>("FFNLnScale");
     auto ffn_ln_biases = ctx.MultiInput<Tensor>("FFNLnBias");
     Tensor bias_dropout_residual_out, dropout_mask_out;
@@ -188,7 +205,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     bias_dropout_residual_out.Resize({{bsz_seq, dim_embed}});
     bias_dropout_residual_out_data =
         dev_ctx.Alloc<T>(&bias_dropout_residual_out,
-                          bias_dropout_residual_out.numel() * sizeof(T));
+                         bias_dropout_residual_out.numel() * sizeof(T));
     uint8_t *dropout_mask_out_data = nullptr;
 
     // 6. moe layer: gate / expert_w & b / some attrs
@@ -199,7 +216,8 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     auto expert_biases1 = ctx.MultiInput<Tensor>("ExpertBias1");
     auto expert_weights2 = ctx.MultiInput<Tensor>("ExpertWeight2");
     auto expert_biases2 = ctx.MultiInput<Tensor>("ExpertBias2");
-    int dim_feedforward = expert_weights1[0]->dims()[0]; // dim is [dim_feedforward, dim_embed]
+    int dim_feedforward =
+        expert_weights1[0]->dims()[0];  // dim is [dim_feedforward, dim_embed]
     int topk = ctx.Attr<int>("topk");
     int mp_size = ctx.Attr<int>("mp_size");
     int mp_rank = ctx.Attr<int>("mp_rank");
@@ -207,7 +225,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     int world_size = ctx.Attr<int>("world_size");
     int moe_ring_id = ctx.Attr<int>("moe_ring_id");
     bool approximate = ctx.Attr<bool>("approximate");
-    
+
     int tot_expert = world_size * num_expert;
     // after slice, bsz_seq should be change
     int sliced_bsz_seq = bsz_seq;
@@ -237,15 +255,19 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     Tensor local_expert_count, global_expert_count;
     local_expert_count.Resize({{tot_expert}});
     global_expert_count.Resize({{tot_expert}});
-    dev_ctx.Alloc<int64_t>(&local_expert_count, local_expert_count.numel() * sizeof(int64_t));
-    dev_ctx.Alloc<int64_t>(&global_expert_count, global_expert_count.numel() * sizeof(int64_t));
+    dev_ctx.Alloc<int64_t>(&local_expert_count,
+                           local_expert_count.numel() * sizeof(int64_t));
+    dev_ctx.Alloc<int64_t>(&global_expert_count,
+                           global_expert_count.numel() * sizeof(int64_t));
     // fwd_expert_count, fwd_batch_size
     Tensor fwd_expert_count, fwd_batch_size;
     Tensor fwd_expert_count_cpu, fwd_batch_size_cpu;
     fwd_expert_count.Resize({{num_expert}});
     fwd_batch_size.Resize({{1}});
-    dev_ctx.Alloc<int64_t>(&fwd_expert_count, fwd_expert_count.numel() * sizeof(int64_t));
-    dev_ctx.Alloc<int64_t>(&fwd_batch_size, fwd_batch_size.numel() * sizeof(int64_t));
+    dev_ctx.Alloc<int64_t>(&fwd_expert_count,
+                           fwd_expert_count.numel() * sizeof(int64_t));
+    dev_ctx.Alloc<int64_t>(&fwd_batch_size,
+                           fwd_batch_size.numel() * sizeof(int64_t));
     // pos, temp pos
     Tensor pos, temp_pos;
     pos.Resize({{out_batch_size}});
@@ -276,7 +298,8 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     Tensor topk_tensor;
     topk_tensor.Resize({{1}});
     dev_ctx.Alloc<int64_t>(&topk_tensor, topk_tensor.numel() * sizeof(int64_t));
-    phi::FullKernel<int64_t, phi::GPUContext>(dev_ctx, {1}, topk, pos.dtype(), &topk_tensor);
+    phi::FullKernel<int64_t, phi::GPUContext>(
+        dev_ctx, {1}, topk, pos.dtype(), &topk_tensor);
 
     // []. init workspace for cublasLt transform
     Tensor input_workspace, output_workspace, cublaslt_workspace;
@@ -304,14 +327,12 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     Tensor buf0, moe_out;
     buf0.Resize({{bsz_seq, dim_embed}});
     dev_ctx.Alloc<T>(&buf0, buf0.numel() * sizeof(T));
+    moe_out.ShareDataWith(*out);
     moe_out.Resize({{bsz_seq, dim_embed}});
-    dev_ctx.Alloc<T>(&moe_out, moe_out.numel() * sizeof(T));
 
-    const T *x_data;
-    x_data = input_x->data<T>();
+    const T *x_data = input_x->data<T>();
 
     int layers = qkv_weights.size();
-
     for (int i = 0; i < layers; ++i) {
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step1, pre layernorm";
@@ -338,26 +359,24 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       VLOG(0) << "step2, qkv";
 #endif
       // step2. qkv
-      const Tensor *qkv_bias =
-          qkv_biases.size() > 0 ? qkv_biases[i] : nullptr;
+      const Tensor *qkv_bias = qkv_biases.size() > 0 ? qkv_biases[i] : nullptr;
       // NOTE: in decoder stage, bias is fused in fmha
       const Tensor *bias = time_step ? nullptr : qkv_bias;
       // 输入是int8，input workspace，输出是T，qkv_out
       qkv_compute.ComputeForwardINT8ToT(qkv_weights[i],
                                         qkv_in_scale[i],
-                                        &input_workspace, // input
+                                        &input_workspace,  // input
                                         bias,
-                                        &qkv_out, // out, T
-                                        &output_workspace, // out tmp, int32
-                                        &qkv_out, // bias out, T
+                                        &qkv_out,           // out, T
+                                        &output_workspace,  // out tmp, int32
+                                        &qkv_out,           // bias out, T
                                         qkv_out_scales[i],
                                         &cublaslt_workspace);
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step3.1 fmha";
 #endif
       // step3. fmha
-      const Tensor *cache_kv =
-          cache_kvs.size() > 0 ? cache_kvs[i] : nullptr;
+      const Tensor *cache_kv = cache_kvs.size() > 0 ? cache_kvs[i] : nullptr;
       Tensor *cache_kv_out = cache_kv ? cache_kv_outs[i] : nullptr;
 
       if (time_step) {  // generation decoder stage
@@ -381,18 +400,36 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
                 0,
                 1. / sqrt(dim_head));
       } else if (cache_kv_out) {  // generation context stage
-        fmha_compute.ComputeForward(qkv_out,
-                                    nullptr,
-                                    src_mask,
-                                    &transpose_out_2,
-                                    nullptr,
-                                    &qk_out,
-                                    nullptr,
-                                    &softmax_out,
-                                    &attn_dropout_mask_out,
-                                    &attn_dropout_out,
-                                    &qktv_out,
-                                    &fmha_out);
+        if (is_support_flash_attn) {
+          fmha_fa_compute.ComputeForward(qkv_out,
+                                         nullptr,
+                                         src_mask,
+                                         &transpose_out_2,
+                                         nullptr,
+                                         &softmax_out,  // softmax_lse_out
+                                         &attn_dropout_mask_out,  // seek_offset
+                                         &attn_dropout_out,       // softmax_out
+                                         &fmha_out);
+          // input: [bs, seq_len, 3, num_head, head_dim]
+          // output: [3, bs, num_head, seq_len, head_dim]
+          std::vector<int> perm_1 = {2, 0, 3, 1, 4};
+          transpose_out_2.Resize({{3, bsz, num_head, seq_len, dim_head}});
+          TransposeGPUKernelDriver<T>(
+              dev_ctx, qkv_out, perm_1, &transpose_out_2);
+        } else {
+          fmha_compute.ComputeForward(qkv_out,
+                                      nullptr,
+                                      src_mask,
+                                      &transpose_out_2,
+                                      nullptr,
+                                      &qk_out,
+                                      nullptr,
+                                      &softmax_out,
+                                      &attn_dropout_mask_out,
+                                      &attn_dropout_out,
+                                      &qktv_out,
+                                      &fmha_out);
+        }
         // [3, bsz, num_head, seq_len, head_dim]
         T *qkv_data = transpose_out_2_data;
         int64_t q_size = bsz * seq_len * num_head * dim_head;
@@ -426,17 +463,18 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       VLOG(0) << "step3.2 out linear";
 #endif
       // T -> int32
-      out_linear_compute.ComputeForwardTToINT8(out_linear_weights[i],
-                                               out_linear_in_scale[i],
-                                               &fmha_out,
-                                               &input_workspace, // input tmp, 先将输入量化
-                                               nullptr,
-                                               &output_workspace, // output, int32
-                                               nullptr,
-                                               &cublaslt_workspace,
-                                               quant_round_type,
-                                               quant_max_bound,
-                                               quant_min_bound);
+      out_linear_compute.ComputeForwardTToINT8(
+          out_linear_weights[i],
+          out_linear_in_scale[i],
+          &fmha_out,
+          &input_workspace,  // input tmp, 先将输入量化
+          nullptr,
+          &output_workspace,  // output, int32
+          nullptr,
+          &cublaslt_workspace,
+          quant_round_type,
+          quant_max_bound,
+          quant_min_bound);
       // 输出在output_workspace
       AllReduce<int32_t>(output_workspace,
                          ring_id,
@@ -450,11 +488,26 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       auto *ln_bias_data = ffn_ln_biases[i]->data<U>();
       auto *out_linear_bias_data = out_linear_biases[i]->data<T>();
       // input type is int32, src is T, dst is T
-      DequantSkipLoadAndStoreResidual<int32_t, T, T, true> load(output_workspace.data<int32_t>(), out_linear_bias_data, x_data, 
-                                                              out_linear_out_scales[i]->data<float>(), bias_dropout_residual_out_data, 0.0f, dim_embed);
+      DequantSkipLoadAndStoreResidual<int32_t, T, T, true> load(
+          output_workspace.data<int32_t>(),
+          out_linear_bias_data,
+          x_data,
+          out_linear_out_scales[i]->data<float>(),
+          bias_dropout_residual_out_data,
+          0.0f,
+          dim_embed);
       // 改为输出先不做scale，输出是fp16，输出到buf0
-      AffineQuantStore<T, LayerNormComputeType, T, false, true> store(buf0.data<T>(), dim_embed, ln_scale_data, ln_bias_data);
-      DispatchLayerNorm<decltype(load), decltype(store), LayerNormComputeType>(dev_ctx.stream(), load, store, bsz_seq, dim_embed, epsilon, ln_mean_data, ln_var_data);
+      AffineQuantStore<T, LayerNormComputeType, T, false, true> store(
+          buf0.data<T>(), dim_embed, ln_scale_data, ln_bias_data);
+      DispatchLayerNorm<decltype(load), decltype(store), LayerNormComputeType>(
+          dev_ctx.stream(),
+          load,
+          store,
+          bsz_seq,
+          dim_embed,
+          epsilon,
+          ln_mean_data,
+          ln_var_data);
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step5";
 #endif
@@ -470,35 +523,37 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 #endif
       // step3 gate & topk
       // 这里不做量化
-      phi::MatMulAndAdd<T>(dev_ctx, 
-                           gate_weights[i], 
-                           &sliced_inp, 
+      phi::MatMulAndAdd<T>(dev_ctx,
+                           gate_weights[i],
+                           &sliced_inp,
                            gate_biases[i],
                            false,
                            false,
                            true,  //  compute bias
-                           &gate_out, 
+                           &gate_out,
                            &gate_out);
-      phi::TopkKernel<T, phi::GPUContext>(dev_ctx, 
-                                          gate_out, 
-                                          topk, // scalar
-                                          -1, 
-                                          true, 
-                                          false, 
-                                          &topk_value, 
+      phi::TopkKernel<T, phi::GPUContext>(dev_ctx,
+                                          gate_out,
+                                          topk,  // scalar
+                                          -1,
+                                          true,
+                                          false,
+                                          &topk_value,
                                           &topk_idx);
       // step4 prepare forward
       // step4.1 number count
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, number count";
 #endif
-      phi::NumberCountKernel<int64_t, phi::GPUContext>(dev_ctx, topk_idx, tot_expert, &local_expert_count);
+      phi::NumberCountKernel<int64_t, phi::GPUContext>(
+          dev_ctx, topk_idx, tot_expert, &local_expert_count);
       // step4.2 all_to_all
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, all_to_all";
 #endif
       if (world_size > 1) {
-        phi::AllToAll<int64_t>(local_expert_count, global_expert_count, moe_ring_id, dev_ctx);
+        phi::AllToAll<int64_t>(
+            local_expert_count, global_expert_count, moe_ring_id, dev_ctx);
       } else {
         global_expert_count = local_expert_count;
       }
@@ -509,55 +564,54 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, fwd expert count";
 #endif
-      phi::SumKernel<int64_t, phi::GPUContext>(dev_ctx, 
-                                               global_expert_count, 
+      phi::SumKernel<int64_t, phi::GPUContext>(dev_ctx,
+                                               global_expert_count,
                                                phi::IntArray({0}),
                                                global_expert_count.dtype(),
                                                false,
                                                &fwd_expert_count);
       // fwd batch size
-      phi::SumKernel<int64_t, phi::GPUContext>(dev_ctx, 
-                                               fwd_expert_count, 
-                                               phi::IntArray({}), // axis is None
-                                               fwd_expert_count.dtype(),
-                                               false,
-                                               &fwd_batch_size);
+      phi::SumKernel<int64_t, phi::GPUContext>(
+          dev_ctx,
+          fwd_expert_count,
+          phi::IntArray({}),  // axis is None
+          fwd_expert_count.dtype(),
+          false,
+          &fwd_batch_size);
       // step4.3 cumsum & assign pos
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, cumsum";
 #endif
-      phi::CumsumKernel<int64_t, phi::GPUContext>(dev_ctx, 
-                                                  local_expert_count, 
-                                                  0,
-                                                  false,
-                                                  false,
-                                                  false,
-                                                  &lec_cum);
+      phi::CumsumKernel<int64_t, phi::GPUContext>(
+          dev_ctx, local_expert_count, 0, false, false, false, &lec_cum);
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, assign pos";
 #endif
-      phi::AssignPosCompute<int64_t>(dev_ctx, &lec_cum, &topk_idx, &pos, out_batch_size);
+      phi::AssignPosCompute<int64_t>(
+          dev_ctx, &lec_cum, &topk_idx, &pos, out_batch_size);
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, floor divide";
 #endif
       if (topk > 1) {
-        phi::FloorDivideKernel<int64_t, phi::GPUContext>(dev_ctx,
-                                                         pos,
-                                                         topk_tensor,
-                                                         &temp_pos);
+        phi::FloorDivideKernel<int64_t, phi::GPUContext>(
+            dev_ctx, pos, topk_tensor, &temp_pos);
       } else {
         temp_pos = pos;
       }
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, tensor copy";
 #endif
-      framework::TensorCopySync(fwd_expert_count, platform::CPUPlace(), &fwd_expert_count_cpu);
-      framework::TensorCopySync(fwd_batch_size, platform::CPUPlace(), &fwd_batch_size_cpu);
+      framework::TensorCopy(
+          fwd_expert_count, platform::CPUPlace(), &fwd_expert_count_cpu);
+      framework::TensorCopy(
+          fwd_batch_size, platform::CPUPlace(), &fwd_batch_size_cpu);
+      dev_ctx.Wait();
       int fwd_bsz = fwd_batch_size_cpu.data<int64_t>()[0];
 
       Tensor global_scatter_out;
       global_scatter_out.Resize({{fwd_bsz, dim_embed}});
-      dev_ctx.Alloc<T>(&global_scatter_out, global_scatter_out.numel() * sizeof(T));
+      dev_ctx.Alloc<T>(&global_scatter_out,
+                       global_scatter_out.numel() * sizeof(T));
 
       Tensor all_expert_out;
       all_expert_out.Resize({{fwd_bsz, dim_embed}});
@@ -569,23 +623,24 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, index select";
 #endif
-      phi::IndexSelectKernel<T, phi::GPUContext>(dev_ctx, sliced_inp, temp_pos, 0, &index_select_out);
+      phi::IndexSelectKernel<T, phi::GPUContext>(
+          dev_ctx, sliced_inp, temp_pos, 0, &index_select_out);
       if (world_size > 1) {
         auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
         // step 5.2, global_scatter
         if (map->has(moe_ring_id)) {
-          phi::GlobalScatterProcessGroupFunctor<T>(dev_ctx, 
-                                                   &index_select_out, 
-                                                   &local_expert_count, 
-                                                   &global_expert_count, 
+          phi::GlobalScatterProcessGroupFunctor<T>(dev_ctx,
+                                                   &index_select_out,
+                                                   &local_expert_count,
+                                                   &global_expert_count,
                                                    moe_ring_id,
                                                    true,
                                                    &global_scatter_out);
         } else {
-          phi::GlobalScatterFunctor<T>(dev_ctx, 
-                                       &index_select_out, 
-                                       &local_expert_count, 
-                                       &global_expert_count, 
+          phi::GlobalScatterFunctor<T>(dev_ctx,
+                                       &index_select_out,
+                                       &local_expert_count,
+                                       &global_expert_count,
                                        moe_ring_id,
                                        true,
                                        &global_scatter_out);
@@ -599,8 +654,6 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       VLOG(0) << "moe, Expert Computation";
 #endif
       if (fwd_bsz != 0) {
-        phi::funcs::ConcatFunctor<phi::GPUContext, T> concat; // fp16
-        std::vector<Tensor> tmp_expert_out;
         int last_index = 0;
         for (int idx = 0; idx < num_expert; idx++) {
           int cur_expert_count = fwd_expert_count_cpu.data<int64_t>()[idx];
@@ -609,23 +662,23 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
           }
           int end = cur_expert_count + last_index;
 
-          Tensor expert_in_tmp; // int8_t
+          Tensor expert_in_tmp;  // int8_t
           expert_in_tmp.Resize({{cur_expert_count, dim_feedforward}});
-          dev_ctx.Alloc<int8_t>(&expert_in_tmp, expert_in_tmp.numel() * sizeof(int8_t));
+          dev_ctx.Alloc<int8_t>(&expert_in_tmp,
+                                expert_in_tmp.numel() * sizeof(int8_t));
 
-          Tensor expert_out1; // int32_t
+          Tensor expert_out1;  // int32_t
           expert_out1.Resize({{cur_expert_count, dim_feedforward}});
-          dev_ctx.Alloc<int32_t>(&expert_out1, expert_out1.numel() * sizeof(int32_t));
-
-          Tensor expert_out2; // T(fp16)
-          expert_out2.Resize({{cur_expert_count, dim_embed}});
-          dev_ctx.Alloc<T>(&expert_out2, expert_out2.numel() * sizeof(T));
+          dev_ctx.Alloc<int32_t>(&expert_out1,
+                                 expert_out1.numel() * sizeof(int32_t));
 
           // input is int32_t, output is int8_t
-          FusedDropoutHelper<T, uint8_t, int32_t, int8_t> fused_act_dropout_helper(
-            dev_ctx, cur_expert_count, dim_feedforward, dropout_param);
-          
-          Tensor tmp_inp = global_scatter_out.Slice(last_index, end); // fp16, T
+          FusedDropoutHelper<T, uint8_t, int32_t, int8_t>
+              fused_act_dropout_helper(
+                  dev_ctx, cur_expert_count, dim_feedforward, dropout_param);
+
+          Tensor tmp_inp =
+              global_scatter_out.Slice(last_index, end);  // fp16, T
           int expert_idx = i * num_expert + idx;
           // T to int8_t, matmul, dont compute bias
           MatMulTToINT8<T>(dev_ctx,
@@ -637,7 +690,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
                            cur_expert_count,
                            dim_feedforward,
                            dim_embed,
-                           &cublaslt_workspace, // maybe space not enough
+                           &cublaslt_workspace,  // maybe space not enough
                            quant_round_type,
                            quant_max_bound,
                            quant_min_bound);
@@ -647,24 +700,27 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
               expert_out1.data<int32_t>(),
               expert_biases1[expert_idx]->data<T>(),
               "gelu",
-              expert_in_tmp.data<int8_t>(), // output
+              expert_in_tmp.data<int8_t>(),  // output
               nullptr,
               expert_weight1_in_scale[expert_idx],
               expert_weight1_out_scales[expert_idx]->data<float>(),
-              0, // data offset
+              0,  // data offset
               expert_weight2_in_scale[expert_idx],
               quant_round_type,
               quant_max_bound,
               quant_min_bound,
               approximate);
+
+          // T(fp16)
+          Tensor expert_out2 = all_expert_out.Slice(last_index, end);
           // linear2, int8_t to T
           MatMulINT8ToT<T>(dev_ctx,
                            expert_weights2[expert_idx],
                            expert_weight2_in_scale[expert_idx],
-                           &expert_in_tmp, // input
+                           &expert_in_tmp,  // input
                            expert_biases2[expert_idx],
                            &expert_out2,
-                           &expert_out1, // output_tmp
+                           &expert_out1,  // output_tmp
                            &expert_out2,
                            expert_weight2_out_scales[expert_idx],
                            cur_expert_count,
@@ -672,10 +728,8 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
                            dim_feedforward,
                            true,
                            &cublaslt_workspace);
-          tmp_expert_out.emplace_back(expert_out2);
           last_index = end;
         }
-        concat(dev_ctx, tmp_expert_out, 0, &all_expert_out);
       } else {
         all_expert_out = global_scatter_out;
       }
@@ -688,18 +742,18 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
         auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
         // step 7.1, global_gather
         if (map->has(moe_ring_id)) {
-          phi::GlobalGatherProcessGroupFunctor<T>(dev_ctx, 
-                                                  &all_expert_out, 
-                                                  &local_expert_count, 
-                                                  &global_expert_count, 
+          phi::GlobalGatherProcessGroupFunctor<T>(dev_ctx,
+                                                  &all_expert_out,
+                                                  &local_expert_count,
+                                                  &global_expert_count,
                                                   moe_ring_id,
                                                   true,
                                                   &global_gather_out);
         } else {
-          phi::GlobalGatherFunctor<T>(dev_ctx, 
-                                      &all_expert_out, 
-                                      &local_expert_count, 
-                                      &global_expert_count, 
+          phi::GlobalGatherFunctor<T>(dev_ctx,
+                                      &all_expert_out,
+                                      &local_expert_count,
+                                      &global_expert_count,
                                       moe_ring_id,
                                       true,
                                       &global_gather_out);
@@ -712,12 +766,9 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, local_gather or scatter";
 #endif
-      phi::ScatterKernel<T, phi::GPUContext>(dev_ctx, 
-                                             moe_gather_out, 
-                                             pos, 
-                                             global_gather_out, 
-                                             true, 
-                                             &moe_gather_out);
+      phi::funcs::GPUScatterAssign<T, int64_t>(
+          dev_ctx, global_gather_out, pos, &moe_gather_out, true);
+
       // step 8, reshape & bmm
       // moe gather out reshape
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
@@ -725,7 +776,8 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 #endif
       moe_gather_out.Resize({{sliced_bsz_seq, topk, dim_embed}});
       topk_value.Resize({{sliced_bsz_seq, 1, topk}});
-      phi::BmmKernel<T, phi::GPUContext>(dev_ctx, topk_value, moe_gather_out, &bmm_out);
+      phi::BmmKernel<T, phi::GPUContext>(
+          dev_ctx, topk_value, moe_gather_out, &bmm_out);
       bmm_out.Resize({{sliced_bsz_seq, dim_embed}});
       // step 9, AllGather
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
@@ -747,21 +799,41 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
         auto *ln_scale_data = ln_scales[i + 1]->data<U>();
         auto *ln_bias_data = ln_biases[i + 1]->data<U>();
         // input type is T, src is T, dst is T
-        DequantSkipLoadAndStoreResidual<T, T, T, false> load(all_gather_out.data<T>(), nullptr, bias_dropout_residual_out_data, 
-                                                             nullptr, moe_out.data<T>(), 0.0f, dim_embed);
-        AffineQuantStore<int8_t, LayerNormComputeType, T, true, true> store(input_workspace.data<int8_t>(), dim_embed, 
-                                                                            ln_scale_data, ln_bias_data, qkv_in_scale[i + 1], quant_round_type, quant_max_bound, quant_min_bound);
-        DispatchLayerNorm<decltype(load), decltype(store), LayerNormComputeType>(dev_ctx.stream(), load, store, bsz_seq, dim_embed, epsilon, ln_mean_data, ln_var_data);
+        DequantSkipLoadAndStoreResidual<T, T, T, false> load(
+            all_gather_out.data<T>(),
+            nullptr,
+            bias_dropout_residual_out_data,
+            nullptr,
+            moe_out.data<T>(),
+            0.0f,
+            dim_embed);
+        AffineQuantStore<int8_t, LayerNormComputeType, T, true, true> store(
+            input_workspace.data<int8_t>(),
+            dim_embed,
+            ln_scale_data,
+            ln_bias_data,
+            qkv_in_scale[i + 1],
+            quant_round_type,
+            quant_max_bound,
+            quant_min_bound);
+        DispatchLayerNorm<decltype(load),
+                          decltype(store),
+                          LayerNormComputeType>(dev_ctx.stream(),
+                                                load,
+                                                store,
+                                                bsz_seq,
+                                                dim_embed,
+                                                epsilon,
+                                                ln_mean_data,
+                                                ln_var_data);
       } else {
         // last layer, only add residual, T
-        phi::AddKernel<T, phi::GPUContext>(dev_ctx, all_gather_out, bias_dropout_residual_out, &moe_out);
+        phi::AddKernel<T, phi::GPUContext>(
+            dev_ctx, all_gather_out, bias_dropout_residual_out, &moe_out);
       }
-
       x_data = moe_out.data<T>();
-
-    } // end for layer loop
-    moe_out.Resize({{bsz, seq_len, dim_embed}});
-    *out = moe_out;
+    }  // end for layer loop
+    out->Resize({{bsz, seq_len, dim_embed}});
   }
 };
 
@@ -770,6 +842,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 
 namespace ops = paddle::operators;
 namespace plat = paddle::platform;
-REGISTER_OP_CUDA_KERNEL(fused_multi_transformer_moe_int8,
-                        ops::FusedMultiTransformerMoeINT8OpKernel<plat::float16>,
-                        ops::FusedMultiTransformerMoeINT8OpKernel<float>);
+REGISTER_OP_CUDA_KERNEL(
+    fused_multi_transformer_moe_int8,
+    ops::FusedMultiTransformerMoeINT8OpKernel<plat::float16>,
+    ops::FusedMultiTransformerMoeINT8OpKernel<float>);
