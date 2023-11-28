@@ -19,6 +19,7 @@ namespace paddle {
 namespace operators {
 
 using Tensor = phi::DenseTensor;
+// #define _DEBUG_FUSED_MULTI_TRANSFORMER
 
 template <typename T>
 static void PrintMatrix(const T* mat_d, int num, std::string name) {
@@ -72,7 +73,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     auto quant_max_bound = ctx.Attr<float>("quant_max_bound");
     auto quant_min_bound = ctx.Attr<float>("quant_min_bound");
 
-    // dequant output scales, tensor, size = [num_layers, n], n is gemm output
+    // dequant output scales, vertor<tensor>, size = [num_layers, n], n is gemm output
     // size
     auto qkv_out_scales = ctx.MultiInput<Tensor>("QKVOutScale");
     auto out_linear_out_scales =
@@ -164,7 +165,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     qktv_out.Resize({{bsz, num_head, seq_len, dim_head}});
     auto *qktv_out_data =
         dev_ctx.Alloc<T>(&qktv_out, qktv_out.numel() * sizeof(T));
-    fmha_out.Resize({{bsz_seq, num_head, dim_head}});
+    fmha_out.Resize({{bsz, seq_len, num_head, dim_head}});
     auto *fmha_out_data =
         dev_ctx.Alloc<T>(&fmha_out, fmha_out.numel() * sizeof(T));
 
@@ -231,7 +232,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     topk_value.Resize({{sliced_bsz_seq, topk}});
     dev_ctx.Alloc<T>(&topk_value, topk_value.numel() * sizeof(T));
     topk_idx.Resize({{sliced_bsz_seq, topk}});
-    dev_ctx.Alloc<T>(&topk_idx, topk_idx.numel() * sizeof(T));
+    dev_ctx.Alloc<int64_t>(&topk_idx, topk_idx.numel() * sizeof(int64_t));
     // local expert count, global expert count
     Tensor local_expert_count, global_expert_count;
     local_expert_count.Resize({{tot_expert}});
@@ -424,7 +425,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step3.2 out linear";
 #endif
-      // T -> int8
+      // T -> int32
       out_linear_compute.ComputeForwardTToINT8(out_linear_weights[i],
                                                out_linear_in_scale[i],
                                                &fmha_out,
@@ -444,7 +445,6 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step4";
 #endif
-
       // step5. ln(residual + dropout(input + bias))
       auto *ln_scale_data = ffn_ln_scales[i]->data<U>();
       auto *ln_bias_data = ffn_ln_biases[i]->data<U>();
@@ -455,7 +455,6 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       // 改为输出先不做scale，输出是fp16，输出到buf0
       AffineQuantStore<T, LayerNormComputeType, T, false, true> store(buf0.data<T>(), dim_embed, ln_scale_data, ln_bias_data);
       DispatchLayerNorm<decltype(load), decltype(store), LayerNormComputeType>(dev_ctx.stream(), load, store, bsz_seq, dim_embed, epsilon, ln_mean_data, ln_var_data);
-
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step5";
 #endif
@@ -564,9 +563,6 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       all_expert_out.Resize({{fwd_bsz, dim_embed}});
       dev_ctx.Alloc<T>(&all_expert_out, all_expert_out.numel() * sizeof(T));
 
-      // global_scatter_out.Resize({{fwd_bsz, dim_embed}});
-      // all_expert_out.Resize({{fwd_bsz, dim_embed}});
-
       // step 5, MOEScatter
       // step 5.1, index select
       // suppose tmp_pos->shape != [0]
@@ -614,19 +610,16 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
           int end = cur_expert_count + last_index;
 
           Tensor expert_in_tmp; // int8_t
-          expert_in_tmp.Resize({{(cur_expert_count * dim_feedforward + 31) / 32 * 32 }});
+          expert_in_tmp.Resize({{cur_expert_count, dim_feedforward}});
           dev_ctx.Alloc<int8_t>(&expert_in_tmp, expert_in_tmp.numel() * sizeof(int8_t));
 
           Tensor expert_out1; // int32_t
-          expert_out1.Resize({{(cur_expert_count * dim_feedforward + 31) / 32 * 32}});
+          expert_out1.Resize({{cur_expert_count, dim_feedforward}});
           dev_ctx.Alloc<int32_t>(&expert_out1, expert_out1.numel() * sizeof(int32_t));
 
           Tensor expert_out2; // T(fp16)
           expert_out2.Resize({{cur_expert_count, dim_embed}});
           dev_ctx.Alloc<T>(&expert_out2, expert_out2.numel() * sizeof(T));
-          // act_bias_out.Resize({{cur_expert_count, dim_feedforward}}); maybe int8_t?
-          // maybe use input_workspace and output workspace?
-          // dev_ctx.Alloc<T>(&act_bias_out, act_bias_out.numel() * sizeof(T));
 
           // input is int32_t, output is int8_t
           FusedDropoutHelper<T, uint8_t, int32_t, int8_t> fused_act_dropout_helper(
@@ -654,7 +647,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
               expert_out1.data<int32_t>(),
               expert_biases1[expert_idx]->data<T>(),
               "gelu",
-              expert_in_tmp.data<int8_t>(),
+              expert_in_tmp.data<int8_t>(), // output
               nullptr,
               expert_weight1_in_scale[expert_idx],
               expert_weight1_out_scales[expert_idx]->data<float>(),
@@ -668,7 +661,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
           MatMulINT8ToT<T>(dev_ctx,
                            expert_weights2[expert_idx],
                            expert_weight2_in_scale[expert_idx],
-                           &expert_in_tmp,
+                           &expert_in_tmp, // input
                            expert_biases2[expert_idx],
                            &expert_out2,
                            &expert_out1, // output_tmp

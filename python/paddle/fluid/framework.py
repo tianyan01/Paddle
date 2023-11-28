@@ -1281,6 +1281,29 @@ def _debug_string_(proto, throw_on_error=True):
     return proto.__str__()
 
 
+def _create_tensor(
+    type=core.VarDesc.VarType.LOD_TENSOR,
+    name=None,
+    shape=None,
+    dtype=None,
+    persistable=None,
+    **kwargs,
+):
+    if dtype is not None:
+        if not isinstance(dtype, core.VarDesc.VarType):
+            dtype = convert_np_dtype_to_dtype_(dtype)
+
+    eager_tensor = core.eager.Tensor(
+        dtype if dtype else core.VarDesc.VarType.FP32,
+        list(shape) if shape else [],
+        name,
+        type if type else core.VarDesc.VarType.LOD_TENSOR,
+        True if persistable else False,
+    )
+    eager_tensor.retain_grads()
+    return eager_tensor
+
+
 def _varbase_creator(
     type=core.VarDesc.VarType.LOD_TENSOR,
     name=None,

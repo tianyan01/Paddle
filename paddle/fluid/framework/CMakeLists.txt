@@ -41,6 +41,13 @@ endif()
 proto_library(framework_proto SRCS framework.proto)
 proto_library(pass_desc_proto SRCS pass_desc.proto DEPS framework_proto)
 
+if(WITH_GPU)
+  nv_library(
+    trie_manager
+    SRCS trie_manager.cc trie_manager.cu trie.cc
+    DEPS tensor device_context math_function)
+endif()
+
 proto_library(op_def_proto SRCS op_def.proto DEPS framework_proto)
 cc_library(
   op_def_api

@@ -1044,7 +1044,9 @@ struct DequantSkipLoadAndStoreResidual {
     src_pack.storage = *(reinterpret_cast<const PackType<InputType, N>*>(src) + offset);
     bias_pack.storage = *(reinterpret_cast<const PackType<SRC, N>*>(bias) + bias_offset);
     skip_pack.storage = *(reinterpret_cast<const PackType<SRC, N>*>(skip) + offset);
-    dequant_scale_pack.storage = *(reinterpret_cast<const PackType<float, N>*>(dequant_scale) + bias_offset); // equal to col. 
+    if (do_dequant) {
+      dequant_scale_pack.storage = *(reinterpret_cast<const PackType<float, N>*>(dequant_scale) + bias_offset); // equal to col. 
+    }
 #pragma unroll
     for (int i = 0; i < N; ++i) {
       // First we need to cast src and dequant.
@@ -1053,8 +1055,8 @@ struct DequantSkipLoadAndStoreResidual {
                                                     + bias_pack.elem[i]
                                                     + skip_pack.elem[i]);
       } else {
-        residual_out_pack.elem[i] = static_cast<DST>(static_cast<DST>(src_pack.elem[i]) + bias_pack.elem[i]
-                                                    + skip_pack.elem[i]);
+        // trick for smoe, dont add bias.
+        residual_out_pack.elem[i] = static_cast<DST>(static_cast<DST>(src_pack.elem[i]) + skip_pack.elem[i]);
       }
     }
 #pragma unroll

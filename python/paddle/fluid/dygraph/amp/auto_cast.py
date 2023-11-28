@@ -183,6 +183,8 @@ def pure_fp16_initialize(models):
     for idx in range(len(models)):
         for layer in models[idx].sublayers(include_self=True):
             layer._casted_by_pure_fp16 = True
+            if isinstance(layer, paddle.incubate.nn.FusedMultiTransformerMoeINT8):
+                continue
             if (layer._dtype == 'float16') or isinstance(
                     layer, (paddle.nn.BatchNorm, paddle.nn.BatchNorm1D,
                             paddle.nn.BatchNorm2D, paddle.nn.BatchNorm3D,
@@ -196,6 +198,9 @@ def pure_fp16_initialize(models):
                                   paddle.incubate.nn.FusedMoELayer)):
                 layer._amp_decorate(dtype='float16')
                 continue
+            # if isinstance(layer, paddle.incubate.nn.FusedMultiTransformerMoeINT8):
+            #     layer._amp_decorate(dtype='int8')
+            #     continue
             layer._to_impl(dtype='float16',
                            include_sublayers=False,
                            floating_only=True)

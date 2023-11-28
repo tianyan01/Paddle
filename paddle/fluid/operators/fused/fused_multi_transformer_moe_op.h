@@ -216,11 +216,11 @@ void MatMulTToINT8(const phi::GPUContext& dev_ctx,
                               dev_ctx.stream());
 
   helper->GEMM(input_tmp->data<int8_t>(),
-              weight->data<int8_t>(),
-              output->data<int32_t>(),
-              dev_ctx.stream(),
-              (void*)workspace->data<int8_t>(),
-              workspace->numel());
+               weight->data<int8_t>(),
+               output->data<int32_t>(),
+               dev_ctx.stream(),
+               (void*)workspace->data<int8_t>(),
+               workspace->numel());
 }
 
 template <typename T>

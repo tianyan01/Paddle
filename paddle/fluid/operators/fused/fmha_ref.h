@@ -36,14 +36,14 @@ class PDTraits;
 
 template <>
 class PDTraits<paddle::DataType::FLOAT32> {
- public:
+public:
   typedef float DataType;
   typedef float data_t;
 };
 
 template <>
 class PDTraits<paddle::DataType::FLOAT16> {
- public:
+public:
   typedef half DataType;
   typedef paddle::float16 data_t;
 };
@@ -919,3 +919,4 @@ class FlashAttnFMHARef {
 
 }  // namespace operators
 }  // namespace paddle
+

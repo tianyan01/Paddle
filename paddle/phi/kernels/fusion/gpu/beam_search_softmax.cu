@@ -55,6 +55,7 @@ namespace fusion {
                                                  max_dec_len,       \
                                                  fuse_softmax,      \
                                                  early_stop,        \
+                                                 length_penalty,    \
                                                  stream);           \
     break
 
@@ -202,6 +203,7 @@ __global__ void batch_topk(const int *topk_tmp_id_buf,
   }
 }
 
+// early stop
 template <typename T, int K, int THREADBLOCK_SIZE>
 __global__ void batch_topk(const int *topk_tmp_id_buf,
                            const T *topk_tmp_val_buf,
@@ -391,7 +393,9 @@ __global__ void beam_search_softmax_topk_stage2(const float *tmp_buffer,
                                                 T *tmp_vals,
                                                 const int voc_parts,
                                                 const int packed_top_kmd_size,
-                                                const bool fuse_softmax) {
+                                                const bool fuse_softmax,
+                                                const float length_penalty,
+                                                const int *step_ids) {
   const int vector_id = blockIdx.x;
   const int thread_id = threadIdx.x;
   const int PACKED_TOP_KMD_SIZE = packed_top_kmd_size;
@@ -401,6 +405,10 @@ __global__ void beam_search_softmax_topk_stage2(const float *tmp_buffer,
   extern __shared__ char buf_s_[];
   float *buf_s = reinterpret_cast<float *>(buf_s_);
   tmp_buffer += vector_id * PACKED_TOP_KMD_SIZE * voc_parts;
+
+   // Since cum_log_probs is the penalized values, need to be restored before accumulation.
+  T previous_penalty = static_cast<T>(powf(step_ids[vector_id], length_penalty));
+  T current_penalty = static_cast<T>(powf(step_ids[vector_id] + 1, length_penalty));
 
   if (fuse_softmax) {
     typedef cub::BlockReduce<TopKSoftMax<T, K>, THREADBLOCK_SIZE> BlockReduce;
@@ -443,7 +451,7 @@ __global__ void beam_search_softmax_topk_stage2(const float *tmp_buffer,
         // float val = expf((float)total.topk.vals[i] - total.softmax_md.logit -  d_total_log);
         float val = total.topk.vals[i] - total.softmax_md.logit - d_total_log;
         tmp_ids[i] = total.topk.ids[i];
-        tmp_vals[i] = val + cum_log_probs[0];
+        tmp_vals[i] = (val + cum_log_probs[0] * previous_penalty) / current_penalty;
 #ifdef DEBUG_BEAM_SEARCH_SOFTMAX
         printf("vector_id: %d, vals: %f, logit: %f, d_total_log: %f, id: %d, val: %f, cum_log_probs: %f, res: %f\n", vector_id, total.topk.vals[i], total.softmax_md.logit, d_total_log, tmp_ids[i], val, cum_log_probs[0], tmp_vals[i]);
 #endif
@@ -485,7 +493,7 @@ __global__ void beam_search_softmax_topk_stage2(const float *tmp_buffer,
       for (int i = 0; i < K; ++i) {
         float val = total.vals[i];
         tmp_ids[i] = total.ids[i];
-        tmp_vals[i] = val + cum_log_probs[0];
+        tmp_vals[i] = (val + cum_log_probs[0] * previous_penalty) / current_penalty;
       }
     }
   }
@@ -501,25 +509,27 @@ void invokeBeamSearchSoftmaxTopKStage2(const float *tmp_buffer,
                                        const int voc_parts,
                                        const int packed_top_kmd_size,
                                        const bool fuse_softmax,
+                                       const float length_penalty,
+                                       const int *step_ids,
                                        cudaStream_t stream) {
   int smem_stage2_size = voc_parts * packed_top_kmd_size * sizeof(float);
 
   if (voc_parts <= 32) {
     beam_search_softmax_topk_stage2<T, K, 32>
         <<<batch_size * beam_size, 32, smem_stage2_size, stream>>>(
-            tmp_buffer, cum_log_probs, ids, vals, voc_parts, packed_top_kmd_size, fuse_softmax);
+            tmp_buffer, cum_log_probs, ids, vals, voc_parts, packed_top_kmd_size, fuse_softmax, length_penalty, step_ids);
     return;
   }
   if (voc_parts <= 64) {
     beam_search_softmax_topk_stage2<T, K, 64>
         <<<batch_size * beam_size, 64, smem_stage2_size, stream>>>(
-            tmp_buffer, cum_log_probs, ids, vals, voc_parts, packed_top_kmd_size, fuse_softmax);
+            tmp_buffer, cum_log_probs, ids, vals, voc_parts, packed_top_kmd_size, fuse_softmax, length_penalty, step_ids);
     return;
   }
   if (voc_parts <= 128) {
     beam_search_softmax_topk_stage2<T, K, 128>
         <<<batch_size * beam_size, 128, smem_stage2_size, stream>>>(
-            tmp_buffer, cum_log_probs, ids, vals, voc_parts, packed_top_kmd_size, fuse_softmax);
+            tmp_buffer, cum_log_probs, ids, vals, voc_parts, packed_top_kmd_size, fuse_softmax, length_penalty, step_ids);
     return;
   }
 }
@@ -681,6 +691,7 @@ void invokeTopKSoftMaxLauncher(const Context &dev_ctx,
                                const int max_dec_len,
                                const bool fuse_softmax,
                                const bool early_stop,
+                               const float length_penalty,
                                cudaStream_t stream) {
   // K = 2 * beam_size
   const int block_size = 128;
@@ -725,6 +736,8 @@ void invokeTopKSoftMaxLauncher(const Context &dev_ctx,
                                           voc_parts,
                                           packed_top_kmd_size,
                                           fuse_softmax,
+                                          length_penalty,
+                                          step_ids,
                                           stream);
   // (bs, bm)
   if (early_stop) {
@@ -808,6 +821,7 @@ void invokeTopkSoftMax(const Context &dev_ctx,
                        const int max_dec_len,
                        const bool fuse_softmax,
                        const bool early_stop,
+                       const float length_penalty,
                        cudaStream_t stream) {
   switch (beam_size) {
     CASE_K(1);
@@ -848,6 +862,7 @@ void BeamSearchSoftmaxKernel(const Context &dev_ctx,
                              int max_dec_len,
                              bool fuse_softmax,
                              bool early_stop,
+                             float length_penalty,
                              DenseTensor *ids_this_time,
                              DenseTensor *out_cum_scores,
                              DenseTensor *cache_ids,
@@ -913,6 +928,7 @@ void BeamSearchSoftmaxKernel(const Context &dev_ctx,
                     max_dec_len,
                     fuse_softmax,
                     early_stop,
+                    length_penalty,
                     dev_ctx.stream());
 }
 

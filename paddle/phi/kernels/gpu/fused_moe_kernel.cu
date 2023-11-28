@@ -63,6 +63,7 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
   // tmp out
   Tensor ln_out;
   ln_out.Resize({{bsz, seq_len, d_model}});
+
   // after slice, bsz_seq should be change
   int sliced_bsz_seq = bsz_seq;
   int start = 0;
@@ -321,21 +322,15 @@ void FusedMoeKernel(const DeviceContext& dev_ctx,
     all_expert_out = global_scatter_out;
   }
   // step7. MOEGather
-  Tensor global_gather_out;
+  // VLOG(0) << "moe, MOEGather";
   if (world_size > 1) {
-    global_gather_out.Resize({{out_batch_size, d_model}});
-    dev_ctx.template Alloc<T>(&global_gather_out);
-    auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
+    // auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
     // step 7.1, global_gather
     if (map->has(moe_ring_id)) {
-      GlobalGatherProcessGroupFunctor<T>(dev_ctx,
-                                         &all_expert_out,
-                                         &local_expert_count,
-                                         &global_expert_count,
-                                         moe_ring_id,
-                                         true,
-                                         &global_gather_out);
-    } else {
+      GlobalGatherProcessGroupFunctor<T>(dev_ctx, 
+                                         &all_expert_out, 
+                                         &local_expert_count, 
+                                         &global_expert_count, 
       GlobalGatherFunctor<T>(dev_ctx,
                              &all_expert_out,
                              &local_expert_count,

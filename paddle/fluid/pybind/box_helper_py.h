@@ -26,6 +26,7 @@ void BindBoxHelper(py::module* m);
 #ifdef PADDLE_WITH_BOX_PS
 void BindBoxWrapper(py::module* m);
 #endif
+void BindTrieManager(py::module* m);
 
 }  // namespace pybind
 }  // namespace paddle

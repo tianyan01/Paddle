@@ -11,6 +11,7 @@ limitations under the License. */
 
 #include "paddle/fluid/operators/fused/fused_multi_transformer_moe_op.h"
 #include "paddle/phi/kernels/funcs/scatter.cu.h"
+
 namespace paddle {
 namespace operators {
 
@@ -161,6 +162,7 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
     fmha_out.Resize({{bsz, seq_len, num_head, dim_head}});
     auto *fmha_out_data =
         dev_ctx.Alloc<T>(&fmha_out, fmha_out.numel() * sizeof(T));
+    
     // 4. out_linear
     auto out_linear_weights = ctx.MultiInput<Tensor>("OutLinearW");
     auto out_linear_biases = ctx.MultiInput<Tensor>("OutLinearBias");
@@ -224,7 +226,7 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
     topk_value.Resize({{sliced_bsz_seq, topk}});
     dev_ctx.Alloc<T>(&topk_value, topk_value.numel() * sizeof(T));
     topk_idx.Resize({{sliced_bsz_seq, topk}});
-    dev_ctx.Alloc<T>(&topk_idx, topk_idx.numel() * sizeof(T));
+    dev_ctx.Alloc<int64_t>(&topk_idx, topk_idx.numel() * sizeof(int64_t));
     // local expert count, global expert count
     Tensor local_expert_count, global_expert_count;
     local_expert_count.Resize({{tot_expert}});
@@ -430,13 +432,13 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
       fused_dropout_layernorm_helper.LayernormResidualDropoutBias(
           dev_ctx,
           buf0.data<T>(),
-          x_data,  // residual, moe out
+          x_data, // residual, moe out
           out_linear_bias_data,
           ln_scale_data,
           ln_bias_data,
           bias_dropout_residual_out_data,
           dropout_mask_out_data,
-          buf0.data<T>(),  // output to buf0
+          buf0.data<T>(), // output to buf0
           ln_mean_data,
           ln_var_data);
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
@@ -536,7 +538,6 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
       framework::TensorCopy(
           fwd_batch_size, platform::CPUPlace(), &fwd_batch_size_cpu);
       dev_ctx.Wait();
-
       int fwd_bsz = fwd_batch_size_cpu.data<int64_t>()[0];
 
       Tensor global_scatter_out;
@@ -701,7 +702,7 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
 #endif
       phi::funcs::GPUScatterAssign<T, int64_t>(
           dev_ctx, global_gather_out, pos, &moe_gather_out, true);
-
+      
       // step 8, reshape & bmm
       // moe gather out reshape
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
@@ -722,7 +723,6 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
       } else {
         all_gather_out = bmm_out;
       }
-
       // step 11, add residual
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, add residual";
