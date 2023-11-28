@@ -574,6 +574,11 @@ if '${WITH_XPU}' == 'ON':
 if '${WITH_XPU_BKCL}' == 'ON':
     shutil.copy('${XPU_BKCL_LIB}', libs_path)
     package_data['paddle.libs']+=['${XPU_BKCL_LIB_NAME}']
+    
+#flash attention
+if len('${FLASHATTN_LIBRARIES}') > 1:
+    package_data['paddle.libs']+=[os.path.basename('${FLASHATTN_LIBRARIES}')]
+    shutil.copy('${FLASHATTN_LIBRARIES}', libs_path)
 
 # remove unused paddle/libs/__init__.py
 if os.path.isfile(libs_path+'/__init__.py'):

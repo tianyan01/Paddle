@@ -1593,7 +1593,6 @@ class FusedMoELayer(Layer):
         seq_len = inp.shape[1]
         out = _C_ops.fused_moe_kernel(
             inp,
-            inp,
             self.gate_weight,
             self.gate_bias,
             self.ln_scale,
@@ -1611,10 +1610,6 @@ class FusedMoELayer(Layer):
             self.world_size,
             -1 if self.group is None else self.group.id,
             self.approximate,
-            bsz,
-            seq_len,
-            self.d_model,
-            self.dim_feedforward
         )
         return out
     

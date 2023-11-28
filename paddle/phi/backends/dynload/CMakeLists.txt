@@ -53,6 +53,10 @@ configure_file(cupti_lib_path.h.in ${CMAKE_CURRENT_BINARY_DIR}/cupti_lib_path.h)
 if(CUPTI_FOUND)
   list(APPEND CUDA_SRCS cupti.cc)
 endif()
+if(WITH_FLASHATTN)
+  list(APPEND CUDA_SRCS flashattn.cc)
+endif()
+
 if(WITH_ROCM)
   hip_library(
     phi_dynload_cuda
@@ -83,7 +87,6 @@ if(WITH_MKLML)
     SRCS mklml.cc
     DEPS phi_dynamic_loader mklml)
 endif()
-
 cc_library(
   phi_dynload_lapack
   SRCS lapack.cc

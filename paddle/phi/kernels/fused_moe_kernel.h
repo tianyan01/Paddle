@@ -14,40 +14,42 @@
 
 #pragma once
 
-#include "paddle/phi/core/dense_tensor.h"
+#include "paddle/fluid/framework/convert_utils.h"
 #include "paddle/fluid/framework/data_type.h"
-#include "paddle/fluid/platform/device/gpu/gpu_primitives.h"
-#include "paddle/phi/backends/gpu/gpu_context.h"
-#include "paddle/phi/core/kernel_registry.h"
-#include "paddle/phi/core/tensor_utils.h"
+#include "paddle/fluid/operators/collective/global_gather_op.h"
+#include "paddle/fluid/operators/collective/global_scatter_op.h"
 #include "paddle/fluid/operators/fused/fused_dropout_helper.h"
 #include "paddle/fluid/operators/layer_norm_kernel.cu.h"
+#include "paddle/fluid/platform/device/gpu/gpu_primitives.h"
+#include "paddle/fluid/platform/float16.h"
+#include "paddle/phi/backends/gpu/gpu_context.h"
+#include "paddle/phi/core/dense_tensor.h"
+#include "paddle/phi/core/kernel_registry.h"
+#include "paddle/phi/core/tensor_utils.h"
+#include "paddle/phi/kernels/bmm_kernel.h"
+#include "paddle/phi/kernels/cum_kernel.h"
+#include "paddle/phi/kernels/elementwise_add_kernel.h"
+#include "paddle/phi/kernels/elementwise_kernel.h"
+#include "paddle/phi/kernels/full_kernel.h"
 #include "paddle/phi/kernels/funcs/blas/blas.h"
 #include "paddle/phi/kernels/funcs/broadcast_function.h"
-#include "paddle/phi/kernels/funcs/elementwise_functor.h"
-#include "paddle/phi/kernels/top_k_kernel.h"
-#include "paddle/phi/kernels/cum_kernel.h"
-#include "paddle/phi/kernels/reduce_sum_kernel.h"
-#include "paddle/phi/kernels/full_kernel.h"
-#include "paddle/phi/kernels/elementwise_kernel.h"
 #include "paddle/phi/kernels/funcs/concat_and_split_functor.h"
+#include "paddle/phi/kernels/funcs/elementwise_functor.h"
 #include "paddle/phi/kernels/funcs/functors.h"
 #include "paddle/phi/kernels/index_select_kernel.h"
-#include "paddle/phi/kernels/scatter_kernel.h"
-#include "paddle/fluid/operators/collective/global_scatter_op.h"
-#include "paddle/fluid/operators/collective/global_gather_op.h"
-#include "paddle/phi/kernels/bmm_kernel.h"
-#include "paddle/phi/kernels/elementwise_add_kernel.h"
-#include "paddle/fluid/framework/convert_utils.h"
-#include "paddle/fluid/platform/float16.h"
 #include "paddle/phi/kernels/number_count_kernel.h"
+#include "paddle/phi/kernels/reduce_sum_kernel.h"
+#include "paddle/phi/kernels/scatter_kernel.h"
+#include "paddle/phi/kernels/top_k_kernel.h"
 
 #if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
 #include "paddle/fluid/distributed/collective/ProcessGroupNCCL.h"
 #include "paddle/fluid/platform/collective_helper.h"
 #include "paddle/fluid/platform/device/gpu/nccl_helper.h"
 #endif
-
+#if (defined(PADDLE_WITH_CUDA) && CUDA_VERSION >= 11040)
+#include "paddle/phi/kernels/funcs/blas/blaslt_impl.cu.h"
+#endif
 namespace phi {
 using Tensor = DenseTensor;
 namespace framework = paddle::framework;
@@ -75,7 +77,7 @@ static void AllToAll(Tensor& tensor,  // NOLINT
   } else {
     auto dtype = platform::ToNCCLDataType(
         framework::TransToProtoVarType(tensor.dtype()));
-    int64_t send_numel = tensor.numel(); // send_numel
+    int64_t send_numel = tensor.numel();  // send_numel
     auto place = ctx.GetPlace();
     auto comm = platform::NCCLCommContext::Instance().Get(ring_id, place);
     int nranks = comm->nranks();
@@ -168,8 +170,7 @@ void GlobalScatterFunctor(const phi::GPUContext& ctx,
   if (platform::is_cpu_place(local_count->place())) {
     cpu_local_count_data = local_count->data<int64_t>();
   } else {
-    framework::TensorCopySync(
-        *local_count, platform::CPUPlace(), &cpu_local_count);
+    framework::TensorCopy(*local_count, platform::CPUPlace(), &cpu_local_count);
     cpu_local_count_data = cpu_local_count.data<int64_t>();
   }
   auto global_count_len = 0;
@@ -178,11 +179,12 @@ void GlobalScatterFunctor(const phi::GPUContext& ctx,
     cpu_global_count_data = global_count->data<int64_t>();
     global_count_len = global_count->numel();
   } else {
-    framework::TensorCopySync(
+    framework::TensorCopy(
         *global_count, platform::CPUPlace(), &cpu_global_count);
     cpu_global_count_data = cpu_global_count.data<int64_t>();
     global_count_len = cpu_global_count.numel();
   }
+  ctx.Wait();
 
   ncclDataType_t dtype =
       platform::ToNCCLDataType(framework::TransToProtoVarType(x->dtype()));
@@ -274,8 +276,7 @@ void GlobalScatterProcessGroupFunctor(const phi::GPUContext& ctx,
   if (platform::is_cpu_place(local_count->place())) {
     cpu_local_count_data = local_count->data<int64_t>();
   } else {
-    framework::TensorCopySync(
-        *local_count, platform::CPUPlace(), &cpu_local_count);
+    framework::TensorCopy(*local_count, platform::CPUPlace(), &cpu_local_count);
     cpu_local_count_data = cpu_local_count.data<int64_t>();
   }
   auto global_count_len = 0;
@@ -284,11 +285,12 @@ void GlobalScatterProcessGroupFunctor(const phi::GPUContext& ctx,
     cpu_global_count_data = global_count->data<int64_t>();
     global_count_len = global_count->numel();
   } else {
-    framework::TensorCopySync(
+    framework::TensorCopy(
         *global_count, platform::CPUPlace(), &cpu_global_count);
     cpu_global_count_data = cpu_global_count.data<int64_t>();
     global_count_len = cpu_global_count.numel();
   }
+  ctx.Wait();
 
   PADDLE_ENFORCE_GE(
       ring_id,
@@ -319,15 +321,13 @@ void GlobalScatterProcessGroupFunctor(const phi::GPUContext& ctx,
       if (cpu_local_count_data[idx]) {
         phi::DenseTensor tmp = *x;
         pg->Send_Partial(tmp,
-                          j,
-                          expert_ptr[idx] * in_feat,
-                          cpu_local_count_data[idx] * in_feat);
+                         j,
+                         expert_ptr[idx] * in_feat,
+                         cpu_local_count_data[idx] * in_feat);
       }
       if (cpu_global_count_data[idx]) {
-        pg->Recv_Partial(*out,
-                          j,
-                          recv_ptr * in_feat,
-                          cpu_global_count_data[idx] * in_feat);
+        pg->Recv_Partial(
+            *out, j, recv_ptr * in_feat, cpu_global_count_data[idx] * in_feat);
         recv_ptr += cpu_global_count_data[idx];
       }
     }
@@ -369,8 +369,7 @@ void GlobalGatherFunctor(const phi::GPUContext& ctx,
     cpu_local_count_data = local_count->data<int64_t>();
     local_count_len = local_count->numel();
   } else {
-    framework::TensorCopySync(
-        *local_count, platform::CPUPlace(), &cpu_local_count);
+    framework::TensorCopy(*local_count, platform::CPUPlace(), &cpu_local_count);
     cpu_local_count_data = cpu_local_count.data<int64_t>();
     local_count_len = cpu_local_count.numel();
   }
@@ -379,10 +378,11 @@ void GlobalGatherFunctor(const phi::GPUContext& ctx,
   if (platform::is_cpu_place(global_count->place())) {
     cpu_global_count_data = global_count->data<int64_t>();
   } else {
-    framework::TensorCopySync(
+    framework::TensorCopy(
         *global_count, platform::CPUPlace(), &cpu_global_count);
     cpu_global_count_data = cpu_global_count.data<int64_t>();
   }
+  ctx.Wait();
 
   ncclDataType_t dtype =
       platform::ToNCCLDataType(framework::TransToProtoVarType(x->dtype()));
@@ -478,8 +478,7 @@ void GlobalGatherProcessGroupFunctor(const phi::GPUContext& ctx,
     cpu_local_count_data = local_count->data<int64_t>();
     local_count_len = local_count->numel();
   } else {
-    framework::TensorCopySync(
-        *local_count, platform::CPUPlace(), &cpu_local_count);
+    framework::TensorCopy(*local_count, platform::CPUPlace(), &cpu_local_count);
     cpu_local_count_data = cpu_local_count.data<int64_t>();
     local_count_len = cpu_local_count.numel();
   }
@@ -488,10 +487,11 @@ void GlobalGatherProcessGroupFunctor(const phi::GPUContext& ctx,
   if (platform::is_cpu_place(global_count->place())) {
     cpu_global_count_data = global_count->data<int64_t>();
   } else {
-    framework::TensorCopySync(
+    framework::TensorCopy(
         *global_count, platform::CPUPlace(), &cpu_global_count);
     cpu_global_count_data = cpu_global_count.data<int64_t>();
   }
+  ctx.Wait();
 
   PADDLE_ENFORCE_GE(
       ring_id,
@@ -527,9 +527,9 @@ void GlobalGatherProcessGroupFunctor(const phi::GPUContext& ctx,
       }
       if (cpu_local_count_data[idx]) {
         pg->Recv_Partial(*out,
-                          j,
-                          expert_ptr[idx] * in_feat,
-                          cpu_local_count_data[idx] * in_feat);
+                         j,
+                         expert_ptr[idx] * in_feat,
+                         cpu_local_count_data[idx] * in_feat);
       }
     }
     PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupEnd());
@@ -552,6 +552,34 @@ void GlobalGatherProcessGroupFunctor(const phi::GPUContext& ctx,
 }
 
 template <typename T>
+void MatMulAndAddGelu(const phi::GPUContext& dev_ctx,
+                      const framework::Tensor* weight,
+                      const framework::Tensor* input,
+                      const framework::Tensor* bias,
+                      bool istransA,
+                      bool istransB,
+                      bool compute_bias,
+                      framework::Tensor* output) {
+#if (defined(PADDLE_WITH_CUDA) && CUDA_VERSION >= 11040)
+  phi::funcs::LinearWithCublasLt<T>::Run(
+      dev_ctx,
+      input,   // x
+      weight,  // y
+      output,  // out
+      ((compute_bias) ? static_cast<const void*>(bias->data<T>())
+                      : nullptr),  // bias
+      nullptr,
+      input->dims()[0],   // M  bsz_seq
+      weight->dims()[1],  // N  output_size
+      input->dims()[1],   // K  input_size
+      istransA,
+      istransB,
+      ((compute_bias) ? phi::funcs::MatmulFusedType::kMatmulBiasGelu
+                      : phi::funcs::MatmulFusedType::kMatmulGelu));
+#endif
+}
+
+template <typename T>
 void MatMulAndAdd(const phi::GPUContext& dev_ctx,
                   const framework::Tensor* weight,
                   const framework::Tensor* input,
@@ -561,6 +589,24 @@ void MatMulAndAdd(const phi::GPUContext& dev_ctx,
                   bool compute_bias,
                   framework::Tensor* output,
                   framework::Tensor* bias_out) {
+#if (CUDA_VERSION >= 11040)
+  if (compute_bias) {
+    phi::funcs::LinearWithCublasLt<T>::Run(
+        dev_ctx,
+        input,                                      // x
+        weight,                                     // y
+        bias_out,                                   // out
+        static_cast<const void*>(bias->data<T>()),  // bias
+        nullptr,
+        input->dims()[0],   // M   bsz_seq
+        weight->dims()[1],  // N   output_size
+        input->dims()[1],   // K   input_size
+        istransA,
+        istransB,
+        phi::funcs::MatmulFusedType::kMatmulBias);
+    return;
+  }
+#endif
   // Note: for blas.GEMM API in Paddle, it treats all inputs as row-major.
   // here: (transa, transb): nt, input * weight.
   CBLAS_TRANSPOSE transA = istransA ? CblasTrans : CblasNoTrans;
@@ -592,7 +638,6 @@ void MatMulAndAdd(const phi::GPUContext& dev_ctx,
 template <typename T, typename DeviceContext>
 void FusedMoeKernel(const DeviceContext& context,
                     const DenseTensor& x,
-                    const DenseTensor& residual,
                     const DenseTensor& gate_weight,
                     const DenseTensor& gate_bias,
                     const DenseTensor& ln_scale,
@@ -610,10 +655,6 @@ void FusedMoeKernel(const DeviceContext& context,
                     int world_size,
                     int moe_ring_id,
                     bool approximate,
-                    int bsz,
-                    int seq_len,
-                    int d_model,
-                    int dim_feedforward,
                     DenseTensor* out);
 
 }  // namespace phi

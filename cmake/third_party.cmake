@@ -499,6 +499,12 @@ if(WITH_GPU
     include(external/cutlass) # download, build, install cusparselt
     list(APPEND third_party_deps extern_cutlass)
   endif()
+  if(${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 11.4)
+    message(STATUS "add flashattn lib")
+    include(external/flashattn)
+    list(APPEND third_party_deps extern_flashattn)
+    set(WITH_FLASHATTN ON)
+  endif()
 endif()
 
 add_custom_target(third_party ALL DEPENDS ${third_party_deps})

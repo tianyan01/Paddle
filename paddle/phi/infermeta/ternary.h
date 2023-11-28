@@ -203,4 +203,12 @@ void ViterbiDecodeInferMeta(const MetaTensor& input,
                             MetaTensor* path,
                             MetaConfig config = MetaConfig());
 
+void FlashAttnInferMeta(const MetaTensor& q,
+                        const MetaTensor& k,
+                        const MetaTensor& v,
+                        MetaTensor* out,
+                        MetaTensor* softmax,
+                        MetaTensor* softmax_lse,
+                        MetaTensor* seed_offset);
+
 }  // namespace phi

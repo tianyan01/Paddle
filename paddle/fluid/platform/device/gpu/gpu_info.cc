@@ -60,6 +60,7 @@ PADDLE_DEFINE_EXPORTED_bool(enable_gpu_memory_usage_log_mb,
                             true,
                             "Whether to print the message of gpu memory usage "
                             "MB as a unit of measurement.");
+PADDLE_DEFINE_EXPORTED_bool(enable_flash_attn, false, "enable flash attention");
 
 constexpr static float fraction_reserve_gpu_memory = 0.05f;
 
@@ -556,6 +557,19 @@ void GpuMemcpyPeerSync(
 
 void GpuMemsetAsync(void *dst, int value, size_t count, gpuStream_t stream) {
   phi::backends::gpu::GpuMemsetAsync(dst, value, count, stream);
+}
+
+//! is support flash attn
+bool IsSupportFlashAttn(int dev_id) {
+  if (!FLAGS_enable_flash_attn) {
+    return false;
+  }
+  auto dprops = phi::backends::gpu::GetDeviceProperties(dev_id);
+  // sm80+
+  if (dprops.major >= 8) {
+    return true;
+  }
+  return false;
 }
 
 }  // namespace platform

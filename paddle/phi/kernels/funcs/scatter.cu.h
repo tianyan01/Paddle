@@ -48,12 +48,11 @@ __global__ void ScatterInitCUDAKernel(const IndexT* indices,
 }
 
 template <typename T, typename IndexT = int>
-__global__ void ScatterCUDAKernel(const T* params,
+__global__ void ScatterCUDAKernelAdd(const T* params,
                                   const IndexT* indices,
                                   T* output,
                                   size_t index_size,
-                                  size_t slice_size,
-                                  bool overwrite) {
+                                  size_t slice_size) {
   CUDA_KERNEL_LOOP_TYPE(i, index_size * slice_size, int64_t) {
     int64_t indices_i = i / slice_size;
     int64_t slice_i = i - indices_i * slice_size;  // offset inside the slice
@@ -67,11 +66,30 @@ __global__ void ScatterCUDAKernel(const T* params,
                    scatter_i);
 
     int64_t out_i = scatter_i * slice_size + slice_i;
-    if (overwrite) {
-      *(output + out_i) = *(params + i);
-    } else {
-      paddle::platform::CudaAtomicAdd(output + out_i, *(params + i));
-    }
+    paddle::platform::CudaAtomicAdd(output + out_i, *(params + i));
+  }
+}
+
+template <typename T, typename IndexT = int>
+__global__ void ScatterCUDAKernelCopy(const T* params,
+                                  const IndexT* indices,
+                                  T* output,
+                                  size_t index_size,
+                                  size_t slice_size) {
+  CUDA_KERNEL_LOOP_TYPE(i, index_size * slice_size, int64_t) {
+    int64_t indices_i = i / slice_size;
+    int64_t slice_i = i - indices_i * slice_size;  // offset inside the slice
+    IndexT scatter_i = indices[indices_i];
+
+    PADDLE_ENFORCE(scatter_i >= 0,
+                   "The index is out of bounds, "
+                   "please check whether the dimensions of index and "
+                   "input meet the requirements. It should "
+                   "be greater than or equal to 0, but received [%d]",
+                   scatter_i);
+
+    int64_t out_i = scatter_i * slice_size + slice_i;
+    *(output + out_i) = *(params + i);
   }
 }
 
@@ -164,10 +182,12 @@ void GPUScatterAssign(const phi::GPUContext& ctx,
   if (!overwrite) {
     ScatterInitCUDAKernel<T, IndexT><<<grid, block, 0, ctx.stream()>>>(
         p_index, p_output, index_size, slice_size);
+    ScatterCUDAKernelAdd<T, IndexT><<<grid, block, 0, ctx.stream()>>>(
+          p_src, p_index, p_output, index_size, slice_size);
+  } else {
+    ScatterCUDAKernelCopy<T, IndexT><<<grid, block, 0, ctx.stream()>>>(
+	    p_src, p_index, p_output, index_size, slice_size);
   }
-
-  ScatterCUDAKernel<T, IndexT><<<grid, block, 0, ctx.stream()>>>(
-      p_src, p_index, p_output, index_size, slice_size, overwrite);
 }
 
 // The function is only for scatter grad x,

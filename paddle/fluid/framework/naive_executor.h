@@ -37,7 +37,7 @@ namespace framework {
  */
 class ProgramDesc;
 class Scope;
-
+class GarbageCollector;
 class NaiveExecutor {
  public:
   explicit NaiveExecutor(const platform::Place& place) : place_(place) {}
@@ -71,6 +71,10 @@ class NaiveExecutor {
   void CleanFeedFetchOps();
 
   void ResetTrtOps(int num);
+  void AddSkipVars(const std::vector<std::string>& skip_vars);
+  void SetRunByExecutor(bool executor) {
+    run_by_executor_ = executor;
+  }
 
  protected:
   void CreateOps(const ProgramDesc& desc,
@@ -81,7 +85,17 @@ class NaiveExecutor {
   const platform::Place place_;
   // Catch the required resource to avoid recreate.
   std::vector<std::unique_ptr<OperatorBase>> ops_;
+  // op gc vars
+  std::vector<std::string> skip_vars_;
+  // gc vars
+  std::unordered_map<const OperatorBase *, std::vector<std::string>> unused_vars_;
   Scope* scope_;
+  // root scope
+  const Scope* root_scope_;
+  // executor
+  bool run_by_executor_ = false;
+  // gc
+  GarbageCollector *gc_ = nullptr;
 };
 
 }  // namespace framework

@@ -2950,7 +2950,6 @@ void GraphSendUVInferMeta(const MetaTensor& x,
 }
 
 void FusedMoeInferMeta(const MetaTensor& x,
-                       const MetaTensor& residual,
                        const MetaTensor& gate_weight,
                        const MetaTensor& gate_bias,
                        const MetaTensor& ln_scale,
@@ -2968,10 +2967,6 @@ void FusedMoeInferMeta(const MetaTensor& x,
                        int world_size,
                        int moe_ring_id,
                        bool approximate,
-                       int bsz,
-                       int seq_len,
-                       int d_model,
-                       int dim_feedforward,
                        MetaTensor* out) {
   out->set_dims(x.dims());
   out->set_dtype(x.dtype());
