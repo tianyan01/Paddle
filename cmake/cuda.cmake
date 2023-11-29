@@ -97,7 +97,7 @@ endfunction()
 # Function for selecting GPU arch flags for nvcc based on CUDA_ARCH_NAME
 # Usage:
 #   select_nvcc_arch_flags(out_variable)
-function(select_nvcc_arch_flags out_variable)
+function(select_nvcc_arch_flags out_variable out_arch_bin)
   # List of arch names
   set(archs_names
       "Kepler"
@@ -237,6 +237,9 @@ function(select_nvcc_arch_flags out_variable)
   set(${out_variable}_readable
       ${nvcc_archs_readable}
       PARENT_SCOPE)
+  set(${out_arch_bin}
+      ${cuda_arch_bin}
+      PARENT_SCOPE)
 endfunction()
 
 message(STATUS "CUDA detected: " ${CMAKE_CUDA_COMPILER_VERSION})
@@ -266,9 +269,9 @@ add_definitions("-DCUDA_VERSION_MINOR=\"${CUDA_VERSION_MINOR}\"")
 add_definitions("-DCUDA_TOOLKIT_ROOT_DIR=\"${CUDA_TOOLKIT_ROOT_DIR}\"")
 
 # setting nvcc arch flags
-select_nvcc_arch_flags(NVCC_FLAGS_EXTRA)
+select_nvcc_arch_flags(NVCC_FLAGS_EXTRA NVCC_ARCH_BIN)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${NVCC_FLAGS_EXTRA}")
-message(STATUS "NVCC_FLAGS_EXTRA: ${NVCC_FLAGS_EXTRA}")
+message(STATUS "NVCC_FLAGS_EXTRA: ${NVCC_FLAGS_EXTRA}, NVCC_ARCH_BIN: ${NVCC_ARCH_BIN}")
 
 # Set C++14 support
 set(CUDA_PROPAGATE_HOST_FLAGS OFF)

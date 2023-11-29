@@ -129,6 +129,8 @@ class GPUDeviceGuard {
  private:
   int prev_id_{-1};
 };
+// get arch
+const int GetDeviceArchSM(int id);
 
 }  // namespace gpu
 }  // namespace backends

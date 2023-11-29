@@ -234,6 +234,18 @@ const gpuDeviceProp &GetDeviceProperties(int id) {
   return g_device_props[id];
 }
 
+const int GetDeviceArchSM(int id) {
+  if (id == -1) {
+    id = GetCurrentDeviceId();
+  }
+  auto dprops = GetDeviceProperties(id);
+  // sm80+
+  // bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
+  // bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+  // bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+  return (dprops.major * 10 + dprops.minor);
+}
+
 void SetDeviceId(int id) {
   // TODO(qijun): find a better way to cache the cuda device count
   PADDLE_ENFORCE_LT(

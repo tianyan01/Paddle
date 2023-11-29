@@ -1023,4 +1023,15 @@ void FlashAttnGradInferMeta(const MetaTensor& q,
   }
 }
 
+void WeightOnlyLinearGradInferMeta(const MetaTensor& x,
+                                   const MetaTensor& weight,
+                                   const MetaTensor& bias,
+                                   const MetaTensor& weight_scale,
+                                   const MetaTensor& out_grad,
+                                   const std::string& weight_dtype,
+                                   MetaTensor* x_grad) {
+  x_grad->set_dims(x.dims());
+  x_grad->set_dtype(x.dtype());
+}
+
 }  // namespace phi
