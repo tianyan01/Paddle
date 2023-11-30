@@ -20,6 +20,7 @@ limitations under the License. */
 #include "paddle/phi/kernels/funcs/math_function.h"
 #include "paddle/phi/backends/gpu/gpu_context.h"
 #include "trie.h"
+#include <limits>
 
 namespace paddle {
 namespace framework {
@@ -131,6 +132,7 @@ protected:
 
     Trie trie_;
     size_t endid_;
+    uint32_t end_nodeid_ = std::numeric_limits<uint32_t>::max();
     size_t vocab_size_;
 
     std::mutex mtx_;

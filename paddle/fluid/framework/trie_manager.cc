@@ -101,14 +101,19 @@ void TrieManager::run() {
                 auto it = l2n_.find(select_ids[i]);
                 if (it == l2n_.end()) {
                     out.push_back(endid_);
-                    l2n.insert({endid_, 0});
+                    l2n.insert({endid_, end_nodeid_});
+                    continue;
+                }
+                if (it->second == end_nodeid_) {
+                    out.push_back(endid_);
+                    l2n.insert({endid_, end_nodeid_});
                     continue;
                 }
 
                 size_t chs = trie_.child_size(it->second);
                 if (chs == 0 || trie_.aleaf(it->second)) {
                     out.push_back(endid_);
-                    l2n.insert({endid_, 0});
+                    l2n.insert({endid_, end_nodeid_});
                 }
 
                 for (size_t j = 0; j < chs; ++j) {
@@ -141,7 +146,8 @@ void TrieManager::run() {
             next_lod[i+1] = next_lod[i] + int64_t(outs[i].size());
         }
 
-        VLOG(3) << "out " << next_out_ << "\n lod " << next_lod_;
+        VLOG(10) << "out " << next_out_ << "\n lod " << next_lod_;
+        VLOG(3) << "out" << framework::PrintTensor<int64_t>(next_out_, 100);
 
         // 3.
         TensorCopySync(next_out_, place_, &next_out_d_);
