@@ -272,7 +272,7 @@
     data_type : out_dtype
 
 - op : weight_only_linear
-  args : (Tensor x, Tensor weight, Tensor bias, Tensor weight_scale, str weight_dtype)
+  args : (Tensor x, Tensor weight, Tensor bias, Tensor weight_scale, str weight_dtype, str act_method="none")
   output : Tensor(out)
   infer_meta :
     func : WeightOnlyLinearInferMeta

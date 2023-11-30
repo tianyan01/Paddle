@@ -115,6 +115,7 @@ def weight_only_linear(
     bias=None,
     weight_scale=None,
     weight_dtype="int8",
+    act_method='none',
 ):
     """
     Applies matrix multiplication of two tensors and then bias addition if provided.
@@ -148,7 +149,7 @@ def weight_only_linear(
     """
     if in_dynamic_mode():
         out = _C_ops.weight_only_linear(
-            x, weight, bias, weight_scale, weight_dtype
+            x, weight, bias, weight_scale, weight_dtype, act_method
         )
         return out
     else:
@@ -166,7 +167,7 @@ def weight_only_linear(
         }
         if bias is not None:
             inputs["bias"] = [bias]
-        attrs = {'weight_dtype': weight_dtype}
+        attrs = {'weight_dtype': weight_dtype, 'act_method': act_method}
 
         out = helper.create_variable_for_type_inference(dtype)
 

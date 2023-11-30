@@ -30,6 +30,7 @@ void WeightOnlyLinearKernel(const Context& dev_ctx,
                             const paddle::optional<DenseTensor>& bias,
                             const DenseTensor& weight_scale,
                             const std::string& weight_dtype,
+							const std::string& act_method,
                             DenseTensor* out) {
   const int32_t arch = phi::backends::gpu::GetDeviceArchSM(-1);
 #if defined(PADDLE_WITH_CUTLASS)
@@ -87,7 +88,7 @@ we havenot support sm70 weightonly gemv, because sm70 weight layout is RowMajor.
             m,
             n,
             k,
-            "none",
+			act_method,
             mixgemm_workspace_data,
             mixgemm_workspace_size_bytes,
             dev_ctx.stream());
@@ -130,7 +131,7 @@ we havenot support sm70 weightonly gemv, because sm70 weight layout is RowMajor.
             m,
             n,
             k,
-            "none",
+			act_method,
             mixgemm_workspace_data,
             mixgemm_workspace_size_bytes,
             dev_ctx.stream());
@@ -162,7 +163,7 @@ we havenot support sm70 weightonly gemv, because sm70 weight layout is RowMajor.
                                             weight_scale_data,
                                             n,
                                             k,
-                                            "None",
+											act_method,
                                             out->data<T>());
     }  // TODO(lizhenyun) support weight_only_gemv for int4.
   }

@@ -2977,10 +2977,14 @@ void WeightOnlyLinearInferMeta(const MetaTensor& x,
                                const MetaTensor& bias,
                                const MetaTensor& weight_scale,
                                const std::string& weight_dtype,
+							   const std::string& act_method,
                                MetaTensor* out) {
   auto x_dims = x.dims();
   auto w_dims = weight.dims();
   auto n = weight_scale.dims()[0];
+  PADDLE_ENFORCE(
+		act_method == "none" || act_method == "gelu" || act_method == "relu",
+        errors::InvalidArgument("act_method must be 'gelu' or 'relu' or 'none'."));
   PADDLE_ENFORCE(
       weight_dtype == "int8" || weight_dtype == "int4",
       errors::InvalidArgument("quant_method must be 'int8' or 'int4'."));

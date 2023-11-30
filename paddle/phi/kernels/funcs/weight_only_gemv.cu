@@ -357,7 +357,7 @@ void GemvWeightonlyInt8Wrapper(const Context& ctx,
   bool gelu = false;
   if (act_method == "gelu") {
     gelu = true;
-  } else if (act_method == "None") {
+  } else if (act_method == "none") {
     gelu = false;
   } else {
     PADDLE_THROW(

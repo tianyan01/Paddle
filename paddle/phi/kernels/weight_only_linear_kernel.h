@@ -25,5 +25,7 @@ void WeightOnlyLinearKernel(const Context& dev_ctx,
                             const paddle::optional<DenseTensor>& bias,
                             const DenseTensor& weight_scale,
                             const std::string& weight_dtype,
+							const std::string& act_method,   // none, gelu, relu
                             DenseTensor* out);
+
 }  // namespace phi
