@@ -20,6 +20,7 @@ limitations under the License. */
 
 namespace paddle {
 namespace operators {
+// #define _DEBUG_FUSED_MULTI_TRANSFORMER
 
 template <typename T>
 static void PrintMatrix(const T* mat_d, int num, std::string name) {
@@ -77,7 +78,7 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
     auto ffn1_out_scales = ctx.MultiInput<phi::DenseTensor>("FFN1OutScale");
     auto ffn2_out_scales = ctx.MultiInput<phi::DenseTensor>("FFN2OutScale");
 
-     bool remove_padding = false;
+    bool remove_padding = false;
     auto *sequence_lengths = ctx.Input<phi::DenseTensor>("SeqLengths");
     if (sequence_lengths) {
       remove_padding = true;
@@ -190,25 +191,10 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
     }
 
     auto out_seq_len = seq_len;
+    int time_step_cpu = 0;
     if (time_step) {
-      PADDLE_ENFORCE_EQ(time_step->place(),
-                        platform::CPUPlace(),
-                        platform::errors::PreconditionNotMet(
-                            "The place of input(TimeStep) must be CPUPlace."));
-      // cache_seq_len
-      int time_step_value = time_step->data<int>()[0];
-      PADDLE_ENFORCE_GT(time_step_value,
-                        0,
-                        platform::errors::PreconditionNotMet(
-                            "The value of time_step must > 0, but now is %d",
-                            time_step_value));
-      PADDLE_ENFORCE_EQ(
-          seq_len,
-          1,
-          platform::errors::PreconditionNotMet(
-              "In decode stage, the seq_len of input must be 1, but now is %d",
-              seq_len));
-      out_seq_len += time_step_value;
+      time_step_cpu = src_mask->dims()[3] - 1;
+      out_seq_len += time_step_cpu;
     } else {
       out_seq_len += cache_offset;
     }
@@ -513,7 +499,7 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
                 max_seq_len,
                 num_head,
                 dim_head,
-                src_mask->dims()[3] - 1,
+                time_step_cpu,
                 rotary_emb_dims,
                 1. / sqrt(dim_head));
       } else if (cache_kv_out) {  // generation context stage
@@ -966,6 +952,7 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
               dropout_mask_out_data,
               ffn2_in_scale[i],
               ffn2_out_scales[i]->data<float>(),
+              0,
               1.0);
         }
       } else {
