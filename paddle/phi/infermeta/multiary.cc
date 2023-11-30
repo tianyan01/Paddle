@@ -3034,17 +3034,32 @@ void WeightDequantizeInferMeta(const MetaTensor& x,
       phi::errors::InvalidArgument(
           "The scale tensor of dequantize op must be 1D, but got[%d]",
           scale.dims().size()));
-  PADDLE_ENFORCE_EQ(scale.dims()[0],
-                    x.dims()[0],
-                    phi::errors::InvalidArgument(
-                        "The scale tensor's shape must be equal to the x "
-                        "tensor's shape, but got [%d] not equal to [%d]",
-                        scale.dims()[0],
-                        x.dims()[0]));
-  int n = x.dims()[1];
-  int k = x.dims()[0];
-  out->set_dims(phi::make_ddim({n, k}));
-  out->set_dtype(out_dtype);
+
+  if (algo == "weight_only_int8" || algo == "llm.int8") {
+    PADDLE_ENFORCE_EQ(scale.dims()[0],
+                      x.dims()[0],
+                      phi::errors::InvalidArgument(
+                          "The scale tensor's shape must be equal to the x "
+                          "tensor's shape, but got [%d] not equal to [%d]",
+                          scale.dims()[0],
+                          x.dims()[0]));
+    int n = x.dims()[1];
+    int k = x.dims()[0];
+    out->set_dims(phi::make_ddim({n, k}));
+    out->set_dtype(out_dtype);
+  } else if (algo == "weight_only_int4") {
+    PADDLE_ENFORCE_EQ(scale.dims()[0],
+                      x.dims()[0] * 2,
+                      phi::errors::InvalidArgument(
+                          "The scale tensor's shape must be equal to the x "
+                          "tensor's shape, but got [%d] not equal to [%d]",
+                          scale.dims()[0],
+                          x.dims()[0]));
+    int n = x.dims()[1];
+    int k = x.dims()[0] * 2;
+    out->set_dims(phi::make_ddim({n, k}));
+    out->set_dtype(out_dtype);
+  }
 }
 
 void WeightQuantizeInferMeta(const MetaTensor& x,
