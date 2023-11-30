@@ -581,6 +581,6 @@ void WeightOnlyLinearInferMeta(const MetaTensor& x,
                                const MetaTensor& bias,
                                const MetaTensor& weight_scale,
                                const std::string& weight_dtype,
-							   const std::string& act_method,
+                               const std::string& act_method,
                                MetaTensor* out);
 }  // namespace phi
