@@ -476,7 +476,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
           quant_max_bound,
           quant_min_bound);
       // 输出在output_workspace
-      AllReduce<int32_t>(output_workspace,
+      phi::AllReduce<int32_t>(output_workspace,
                          ring_id,
                          bsz * seq_len * num_head * dim_head,
                          dev_ctx);

@@ -417,7 +417,7 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
       // 输出到buf0
       out_linear_compute.ComputeForward(
           out_linear_weights[i], &fmha_out, nullptr, &buf0, nullptr);
-      AllReduce<T>(buf0, ring_id, buf0.numel(), dev_ctx);
+      phi::AllReduce<T>(buf0, ring_id, buf0.numel(), dev_ctx);
 
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step4";
