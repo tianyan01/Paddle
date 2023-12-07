@@ -290,3 +290,13 @@
   kernel :
     func : weight_quantize
     data_type: x
+    
+- op : weight_only_linear2
+  args : (Tensor x, Tensor weight, Tensor bias, Tensor weight_scale, int m, int n, int k, str weight_dtype, str act_method="none")
+  output : Tensor(out)
+  infer_meta :
+    func : WeightOnlyLinear2InferMeta
+  kernel :
+    func : weight_only_linear2
+    data_type : x
+  optional: bias

@@ -22,16 +22,18 @@ limitations under the License. */
 #endif
 
 namespace phi {
-
 template <typename T, typename Context>
-void WeightOnlyLinearKernel(const Context& dev_ctx,
-                            const DenseTensor& x,
-                            const DenseTensor& weight,
-                            const paddle::optional<DenseTensor>& bias,
-                            const DenseTensor& weight_scale,
-                            const std::string& weight_dtype,
-                            const std::string& act_method,
-                            DenseTensor* out) {
+void WeightOnlyLinear2Kernel(const Context& dev_ctx,
+                             const DenseTensor& x,
+                             const DenseTensor& weight,
+                             const paddle::optional<DenseTensor>& bias,
+                             const DenseTensor& weight_scale,
+                             const int m,
+                             const int n,
+                             const int k,
+                             const std::string& weight_dtype,
+                             const std::string& act_method,  // none, gelu, relu
+                             DenseTensor* out) {
   const int32_t arch = phi::backends::gpu::GetDeviceArchSM(-1);
 #if defined(PADDLE_WITH_CUTLASS)
   PADDLE_ENFORCE_EQ(
@@ -49,11 +51,6 @@ void WeightOnlyLinearKernel(const Context& dev_ctx,
   const T* bias_data = bias ? bias.get().data<T>() : nullptr;
   const float* weight_scale_data = weight_scale.data<float>();
   T* out_data = out->data<T>();
-  const auto x_dims = x.dims();
-  const auto w_dims = weight.dims();
-  int n = weight_scale.dims()[0];
-  int k = w_dims[1];
-  int m = x.numel() / k;
 
   // m > 1: run gemm.
   if (m > 1 || weight_dtype == "int4" || (arch == 70)) {
@@ -168,11 +165,44 @@ we havenot support sm70 weightonly gemv, because sm70 weight layout is RowMajor.
     }  // TODO(lizhenyun) support weight_only_gemv for int4.
   }
 }
+template <typename T, typename Context>
+void WeightOnlyLinearKernel(const Context& dev_ctx,
+                            const DenseTensor& x,
+                            const DenseTensor& weight,
+                            const paddle::optional<DenseTensor>& bias,
+                            const DenseTensor& weight_scale,
+                            const std::string& weight_dtype,
+                            const std::string& act_method,
+                            DenseTensor* out) {
+  const auto w_dims = weight.dims();
+  int n = weight_scale.dims()[0];
+  int k = w_dims[1];
+  int m = x.numel() / k;
+
+  WeightOnlyLinear2Kernel<T, Context>(dev_ctx,
+                                      x,
+                                      weight,
+                                      bias,
+                                      weight_scale,
+                                      m,
+                                      n,
+                                      k,
+                                      weight_dtype,
+                                      act_method,  // none, gelu, relu
+                                      out);
+}
 }  // namespace phi
 
 PD_REGISTER_KERNEL(weight_only_linear,
                    GPU,
                    ALL_LAYOUT,
                    phi::WeightOnlyLinearKernel,
+                   phi::dtype::float16,
+                   phi::dtype::bfloat16) {}
+
+PD_REGISTER_KERNEL(weight_only_linear2,
+                   GPU,
+                   ALL_LAYOUT,
+                   phi::WeightOnlyLinear2Kernel,
                    phi::dtype::float16,
                    phi::dtype::bfloat16) {}

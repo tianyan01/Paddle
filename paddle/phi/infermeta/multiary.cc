@@ -3109,6 +3109,58 @@ void WeightQuantizeInferMeta(const MetaTensor& x,
   scale->set_dtype(DataType::FLOAT32);
 }
 
+void WeightOnlyLinear2InferMeta(const MetaTensor& x,
+                                const MetaTensor& weight,
+                                const MetaTensor& bias,
+                                const MetaTensor& weight_scale,
+                                const int m,
+                                const int n,
+                                const int k,
+                                const std::string& weight_dtype,
+                                const std::string& act_method,
+                                MetaTensor* out) {
+  PADDLE_ENFORCE(
+      act_method == "none" || act_method == "gelu" || act_method == "relu",
+      errors::InvalidArgument(
+          "act_method must be 'gelu' or 'relu' or 'none'."));
+  PADDLE_ENFORCE(
+      weight_dtype == "int8" || weight_dtype == "int4",
+      errors::InvalidArgument("quant_method must be 'int8' or 'int4'."));
+  if (weight_dtype == "int8") {
+    PADDLE_ENFORCE_EQ(
+        weight.numel(),
+        (n * k),
+        errors::InvalidArgument("The input(weight) must be a n * k Tensor."));
+  } else {
+    PADDLE_ENFORCE_EQ(
+        weight.numel() * 2,
+        (n * k),
+        errors::InvalidArgument("The input(weight) must be a n * k Tensor."));
+  }
+  PADDLE_ENFORCE_EQ(
+      weight_scale.numel(),
+      n,
+      errors::InvalidArgument("The input(weight_scale) numel must equal N."));
+  PADDLE_ENFORCE_EQ(
+      k % 16,
+      0,
+      phi::errors::InvalidArgument(
+          "The first dimension of input must be divisible by 16, but got[%d]",
+          k));
+  PADDLE_ENFORCE_EQ(
+      n % 16,
+      0,
+      phi::errors::InvalidArgument(
+          "The second dimension of input must be divisible by 16, but got[%d]",
+          n));
+  PADDLE_ENFORCE_EQ(x.numel(),
+                    (m * k),
+                    errors::InvalidArgument(
+                        "Input(X) must be a M(%d) * K(%d) Tensor.", m, k));
+  out->set_dims({m, n});
+  out->set_dtype(x.dtype());
+}
+
 }  // namespace phi
 
 PD_REGISTER_INFER_META_FN(batch_norm, phi::BatchNormInferMeta);
