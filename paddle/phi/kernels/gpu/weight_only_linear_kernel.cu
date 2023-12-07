@@ -65,14 +65,16 @@ we havenot support sm70 weightonly gemv, because sm70 weight layout is RowMajor.
           CutlassFpAIntBGemmRunner<typename PDDataTypeTraits<T>::DataType,
                                    uint8_t>();
       int mixgemm_max_size = std::max(m, k);
-      DenseTensor mixgemm_workspace;
       int64_t mixgemm_workspace_size_bytes = mixed_gemm_runner.getWorkspaceSize(
           m, mixgemm_max_size, mixgemm_max_size);
 
-      mixgemm_workspace.Resize({mixgemm_workspace_size_bytes});
-      dev_ctx.template Alloc<uint8_t>(&mixgemm_workspace);
-      char* mixgemm_workspace_data =
-          reinterpret_cast<char*>(mixgemm_workspace.data<uint8_t>());
+      //      DenseTensor mixgemm_workspace;
+      //      mixgemm_workspace.Resize({mixgemm_workspace_size_bytes});
+      //      dev_ctx.template Alloc<uint8_t>(&mixgemm_workspace);
+      //      char* mixgemm_workspace_data =
+      //          reinterpret_cast<char*>(mixgemm_workspace.data<uint8_t>());
+      char* mixgemm_workspace_data = reinterpret_cast<char*>(
+          dev_ctx.template GetWorkSpacePtr(mixgemm_workspace_size_bytes));
       if (bias_data) {
         mixed_gemm_runner.gemm_bias_act(
             reinterpret_cast<const typename PDDataTypeTraits<T>::DataType*>(
@@ -108,14 +110,16 @@ we havenot support sm70 weightonly gemv, because sm70 weight layout is RowMajor.
           CutlassFpAIntBGemmRunner<typename PDDataTypeTraits<T>::DataType,
                                    cutlass::uint4b_t>();
       int mixgemm_max_size = std::max(m, k);
-      DenseTensor mixgemm_workspace;
+
       int64_t mixgemm_workspace_size_bytes = mixed_gemm_runner.getWorkspaceSize(
           m, mixgemm_max_size, mixgemm_max_size);
-
-      mixgemm_workspace.Resize({mixgemm_workspace_size_bytes});
-      dev_ctx.template Alloc<uint8_t>(&mixgemm_workspace);
-      char* mixgemm_workspace_data =
-          reinterpret_cast<char*>(mixgemm_workspace.data<uint8_t>());
+      //      DenseTensor mixgemm_workspace;
+      //      mixgemm_workspace.Resize({mixgemm_workspace_size_bytes});
+      //      dev_ctx.template Alloc<uint8_t>(&mixgemm_workspace);
+      //      char* mixgemm_workspace_data =
+      //          reinterpret_cast<char*>(mixgemm_workspace.data<uint8_t>());
+      char* mixgemm_workspace_data = reinterpret_cast<char*>(
+          dev_ctx.template GetWorkSpacePtr(mixgemm_workspace_size_bytes));
       if (bias_data) {
         mixed_gemm_runner.gemm_bias_act(
             reinterpret_cast<const typename PDDataTypeTraits<T>::DataType*>(

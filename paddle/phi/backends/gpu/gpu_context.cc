@@ -722,6 +722,14 @@ struct GPUContext::Impl {
       }
     }
   }
+  // get workspace ptr
+  void* GetWorkSpacePtr(const size_t& len) {
+    if (workspace_ptr_ == nullptr || len > workspace_ptr_->size()) {
+      workspace_ptr_.reset();
+      workspace_ptr_ = allocator_->Allocate(len);
+    }
+    return workspace_ptr_->ptr();
+  }
 
   // use one flag for all handles?
   // they should be accessed consistently
@@ -786,6 +794,8 @@ struct GPUContext::Impl {
   Allocator* allocator_{nullptr};  // external resource.
   // A internal resouce to initinalize eigen_device.
   std::unique_ptr<internal::EigenGpuStreamDevice> eigen_stream_{nullptr};
+  // work space
+  phi::Allocator::AllocationPtr workspace_ptr_{nullptr};
 };
 
 GPUContext::GPUContext(GPUContext&&) = default;
@@ -1005,5 +1015,10 @@ void GPUContext::SetMaxGridDimSize(const std::array<int, 3>& val) {
 void GPUContext::SetDriverVersion(int val) { impl_->driver_version_ = val; }
 
 void GPUContext::SetRuntimeVersion(int val) { impl_->runtime_version_ = val; }
+
+// Get Work Space
+void* GPUContext::GetWorkSpacePtr(const size_t& len) const {
+  return impl_->GetWorkSpacePtr(len);
+}
 
 }  // namespace phi
