@@ -22,6 +22,7 @@ from .layer.fused_transformer import FusedBiasDropoutResidualLayerNorm  # noqa: 
 from .layer.fused_transformer import FusedMoELayer # noqa: F401
 from .layer.fused_transformer import FusedMultiTransformerMoe # noqa: F401
 from .layer.fused_transformer import FusedMultiTransformerMoeINT8 # noqa: F401
+from .layer.fused_transformer import FusedMultiTransformerMoeWeightOnly
 
 __all__ = [  #noqa
     'FusedMultiHeadAttention',
@@ -34,4 +35,5 @@ __all__ = [  #noqa
     'FusedLinear',
     'FusedBiasDropoutResidualLayerNorm',
     'FusedMoELayer',
+    'FusedMultiTransformerMoeWeightOnly',
 ]
