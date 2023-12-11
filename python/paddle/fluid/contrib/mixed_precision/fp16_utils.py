@@ -110,8 +110,9 @@ def _keep_fp32_input(op, in_name):
         return in_name in {
             'LnScale', 'LnBias', 'Ln2Scale', 'Ln2Bias', "Ln1Scale", "Ln1Bias"
         }
-    if op_type in ['fused_multi_transformer', 'fused_multi_transformer_moe']:
-        return in_name in {'LnScale', 'LnBias', 'FFNLnScale', 'FFNLnBias'}
+    if op_type in ['fused_multi_transformer', 'fused_multi_transformer_int8', 'fused_multi_transformer_moe']:
+        return in_name in {'LnScale', 'LnBias', 'FFNLnScale', 'FFNLnBias', 'QKVOutScale',
+            'OutLinearOutScale', 'FFN1OutScale', 'FFN2OutScale'}
     return False
 
 
