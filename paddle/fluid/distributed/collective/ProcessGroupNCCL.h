@@ -262,6 +262,8 @@ class ProcessGroupNCCL : public ProcessGroupStream {
   static void GroupEnd();
 
   ncclComm_t NCCLComm(const Place& place) const;
+  // get nccl comm
+  ncclComm_t GetNCCLComm(const Place& place);
 
  protected:
   virtual std::shared_ptr<ProcessGroupNCCL::NCCLTask> CreateTask(

@@ -59,12 +59,12 @@ namespace platform = paddle::platform;
 static ncclComm_t GetNCCLCommRanks(const Place& place,
                                    const int ring_id,
                                    int* nranks) {
-  static auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
+  auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
   if (map->has(ring_id)) {
     auto pg_nccl =
         static_cast<paddle::distributed::ProcessGroupNCCL*>(map->get(ring_id));
     *nranks = pg_nccl->GetSize();
-    return pg_nccl->NCCLComm(place);
+    return pg_nccl->GetNCCLComm(place);
   } else {
     auto comm = platform::NCCLCommContext::Instance().Get(ring_id, place);
     *nranks = comm->nranks();
@@ -99,458 +99,255 @@ static void AllReduce(phi::DenseTensor& tensor,  // NOLINT
 #endif
 }
 
-template <typename T>
-static void AllToAll(Tensor& tensor,  // NOLINT
-                     Tensor& out,
-                     const int ring_id,
-                     const phi::GPUContext& ctx) {
-  if (ring_id == -1) return;
+class NCCLMoECollective {
+ public:
+  NCCLMoECollective(const phi::GPUContext& ctx,
+                    const int ring_id,
+                    const int num_expert)
+      : dev_ctx_(ctx), moe_ring_id_(ring_id), num_expert_(num_expert) {
+    place_ = ctx.GetPlace();
 #if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
-  auto place = ctx.GetPlace();
-  int nranks = 0;
-  auto comm = GetNCCLCommRanks(place, ring_id, &nranks);
-
-  auto dtype =
-      platform::ToNCCLDataType(framework::TransToProtoVarType(tensor.dtype()));
-  int64_t send_numel = tensor.numel();  // send_numel
-
-  auto stream = ctx.stream();
-
-  framework::DDim x_dims = tensor.dims();
-  framework::DDim out_dims(x_dims);
-  PADDLE_ENFORCE_EQ(
-      x_dims[0] % nranks,
-      0,
-      platform::errors::InvalidArgument(
-          "The first dimension size (%d) of the input tensor must be "
-          "divisible by the number of ranks (%d).",
-          x_dims[0],
-          nranks));
-  auto send_buf = tensor.data<T>();
-  auto recv_buf = out.mutable_data<T>(out_dims, place);
-  size_t offset = 0;
-  send_numel /= nranks;
-  PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupStart());
-  for (auto i = 0; i < nranks; ++i) {
-    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclSend(
-        send_buf + offset, send_numel, dtype, i, comm, stream));
-    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclRecv(
-        recv_buf + offset, send_numel, dtype, i, comm, stream));
-    offset += send_numel;
-  }
-  PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupEnd());
-#else
-  PADDLE_THROW(platform::errors::Unimplemented(
-      "PaddlePaddle should compile with NCCL or RCCL when used tensor model "
-      "parallel op."));
-#endif
-}
-
-template <typename T>
-static void AllGather(Tensor& tensor,  // NOLINT
-                      Tensor& out,
-                      const int ring_id,
-                      const phi::GPUContext& ctx) {
-  if (ring_id == -1) return;
-#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
-  auto place = ctx.GetPlace();
-  int nranks = 0;
-  auto comm = GetNCCLCommRanks(place, ring_id, &nranks);
-  auto dtype =
-      platform::ToNCCLDataType(framework::TransToProtoVarType(tensor.dtype()));
-  int64_t numel = tensor.numel();
-  auto stream = ctx.stream();
-  auto out_dims = tensor.dims();
-  out_dims[0] *= nranks;
-  out.mutable_data<T>(out_dims, place);
-  PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclAllGather(
-      tensor.data<T>(), out.data<T>(), numel, dtype, comm, stream));
-#else
-  PADDLE_THROW(platform::errors::Unimplemented(
-      "PaddlePaddle should compile with NCCL or RCCL when used tensor model "
-      "parallel op."));
-#endif
-}
-
-template <typename T>
-void GlobalScatterFunctor(const phi::GPUContext& ctx,
-                          const framework::Tensor* x,
-                          const framework::Tensor* local_count,
-                          const framework::Tensor* global_count,
-                          int ring_id,
-                          bool use_calc_stream,
-                          framework::Tensor* out) {
-#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
-#if NCCL_VERSION_CODE >= 2703
-  const int64_t* cpu_local_count_data;
-  const int64_t* cpu_global_count_data;
-  framework::Tensor cpu_local_count;
-  if (platform::is_cpu_place(local_count->place())) {
-    cpu_local_count_data = local_count->data<int64_t>();
-  } else {
-    framework::TensorCopy(*local_count, platform::CPUPlace(), &cpu_local_count);
-    cpu_local_count_data = cpu_local_count.data<int64_t>();
-  }
-  auto global_count_len = 0;
-  framework::Tensor cpu_global_count;
-  if (platform::is_cpu_place(global_count->place())) {
-    cpu_global_count_data = global_count->data<int64_t>();
-    global_count_len = global_count->numel();
-  } else {
-    framework::TensorCopy(
-        *global_count, platform::CPUPlace(), &cpu_global_count);
-    cpu_global_count_data = cpu_global_count.data<int64_t>();
-    global_count_len = cpu_global_count.numel();
-  }
-  ctx.Wait();
-
-  ncclDataType_t dtype =
-      platform::ToNCCLDataType(framework::TransToProtoVarType(x->dtype()));
-
-  PADDLE_ENFORCE_GE(
-      ring_id,
-      0,
-      platform::errors::InvalidArgument(
-          "The ring_id (%d) for global scatter op must be non-negative.",
-          ring_id));
-
-  auto place = ctx.GetPlace();
-  int nranks = 0;
-  auto comm = GetNCCLCommRanks(place, ring_id, &nranks);
-
-  gpuStream_t stream = ctx.stream();
-
-  auto in_feat = x->dims()[1];
-  auto n_expert = local_count->dims()[0] / nranks;
-  std::vector<int64_t> expert_ptr(n_expert * nranks);
-  expert_ptr[0] = 0;
-  auto tot_experts = n_expert * nranks;
-  for (auto i = 1; i < tot_experts; ++i) {
-    expert_ptr[i] = expert_ptr[i - 1] + cpu_local_count_data[i - 1];
-  }
-
-  auto recv_ptr = 0;
-  auto send_buf = x->data<T>();
-  auto recv_buf = out->data<T>();
-
-  for (auto i = 0; i < n_expert; ++i) {
-    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupStart());
-    for (auto j = 0; j < nranks; ++j) {
-      int idx = i + j * n_expert;
-      if (cpu_local_count_data[idx]) {
-        PADDLE_ENFORCE_GPU_SUCCESS(
-            platform::dynload::ncclSend(send_buf + expert_ptr[idx] * in_feat,
-                                        cpu_local_count_data[idx] * in_feat,
-                                        dtype,
-                                        j,
-                                        comm,
-                                        stream));
-      }
-      if (cpu_global_count_data[idx]) {
-        PADDLE_ENFORCE_GPU_SUCCESS(
-            platform::dynload::ncclRecv(recv_buf + recv_ptr * in_feat,
-                                        cpu_global_count_data[idx] * in_feat,
-                                        dtype,
-                                        j,
-                                        comm,
-                                        stream));
-        recv_ptr += cpu_global_count_data[idx];
+    if (moe_ring_id_ >= 0) {
+      auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
+      if (map->has(ring_id)) {
+        auto pg_nccl = static_cast<paddle::distributed::ProcessGroupNCCL*>(
+            map->get(ring_id));
+        nranks_ = pg_nccl->GetSize();
+        comm_ = pg_nccl->GetNCCLComm(place_);
+      } else {
+        auto comm = platform::NCCLCommContext::Instance().Get(ring_id, place_);
+        nranks_ = comm->nranks();
+        comm_ = comm->comm();
       }
     }
-    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupEnd());
+#endif
+    total_expert_ = nranks_ * num_expert;
+    expert_offsets_.resize(total_expert_);
+    cpu_local_count_.resize(total_expert_);
+    cpu_global_count_.resize(total_expert_);
   }
 
-#else
-  PADDLE_THROW(
-      platform::errors::Unavailable("NCCL version >= 2.7.3 is needed."));
-#endif
-#else
-  PADDLE_THROW(
-      platform::errors::Unavailable("PaddlePaddle should compile with GPU."));
-#endif
-}
-
-template <typename T>
-void GlobalScatterProcessGroupFunctor(const phi::GPUContext& ctx,
-                                      const framework::Tensor* x,
-                                      const framework::Tensor* local_count,
-                                      const framework::Tensor* global_count,
-                                      int ring_id,
-                                      bool use_calc_stream,
-                                      framework::Tensor* out) {
+  template <typename T>
+  void AllReduce(phi::DenseTensor& tensor) {  // NOLINT
 #if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
-#if NCCL_VERSION_CODE >= 2703
-  const int64_t* cpu_local_count_data;
-  const int64_t* cpu_global_count_data;
-  framework::Tensor cpu_local_count;
-  if (platform::is_cpu_place(local_count->place())) {
-    cpu_local_count_data = local_count->data<int64_t>();
-  } else {
-    framework::TensorCopy(*local_count, platform::CPUPlace(), &cpu_local_count);
-    cpu_local_count_data = cpu_local_count.data<int64_t>();
-  }
-  auto global_count_len = 0;
-  framework::Tensor cpu_global_count;
-  if (platform::is_cpu_place(global_count->place())) {
-    cpu_global_count_data = global_count->data<int64_t>();
-    global_count_len = global_count->numel();
-  } else {
-    framework::TensorCopy(
-        *global_count, platform::CPUPlace(), &cpu_global_count);
-    cpu_global_count_data = cpu_global_count.data<int64_t>();
-    global_count_len = cpu_global_count.numel();
-  }
-  ctx.Wait();
-
-  PADDLE_ENFORCE_GE(
-      ring_id,
-      0,
-      platform::errors::InvalidArgument(
-          "The ring_id (%d) for global scatter op must be non-negative.",
-          ring_id));
-
-  auto place = ctx.GetPlace();
-  auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
-  paddle::distributed::ProcessGroup* pg = map->get(ring_id);
-  int nranks = pg->GetSize();
-  auto in_feat = x->dims()[1];
-  auto n_expert = local_count->dims()[0] / nranks;
-
-  std::vector<int64_t> expert_ptr(n_expert * nranks);
-  expert_ptr[0] = 0;
-  auto tot_experts = n_expert * nranks;
-  for (auto i = 1; i < tot_experts; ++i) {
-    expert_ptr[i] = expert_ptr[i - 1] + cpu_local_count_data[i - 1];
+    auto dtype = platform::ToNCCLDataType(
+        framework::TransToProtoVarType(tensor.dtype()));
+    int64_t numel = tensor.numel();
+    const void* sendbuff = tensor.data<T>();
+    void* recvbuff = tensor.mutable_data<T>(place_);
+    auto stream = dev_ctx_.stream();
+    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclAllReduce(
+        sendbuff, recvbuff, numel, dtype, ncclSum, comm_, stream));
+#else
+    PADDLE_THROW(platform::errors::Unimplemented(
+        "PaddlePaddle should compile with NCCL or RCCL when used tensor model "
+        "parallel op."));
+#endif
   }
 
-  auto recv_ptr = 0;
-  for (auto i = 0; i < n_expert; ++i) {
+  template <typename T>
+  void AllToAll(Tensor& tensor,  // NOLINT
+                Tensor& out) {   // NOLINT
+#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
+    auto dtype = platform::ToNCCLDataType(
+        framework::TransToProtoVarType(tensor.dtype()));
+    int64_t send_numel = tensor.numel();  // send_numel
+
+    auto stream = dev_ctx_.stream();
+
+    framework::DDim x_dims = tensor.dims();
+    framework::DDim out_dims(x_dims);
+    PADDLE_ENFORCE_EQ(
+        x_dims[0] % nranks_,
+        0,
+        platform::errors::InvalidArgument(
+            "The first dimension size (%d) of the input tensor must be "
+            "divisible by the number of ranks (%d).",
+            x_dims[0],
+            nranks_));
+    auto send_buf = tensor.data<T>();
+    auto recv_buf = out.mutable_data<T>(out_dims, place_);
+    size_t offset = 0;
+    send_numel /= nranks_;
     PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupStart());
-    for (auto j = 0; j < nranks; ++j) {
-      int idx = i + j * n_expert;
-      if (cpu_local_count_data[idx]) {
-        phi::DenseTensor tmp = *x;
-        pg->Send_Partial(tmp,
-                         j,
-                         expert_ptr[idx] * in_feat,
-                         cpu_local_count_data[idx] * in_feat);
-      }
-      if (cpu_global_count_data[idx]) {
-        pg->Recv_Partial(
-            *out, j, recv_ptr * in_feat, cpu_global_count_data[idx] * in_feat);
-        recv_ptr += cpu_global_count_data[idx];
-      }
+    for (auto i = 0; i < nranks_; ++i) {
+      PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclSend(
+          send_buf + offset, send_numel, dtype, i, comm_, stream));
+      PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclRecv(
+          recv_buf + offset, send_numel, dtype, i, comm_, stream));
+      offset += send_numel;
     }
     PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupEnd());
+#else
+    PADDLE_THROW(platform::errors::Unimplemented(
+        "PaddlePaddle should compile with NCCL or RCCL when used tensor model "
+        "parallel op."));
+#endif
   }
 
+  template <typename T>
+  void AllGather(Tensor& tensor,  // NOLINT
+                 Tensor& out) {   // NOLINT
+#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
+    auto dtype = platform::ToNCCLDataType(
+        framework::TransToProtoVarType(tensor.dtype()));
+    int64_t numel = tensor.numel();
+    auto stream = dev_ctx_.stream();
+    auto out_dims = tensor.dims();
+    out_dims[0] *= nranks_;
+    out.mutable_data<T>(out_dims, place_);
+    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclAllGather(
+        tensor.data<T>(), out.data<T>(), numel, dtype, comm_, stream));
+#else
+    PADDLE_THROW(platform::errors::Unimplemented(
+        "PaddlePaddle should compile with NCCL or RCCL when used tensor model "
+        "parallel op."));
+#endif
+  }
+
+  template <typename T>
+  void Scatter(const framework::Tensor* x,
+               const phi::DenseTensor& local_expert_count,
+               const phi::DenseTensor& global_expert_count,
+               framework::Tensor* out) {
+    // compute expert data count offset
+    CopyAndSetDataOffset(local_expert_count, global_expert_count);
+#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
+#if NCCL_VERSION_CODE >= 2703
+    ncclDataType_t dtype =
+        platform::ToNCCLDataType(framework::TransToProtoVarType(x->dtype()));
+
+    gpuStream_t stream = dev_ctx_.stream();
+
+    auto in_feat = x->dims()[1];
+    auto recv_ptr = 0;
+    auto send_buf = x->data<T>();
+    auto recv_buf = out->data<T>();
+
+    for (auto i = 0; i < num_expert_; ++i) {
+      PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupStart());
+      for (auto j = 0; j < nranks_; ++j) {
+        int idx = i + j * num_expert_;
+        if (cpu_local_count_[idx]) {
+          PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclSend(
+              send_buf + expert_offsets_[idx] * in_feat,
+              cpu_local_count_[idx] * in_feat,
+              dtype,
+              j,
+              comm_,
+              stream));
+        }
+        if (cpu_global_count_[idx]) {
+          PADDLE_ENFORCE_GPU_SUCCESS(
+              platform::dynload::ncclRecv(recv_buf + recv_ptr * in_feat,
+                                          cpu_global_count_[idx] * in_feat,
+                                          dtype,
+                                          j,
+                                          comm_,
+                                          stream));
+          recv_ptr += cpu_global_count_[idx];
+        }
+      }
+      PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupEnd());
+    }
+#else
+    PADDLE_THROW(
+        platform::errors::Unavailable("NCCL version >= 2.7.3 is needed."));
+#endif
+#else
+    PADDLE_THROW(
+        platform::errors::Unavailable("PaddlePaddle should compile with GPU."));
+#endif
+  }
+
+  template <typename T>
+  void Gather(const framework::Tensor* x, framework::Tensor* out) {
+#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
+#if NCCL_VERSION_CODE >= 2703
+    ncclDataType_t dtype =
+        platform::ToNCCLDataType(framework::TransToProtoVarType(x->dtype()));
+
+    gpuStream_t stream = dev_ctx_.stream();
+
+    auto in_feat = x->dims()[1];
+
+    auto send_ptr = 0;
+    auto send_buf = x->data<T>();
+    auto recv_buf = out->data<T>();
+
+    for (auto i = 0; i < num_expert_; ++i) {
+      PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupStart());
+      for (auto j = 0; j < nranks_; ++j) {
+        int idx = i + j * num_expert_;
+        if (cpu_global_count_[idx]) {
+          PADDLE_ENFORCE_GPU_SUCCESS(
+              platform::dynload::ncclSend(send_buf + send_ptr * in_feat,
+                                          cpu_global_count_[idx] * in_feat,
+                                          dtype,
+                                          j,
+                                          comm_,
+                                          stream));
+          send_ptr += cpu_global_count_[idx];
+        }
+        if (cpu_local_count_[idx]) {
+          PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclRecv(
+              recv_buf + expert_offsets_[idx] * in_feat,
+              cpu_local_count_[idx] * in_feat,
+              dtype,
+              j,
+              comm_,
+              stream));
+        }
+      }
+      PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupEnd());
+    }
+#else
+    PADDLE_THROW(
+        platform::errors::Unavailable("NCCL version >= 2.7.3 is needed."));
+#endif
+#else
+    PADDLE_THROW(
+        platform::errors::Unavailable("PaddlePaddle should compile with GPU."));
+#endif
+  }
+
+ protected:
+  void CopyAndSetDataOffset(const phi::DenseTensor& local_expert_count,
+                            const phi::DenseTensor& global_expert_count) {
 #ifdef PADDLE_WITH_CUDA
-  PADDLE_ENFORCE_GPU_SUCCESS(cudaDeviceSynchronize());
-#else
-  PADDLE_ENFORCE_GPU_SUCCESS(hipDeviceSynchronize());
+    auto stream = dev_ctx_.stream();
+    phi::backends::gpu::GpuMemcpyAsync(&cpu_local_count_[0],
+                                       local_expert_count.data<int64_t>(),
+                                       sizeof(int64_t) * total_expert_,
+                                       cudaMemcpyDeviceToHost,
+                                       stream);
+    phi::backends::gpu::GpuMemcpyAsync(&cpu_global_count_[0],
+                                       global_expert_count.data<int64_t>(),
+                                       sizeof(int64_t) * total_expert_,
+                                       cudaMemcpyDeviceToHost,
+                                       stream);
+    phi::backends::gpu::GpuStreamSync(stream);
 #endif
-
-#else
-  PADDLE_THROW(
-      platform::errors::Unavailable("NCCL version >= 2.7.3 is needed."));
-#endif
-#else
-  PADDLE_THROW(
-      platform::errors::Unavailable("PaddlePaddle should compile with GPU."));
-#endif
-}
-
-template <typename T>
-void GlobalGatherFunctor(const phi::GPUContext& ctx,
-                         const framework::Tensor* x,
-                         const framework::Tensor* local_count,
-                         const framework::Tensor* global_count,
-                         int ring_id,
-                         bool use_calc_stream,
-                         framework::Tensor* out) {
-#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
-#if NCCL_VERSION_CODE >= 2703
-  const int64_t* cpu_local_count_data;
-  const int64_t* cpu_global_count_data;
-  auto local_count_len = 0;
-
-  framework::Tensor cpu_local_count;
-  if (platform::is_cpu_place(local_count->place())) {
-    cpu_local_count_data = local_count->data<int64_t>();
-    local_count_len = local_count->numel();
-  } else {
-    framework::TensorCopy(*local_count, platform::CPUPlace(), &cpu_local_count);
-    cpu_local_count_data = cpu_local_count.data<int64_t>();
-    local_count_len = cpu_local_count.numel();
-  }
-
-  framework::Tensor cpu_global_count;
-  if (platform::is_cpu_place(global_count->place())) {
-    cpu_global_count_data = global_count->data<int64_t>();
-  } else {
-    framework::TensorCopy(
-        *global_count, platform::CPUPlace(), &cpu_global_count);
-    cpu_global_count_data = cpu_global_count.data<int64_t>();
-  }
-  ctx.Wait();
-
-  ncclDataType_t dtype =
-      platform::ToNCCLDataType(framework::TransToProtoVarType(x->dtype()));
-
-  PADDLE_ENFORCE_GE(
-      ring_id,
-      0,
-      platform::errors::InvalidArgument(
-          "The ring_id (%d) for global gather op must be non-negative.",
-          ring_id));
-
-  auto place = ctx.GetPlace();
-  int nranks = 0;
-  auto comm = GetNCCLCommRanks(place, ring_id, &nranks);
-
-  gpuStream_t stream = ctx.stream();
-
-  auto in_feat = x->dims()[1];
-  auto n_expert = local_count->dims()[0] / nranks;
-
-  std::vector<int64_t> expert_ptr(n_expert * nranks);
-  expert_ptr[0] = 0;
-  auto tot_experts = n_expert * nranks;
-  for (auto i = 1; i < tot_experts; ++i) {
-    expert_ptr[i] = expert_ptr[i - 1] + cpu_local_count_data[i - 1];
-  }
-  auto send_ptr = 0;
-  auto send_buf = x->data<T>();
-  auto recv_buf = out->data<T>();
-
-  for (auto i = 0; i < n_expert; ++i) {
-    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupStart());
-    for (auto j = 0; j < nranks; ++j) {
-      int idx = i + j * n_expert;
-      if (cpu_global_count_data[idx]) {
-        PADDLE_ENFORCE_GPU_SUCCESS(
-            platform::dynload::ncclSend(send_buf + send_ptr * in_feat,
-                                        cpu_global_count_data[idx] * in_feat,
-                                        dtype,
-                                        j,
-                                        comm,
-                                        stream));
-        send_ptr += cpu_global_count_data[idx];
-      }
-      if (cpu_local_count_data[idx]) {
-        PADDLE_ENFORCE_GPU_SUCCESS(
-            platform::dynload::ncclRecv(recv_buf + expert_ptr[idx] * in_feat,
-                                        cpu_local_count_data[idx] * in_feat,
-                                        dtype,
-                                        j,
-                                        comm,
-                                        stream));
-      }
+    expert_offsets_[0] = 0;
+    for (auto i = 1; i < total_expert_; ++i) {
+      expert_offsets_[i] = expert_offsets_[i - 1] + cpu_local_count_[i - 1];
     }
-    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupEnd());
   }
 
-#else
-  PADDLE_THROW(
-      platform::errors::Unavailable("NCCL version >= 2.7.3 is needed."));
-#endif
-#else
-  PADDLE_THROW(
-      platform::errors::Unavailable("PaddlePaddle should compile with GPU."));
-#endif
-}
-
-template <typename T>
-void GlobalGatherProcessGroupFunctor(const phi::GPUContext& ctx,
-                                     const framework::Tensor* x,
-                                     const framework::Tensor* local_count,
-                                     const framework::Tensor* global_count,
-                                     int ring_id,
-                                     bool use_calc_stream,
-                                     framework::Tensor* out) {
+ private:
+  const phi::GPUContext& dev_ctx_;
+  int moe_ring_id_ = -1;
+  int nranks_ = 0;
+  int num_expert_ = 0;
 #if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
-#if NCCL_VERSION_CODE >= 2703
-  const int64_t* cpu_local_count_data;
-  const int64_t* cpu_global_count_data;
-  auto local_count_len = 0;
-
-  framework::Tensor cpu_local_count;
-  if (platform::is_cpu_place(local_count->place())) {
-    cpu_local_count_data = local_count->data<int64_t>();
-    local_count_len = local_count->numel();
-  } else {
-    framework::TensorCopy(*local_count, platform::CPUPlace(), &cpu_local_count);
-    cpu_local_count_data = cpu_local_count.data<int64_t>();
-    local_count_len = cpu_local_count.numel();
-  }
-
-  framework::Tensor cpu_global_count;
-  if (platform::is_cpu_place(global_count->place())) {
-    cpu_global_count_data = global_count->data<int64_t>();
-  } else {
-    framework::TensorCopy(
-        *global_count, platform::CPUPlace(), &cpu_global_count);
-    cpu_global_count_data = cpu_global_count.data<int64_t>();
-  }
-  ctx.Wait();
-
-  PADDLE_ENFORCE_GE(
-      ring_id,
-      0,
-      platform::errors::InvalidArgument(
-          "The ring_id (%d) for global gather op must be non-negative.",
-          ring_id));
-  auto place = ctx.GetPlace();
-  auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
-  paddle::distributed::ProcessGroup* pg = map->get(ring_id);
-
-  int nranks = pg->GetSize();
-  auto in_feat = x->dims()[1];
-  auto n_expert = local_count->dims()[0] / nranks;
-
-  std::vector<int64_t> expert_ptr(n_expert * nranks);
-  expert_ptr[0] = 0;
-  auto tot_experts = n_expert * nranks;
-  for (auto i = 1; i < tot_experts; ++i) {
-    expert_ptr[i] = expert_ptr[i - 1] + cpu_local_count_data[i - 1];
-  }
-  auto send_ptr = 0;
-
-  for (auto i = 0; i < n_expert; ++i) {
-    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupStart());
-    for (auto j = 0; j < nranks; ++j) {
-      int idx = i + j * n_expert;
-      if (cpu_global_count_data[idx]) {
-        phi::DenseTensor tmp = *x;
-        pg->Send_Partial(
-            tmp, j, send_ptr * in_feat, cpu_global_count_data[idx] * in_feat);
-        send_ptr += cpu_global_count_data[idx];
-      }
-      if (cpu_local_count_data[idx]) {
-        pg->Recv_Partial(*out,
-                         j,
-                         expert_ptr[idx] * in_feat,
-                         cpu_local_count_data[idx] * in_feat);
-      }
-    }
-    PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclGroupEnd());
-  }
-
-#ifdef PADDLE_WITH_CUDA
-  PADDLE_ENFORCE_GPU_SUCCESS(cudaDeviceSynchronize());
-#else
-  PADDLE_ENFORCE_GPU_SUCCESS(hipDeviceSynchronize());
+  ncclComm_t comm_ = nullptr;
 #endif
-
-#else
-  PADDLE_THROW(
-      platform::errors::Unavailable("NCCL version >= 2.7.3 is needed."));
-#endif
-#else
-  PADDLE_THROW(
-      platform::errors::Unavailable("PaddlePaddle should compile with GPU."));
-#endif
-}
+  phi::Place place_;
+  int total_expert_ = 0;
+  std::vector<int64_t> cpu_local_count_;
+  std::vector<int64_t> cpu_global_count_;
+  std::vector<int64_t> expert_offsets_;
+};
 
 template <typename T>
 void MatMulAndAddGelu(const phi::GPUContext& dev_ctx,

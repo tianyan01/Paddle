@@ -8,12 +8,14 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
-
+//#define DEBUG_TMPROFILE_WEIGHT_ONLY
 #include "paddle/fluid/operators/fused/fused_multi_transformer_op.h"
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+#include "paddle/fluid/platform/timer.h"
+#endif
 #include "paddle/phi/kernels/funcs/scatter.cu.h"
 #include "paddle/phi/kernels/gpu/fused_moe_kernel.cu.h"
 #include "paddle/phi/kernels/weight_only_linear_kernel.h"
-
 namespace paddle {
 namespace operators {
 
@@ -34,7 +36,14 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
   void Compute(const framework::ExecutionContext &ctx) const override {
     using U = LayerNormParamType<T>;
     auto &dev_ctx = ctx.cuda_device_context();
-
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+    platform::Timer all_tm, other_tm, trans_tm;
+    platform::Timer qkv_tm, fmha_tm, out_linear_tm;
+    platform::Timer expert_tm, ln_tm, gate_tm;
+    platform::Timer gate_nccl_tm, gather_tm, scatter_tm;
+    all_tm.Start();
+    other_tm.Start();
+#endif
     auto *time_step = ctx.Input<Tensor>("TimeStep");
     // 0. input  [batch_size, seq_len, dim_embed]
     auto *input_x = ctx.Input<Tensor>("X");
@@ -280,6 +289,9 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
     phi::FullKernel<int64_t, phi::GPUContext>(
         dev_ctx, {1}, topk, pos.dtype(), &topk_tensor);
 
+    // moe nccl
+    phi::NCCLMoECollective moe_pg(dev_ctx, moe_ring_id, num_expert);
+
     Tensor buf0, moe_out;
     buf0.Resize({{bsz_seq, dim_embed}});
     dev_ctx.Alloc<T>(&buf0, buf0.numel() * sizeof(T));
@@ -287,11 +299,20 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
     moe_out.Resize({{bsz_seq, dim_embed}});
 
     const T *x_data = input_x->data<T>();
-
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+    dev_ctx.Wait();
+    other_tm.Pause();
+#endif
     int layers = qkv_weights.size();
     for (int i = 0; i < layers; ++i) {
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      trans_tm.Resume();
+#endif
       // step1. layer_norm, only layer 0
       if (i == 0) {
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+        ln_tm.Resume();
+#endif
         auto *ln_scale_data = ln_scales[i]->data<U>();
         auto *ln_bias_data = ln_biases[i]->data<U>();
         // TODO(wangxi): can remove mean var in inference
@@ -301,15 +322,25 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
                                   buf0.data<T>(),
                                   ln_mean_data,
                                   ln_var_data);
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+        dev_ctx.Wait();
+        ln_tm.Pause();
+#endif
       }
 
       // step2. qkv
       const Tensor *qkv_bias = qkv_biases.size() > 0 ? qkv_biases[i] : nullptr;
       // NOTE: in decoder stage, bias is fused in fmha
       // M = batch_size * seq_len, N = 3 * num_head * dim_head, K = dim_embed
-//      VLOG(0) << "layer id=" << i << ", qkv input=" << buf0.dims()
-//              << ", weight=" << qkv_weights[i]->dims()
-//              << ", output=" << qkv_out.dims();
+#ifdef DEBUG_PRINT_LINEAR_SHAPE
+      VLOG(0) << "layer id=" << i << ", qkv input=" << buf0.dims()
+              << ", weight=" << qkv_weights[i]->dims()
+              << ", output=" << qkv_out.dims();
+#endif
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      dev_ctx.Wait();
+      qkv_tm.Resume();
+#endif
       phi::WeightOnlyLinear2Kernel<T, phi::GPUContext>(
           dev_ctx,
           buf0,
@@ -322,7 +353,11 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
           weight_dtype,
           "none",  // none, gelu, relu
           &qkv_out);
-      
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      dev_ctx.Wait();
+      qkv_tm.Pause();
+      fmha_tm.Resume();
+#endif
       // step3. fmha
       const Tensor *cache_kv = cache_kvs.size() > 0 ? cache_kvs[i] : nullptr;
       Tensor *cache_kv_out = cache_kv ? cache_kv_outs[i] : nullptr;
@@ -407,11 +442,18 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       } else {  // not generation
         VLOG(0) << "not support!";
       }
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      dev_ctx.Wait();
+      fmha_tm.Pause();
+      out_linear_tm.Resume();
+#endif
       // 输出到buf0
       // M = batch_size * seq_len, N = dim_embed, K = num_head * dim_head
-//      VLOG(0) << "layer id=" << i << ", out linear input=" << fmha_out.dims()
-//              << ", weight=" << out_linear_weights[i]->dims()
-//              << ", output=" << buf0.dims();
+#ifdef DEBUG_PRINT_LINEAR_SHAPE
+      VLOG(0) << "layer id=" << i << ", out linear input=" << fmha_out.dims()
+              << ", weight=" << out_linear_weights[i]->dims()
+              << ", output=" << buf0.dims();
+#endif
       phi::WeightOnlyLinear2Kernel<T, phi::GPUContext>(
           dev_ctx,
           fmha_out,
@@ -424,13 +466,22 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
           weight_dtype,
           "none",  // none, gelu, relu
           &buf0);
-      phi::AllReduce<T>(buf0, ring_id, buf0.numel(), dev_ctx);
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      dev_ctx.Wait();
+      out_linear_tm.Pause();
+#endif
+      // mp need allreduce
+      if (mp_size > 1) {
+        phi::AllReduce<T>(buf0, ring_id, buf0.numel(), dev_ctx);
+      }
 
       // step5. ln(residual + dropout(input + bias))，在MHA里的
       auto *ln_scale_data = ffn_ln_scales[i]->data<U>();
       auto *ln_bias_data = ffn_ln_biases[i]->data<U>();
       auto *out_linear_bias_data = out_linear_biases[i]->data<T>();
-
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      ln_tm.Resume();
+#endif
       // pre layer norm : bias_dropout_residual_out is residual
       fused_dropout_layernorm_helper.LayernormResidualDropoutBias(
           dev_ctx,
@@ -444,7 +495,10 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
           buf0.data<T>(),  // output to buf0
           ln_mean_data,
           ln_var_data);
-
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      dev_ctx.Wait();
+      ln_tm.Pause();
+#endif
       // moe
       // step2 resize and slice ln_out
       if (mp_size > 1) {
@@ -452,7 +506,9 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       } else {
         sliced_inp = buf0;
       }
-
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      gate_tm.Resume();
+#endif
       // step3 gate & topk
       phi::MatMulAndAdd<T>(dev_ctx,
                            gate_weights[i],
@@ -475,14 +531,21 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       // step4.1 number count
       phi::NumberCountKernel<int64_t, phi::GPUContext>(
           dev_ctx, topk_idx, tot_expert, &local_expert_count);
+
       // step4.2 all_to_all
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      dev_ctx.Wait();
+      gate_nccl_tm.Resume();
+#endif
       if (world_size > 1) {
-        phi::AllToAll<int64_t>(
-            local_expert_count, global_expert_count, moe_ring_id, dev_ctx);
+        moe_pg.AllToAll<int64_t>(local_expert_count, global_expert_count);
       } else {
         global_expert_count = local_expert_count;
       }
-
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      dev_ctx.Wait();
+      gate_nccl_tm.Pause();
+#endif
       // global expert count resize
       global_expert_count.Resize({{world_size, num_expert}});
       // fwd expert count
@@ -531,18 +594,32 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       // step 5.1, index select
       phi::IndexSelectKernel<T, phi::GPUContext>(
           dev_ctx, sliced_inp, temp_pos, 0, &index_select_out);
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      dev_ctx.Wait();
+      gate_tm.Pause();
+
+      dev_ctx.Wait();
+      scatter_tm.Resume();
+#endif
       if (world_size > 1) {
-        phi::GlobalScatterFunctor<T>(dev_ctx,
-                                     &index_select_out,
-                                     &local_expert_count,
-                                     &global_expert_count,
-                                     moe_ring_id,
-                                     true,
-                                     &global_scatter_out);
+        moe_pg.Scatter<T>(&index_select_out,
+                          local_expert_count,
+                          global_expert_count,
+                          &global_scatter_out);
       } else {
         global_scatter_out = index_select_out;
       }
-//      VLOG(0) << "begin expert fwd_bsz=" << fwd_bsz << ", dim_feedforward=" << dim_feedforward;
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      dev_ctx.Wait();
+      scatter_tm.Pause();
+
+      dev_ctx.Wait();
+      expert_tm.Resume();
+#endif
+#ifdef DEBUG_PRINT_LINEAR_SHAPE
+      VLOG(0) << "begin expert fwd_bsz=" << fwd_bsz
+              << ", dim_feedforward = " << dim_feedforward;
+#endif
       // step 6, Expert Computation
       if (fwd_bsz != 0) {
         // encoder, use matmul
@@ -561,11 +638,13 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
           Tensor tmp_inp = global_scatter_out.Slice(last_index, end);
           int expert_idx = i * num_expert + idx;
           // linear1   M = cur_expert_count, N = dim_feedforward, K = dim_embed
-//          VLOG(0) << "expert id=" << idx << ", liner1 input=" << tmp_inp.dims()
-//                  << ", weight=" << expert_weights1[expert_idx]->dims()
-//                  << ", bias=" << expert_biases1[expert_idx]->dims()
-//                  << ", scale=" << expert_scales1[expert_idx]->dims()
-//                  << ", expert_out1=" << expert_out1.dims();
+#ifdef DEBUG_PRINT_LINEAR_SHAPE
+          VLOG(0) << "expert id=" << idx << ", liner1 input=" << tmp_inp.dims()
+                  << ", weight=" << expert_weights1[expert_idx]->dims()
+                  << ", bias=" << expert_biases1[expert_idx]->dims()
+                  << ", scale=" << expert_scales1[expert_idx]->dims()
+                  << ", expert_out1=" << expert_out1.dims();
+#endif
 
           phi::WeightOnlyLinearKernel<T, phi::GPUContext>(
               dev_ctx,
@@ -580,12 +659,14 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
           // linear2 matmul & add
           Tensor expert_out2 = all_expert_out.Slice(last_index, end);
           // linear2  M = cur_expert_count, N = dim_embed, K = dim_feedforward
-//          VLOG(0) << "expert id=" << idx
-//                  << ", liner2 input=" << expert_out1.dims()
-//                  << ", weight=" << expert_weights2[expert_idx]->dims()
-//                  << ", bias=" << expert_biases2[expert_idx]->dims()
-//                  << ", scale=" << expert_scales2[expert_idx]->dims()
-//                  << ", expert_out2=" << expert_out2.dims();
+#ifdef DEBUG_PRINT_LINEAR_SHAPE
+          VLOG(0) << "expert id=" << idx
+                  << ", liner2 input=" << expert_out1.dims()
+                  << ", weight=" << expert_weights2[expert_idx]->dims()
+                  << ", bias=" << expert_biases2[expert_idx]->dims()
+                  << ", scale=" << expert_scales2[expert_idx]->dims()
+                  << ", expert_out2=" << expert_out2.dims();
+#endif
           phi::WeightOnlyLinearKernel<T, phi::GPUContext>(
               dev_ctx,
               expert_out1,
@@ -601,23 +682,25 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       } else {
         all_expert_out = global_scatter_out;
       }
-      
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      dev_ctx.Wait();
+      expert_tm.Pause();
+      gather_tm.Resume();
+#endif
       // step7. MOEGather
       if (world_size > 1) {
-        phi::GlobalGatherFunctor<T>(dev_ctx,
-                                    &all_expert_out,
-                                    &local_expert_count,
-                                    &global_expert_count,
-                                    moe_ring_id,
-                                    true,
-                                    &global_gather_out);
+        moe_pg.Gather<T>(&all_expert_out, &global_gather_out);
       } else {
         global_gather_out = all_expert_out;
       }
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      dev_ctx.Wait();
+      gather_tm.Pause();
+#endif
       // step 7.2, local_gather or scatter
       phi::funcs::GPUScatterAssign<T, int64_t>(
           dev_ctx, global_gather_out, pos, &moe_gather_out, true);
-      
+
       // step 8, reshape & bmm
       // moe gather out reshape
       moe_gather_out.Resize({{sliced_bsz_seq, topk, dim_embed}});
@@ -625,17 +708,21 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       phi::BmmKernel<T, phi::GPUContext>(
           dev_ctx, topk_value, moe_gather_out, &bmm_out);
       bmm_out.Resize({{sliced_bsz_seq, dim_embed}});
-      
+
       // step 9, AllGather
       if (mp_size > 1) {
         // all gather
-        phi::AllGather<T>(bmm_out, all_gather_out, moe_ring_id, dev_ctx);
+        moe_pg.AllGather<T>(bmm_out, all_gather_out);
       } else {
         all_gather_out = bmm_out;
       }
       // step 11, add residual
       if (i < layers - 1) {
         // add residual & next layer norm
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+        dev_ctx.Wait();
+        ln_tm.Resume();
+#endif
         auto *ln_scale_data = ln_scales[i + 1]->data<U>();
         auto *ln_bias_data = ln_biases[i + 1]->data<U>();
         fused_dropout_layernorm_helper.LayernormResidualDropoutBias(
@@ -650,14 +737,40 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
             buf0.data<T>(),  // out, after layernorm
             ln_mean_data,
             ln_var_data);
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+        dev_ctx.Wait();
+        ln_tm.Pause();
+#endif
       } else {
         // last layer, only add residual
         phi::AddKernel<T, phi::GPUContext>(
             dev_ctx, all_gather_out, bias_dropout_residual_out, &moe_out);
       }
       x_data = moe_out.data<T>();
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+      dev_ctx.Wait();
+      trans_tm.Pause();
+#endif
     }  // layers loop end
     out->Resize({{bsz, seq_len, dim_embed}});
+#ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
+    dev_ctx.Wait();
+    all_tm.Pause();
+    VLOG(0) << "gpu=" << static_cast<int>(dev_ctx.GetPlace().GetDeviceId())
+            << ", bsz=" << bsz << ", seq_len=" << seq_len
+            << ", total span=" << all_tm.ElapsedMS()
+            << ", input=" << other_tm.ElapsedMS()
+            << ", transformer=" << trans_tm.ElapsedMS()
+            << ", [qkv=" << qkv_tm.ElapsedMS()
+            << ", fmha=" << fmha_tm.ElapsedMS()
+            << ", out_linear=" << out_linear_tm.ElapsedMS()
+            << ", expert=" << expert_tm.ElapsedMS()
+            << ", ln=" << ln_tm.ElapsedMS()
+            << ", gate/all2all=" << gate_tm.ElapsedMS() << "/"
+            << gate_nccl_tm.ElapsedMS()
+            << ", scatter=" << scatter_tm.ElapsedMS()
+            << ", gather=" << gather_tm.ElapsedMS() << "]";
+#endif
   }
 };
 

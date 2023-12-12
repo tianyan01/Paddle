@@ -11,10 +11,13 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
-
+// #define DEBUG_MOE_TMPROFILE_INT8
 #include "paddle/fluid/operators/fused/fused_multi_transformer_moe_op.h"
 #include "paddle/fluid/operators/fused/layernorm_quant_dequant.h"
 #include "paddle/phi/kernels/funcs/scatter.cu.h"
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+#include "paddle/fluid/platform/timer.h"
+#endif
 namespace paddle {
 namespace operators {
 
@@ -55,7 +58,14 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
   void Compute(const framework::ExecutionContext &ctx) const override {
     using U = LayerNormParamType<T>;
     auto &dev_ctx = ctx.cuda_device_context();
-
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+    platform::Timer all_tm, other_tm, trans_tm;
+    platform::Timer qkv_tm, fmha_tm, out_linear_tm;
+    platform::Timer expert_tm, ln_tm, gate_tm;
+    platform::Timer gate_nccl_tm, gather_tm, scatter_tm;
+    all_tm.Start();
+    other_tm.Start();
+#endif
     auto *time_step = ctx.Input<Tensor>("TimeStep");
     // 0. input
     auto *input_x = ctx.Input<Tensor>("X");
@@ -146,7 +156,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     // 3. fmha
     // check support flash attn
     AttnDropoutParam attn_param(
-           true, "upscale_in_train", 0.0, true, true, 0, nullptr);
+        true, "upscale_in_train", 0.0, true, true, 0, nullptr);
     bool is_support_flash_attn = CheckFlashAttn(dev_ctx, *input_x);
     auto fmha_fa_compute = FlashAttnFMHARef<plat::float16>(
         dev_ctx, bsz, seq_len, num_head, dim_head, attn_param);
@@ -301,6 +311,9 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     phi::FullKernel<int64_t, phi::GPUContext>(
         dev_ctx, {1}, topk, pos.dtype(), &topk_tensor);
 
+    // moe nccl
+    phi::NCCLMoECollective moe_pg(dev_ctx, moe_ring_id, num_expert);
+
     // []. init workspace for cublasLt transform
     Tensor input_workspace, output_workspace, cublaslt_workspace;
     // for input and output transform data is CUBLASLT_ORDER_COL32 format,
@@ -331,14 +344,23 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     moe_out.Resize({{bsz_seq, dim_embed}});
 
     const T *x_data = input_x->data<T>();
-
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+    dev_ctx.Wait();
+    other_tm.Pause();
+#endif
     int layers = qkv_weights.size();
     for (int i = 0; i < layers; ++i) {
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step1, pre layernorm";
 #endif
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      trans_tm.Resume();
+#endif
       // step1. layer_norm
       if (i == 0) {
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+        ln_tm.Resume();
+#endif
         auto *ln_scale_data = ln_scales[i]->data<U>();
         auto *ln_bias_data = ln_biases[i]->data<U>();
         // layer norm后，对输出做scale，因此输出是int8，在input_workspace中
@@ -354,6 +376,10 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
                                   quant_round_type,
                                   quant_max_bound,
                                   quant_min_bound);
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+        dev_ctx.Wait();
+        ln_tm.Pause();
+#endif
       }
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step2, qkv";
@@ -362,6 +388,10 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       const Tensor *qkv_bias = qkv_biases.size() > 0 ? qkv_biases[i] : nullptr;
       // NOTE: in decoder stage, bias is fused in fmha
       const Tensor *bias = time_step ? nullptr : qkv_bias;
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      dev_ctx.Wait();
+      qkv_tm.Resume();
+#endif
       // 输入是int8，input workspace，输出是T，qkv_out
       qkv_compute.ComputeForwardINT8ToT(qkv_weights[i],
                                         qkv_in_scale[i],
@@ -372,6 +402,11 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
                                         &qkv_out,           // bias out, T
                                         qkv_out_scales[i],
                                         &cublaslt_workspace);
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      dev_ctx.Wait();
+      qkv_tm.Pause();
+      fmha_tm.Resume();
+#endif
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step3.1 fmha";
 #endif
@@ -462,6 +497,11 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step3.2 out linear";
 #endif
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      dev_ctx.Wait();
+      fmha_tm.Pause();
+      out_linear_tm.Resume();
+#endif
       // T -> int32
       out_linear_compute.ComputeForwardTToINT8(
           out_linear_weights[i],
@@ -475,13 +515,22 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
           quant_round_type,
           quant_max_bound,
           quant_min_bound);
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      dev_ctx.Wait();
+      out_linear_tm.Pause();
+#endif
       // 输出在output_workspace
-      phi::AllReduce<int32_t>(output_workspace,
-                         ring_id,
-                         bsz * seq_len * num_head * dim_head,
-                         dev_ctx);
+      if (mp_size > 1) {
+        phi::AllReduce<int32_t>(output_workspace,
+                                ring_id,
+                                bsz * seq_len * num_head * dim_head,
+                                dev_ctx);
+      }
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step4";
+#endif
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      ln_tm.Resume();
 #endif
       // step5. ln(residual + dropout(input + bias))
       auto *ln_scale_data = ffn_ln_scales[i]->data<U>();
@@ -508,6 +557,10 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
           epsilon,
           ln_mean_data,
           ln_var_data);
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      dev_ctx.Wait();
+      ln_tm.Pause();
+#endif
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step5";
 #endif
@@ -520,6 +573,9 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       }
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, gate & topk";
+#endif
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      gate_tm.Resume();
 #endif
       // step3 gate & topk
       // 这里不做量化
@@ -551,13 +607,19 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, all_to_all";
 #endif
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      dev_ctx.Wait();
+      gate_nccl_tm.Resume();
+#endif
       if (world_size > 1) {
-        phi::AllToAll<int64_t>(
-            local_expert_count, global_expert_count, moe_ring_id, dev_ctx);
+        moe_pg.AllToAll<int64_t>(local_expert_count, global_expert_count);
       } else {
         global_expert_count = local_expert_count;
       }
-
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      dev_ctx.Wait();
+      gate_nccl_tm.Pause();
+#endif
       // global expert count resize
       global_expert_count.Resize({{world_size, num_expert}});
       // fwd expert count
@@ -625,30 +687,28 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 #endif
       phi::IndexSelectKernel<T, phi::GPUContext>(
           dev_ctx, sliced_inp, temp_pos, 0, &index_select_out);
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      dev_ctx.Wait();
+      gate_tm.Pause();
+
+      dev_ctx.Wait();
+      scatter_tm.Resume();
+#endif
       if (world_size > 1) {
-        auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
-        // step 5.2, global_scatter
-        if (map->has(moe_ring_id)) {
-          phi::GlobalScatterProcessGroupFunctor<T>(dev_ctx,
-                                                   &index_select_out,
-                                                   &local_expert_count,
-                                                   &global_expert_count,
-                                                   moe_ring_id,
-                                                   true,
-                                                   &global_scatter_out);
-        } else {
-          phi::GlobalScatterFunctor<T>(dev_ctx,
-                                       &index_select_out,
-                                       &local_expert_count,
-                                       &global_expert_count,
-                                       moe_ring_id,
-                                       true,
-                                       &global_scatter_out);
-        }
+        moe_pg.Scatter<T>(&index_select_out,
+                          local_expert_count,
+                          global_expert_count,
+                          &global_scatter_out);
       } else {
         global_scatter_out = index_select_out;
       }
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      dev_ctx.Wait();
+      scatter_tm.Pause();
 
+      dev_ctx.Wait();
+      expert_tm.Resume();
+#endif
       // step 6, Expert Computation
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, Expert Computation";
@@ -733,34 +793,24 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       } else {
         all_expert_out = global_scatter_out;
       }
-
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      dev_ctx.Wait();
+      expert_tm.Pause();
+      gather_tm.Resume();
+#endif
       // step7. MOEGather
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, MOEGather";
 #endif
       if (world_size > 1) {
-        auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
-        // step 7.1, global_gather
-        if (map->has(moe_ring_id)) {
-          phi::GlobalGatherProcessGroupFunctor<T>(dev_ctx,
-                                                  &all_expert_out,
-                                                  &local_expert_count,
-                                                  &global_expert_count,
-                                                  moe_ring_id,
-                                                  true,
-                                                  &global_gather_out);
-        } else {
-          phi::GlobalGatherFunctor<T>(dev_ctx,
-                                      &all_expert_out,
-                                      &local_expert_count,
-                                      &global_expert_count,
-                                      moe_ring_id,
-                                      true,
-                                      &global_gather_out);
-        }
+        moe_pg.Gather<T>(&all_expert_out, &global_gather_out);
       } else {
         global_gather_out = all_expert_out;
       }
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      dev_ctx.Wait();
+      gather_tm.Pause();
+#endif
       // step 7.2, local_gather or scatter
       // suppose pos->shape != [0]
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
@@ -785,7 +835,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 #endif
       if (mp_size > 1) {
         // all gather
-        phi::AllGather<T>(bmm_out, all_gather_out, moe_ring_id, dev_ctx);
+        moe_pg.AllGather<T>(bmm_out, all_gather_out);
       } else {
         all_gather_out = bmm_out;
       }
@@ -795,6 +845,10 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       VLOG(0) << "moe, add residual";
 #endif
       if (i < layers - 1) {
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+        dev_ctx.Wait();
+        ln_tm.Resume();
+#endif
         // add residual & next layer norm & qkv quant
         auto *ln_scale_data = ln_scales[i + 1]->data<U>();
         auto *ln_bias_data = ln_biases[i + 1]->data<U>();
@@ -826,14 +880,40 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
                                                 epsilon,
                                                 ln_mean_data,
                                                 ln_var_data);
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+        dev_ctx.Wait();
+        ln_tm.Pause();
+#endif
       } else {
         // last layer, only add residual, T
         phi::AddKernel<T, phi::GPUContext>(
             dev_ctx, all_gather_out, bias_dropout_residual_out, &moe_out);
       }
       x_data = moe_out.data<T>();
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+      dev_ctx.Wait();
+      trans_tm.Pause();
+#endif
     }  // end for layer loop
     out->Resize({{bsz, seq_len, dim_embed}});
+#ifdef DEBUG_MOE_TMPROFILE_INT8
+    dev_ctx.Wait();
+    all_tm.Pause();
+    VLOG(0) << "gpu=" << static_cast<int>(dev_ctx.GetPlace().GetDeviceId())
+            << ", bsz=" << bsz << ", seq_len=" << seq_len
+            << ", total span=" << all_tm.ElapsedMS()
+            << ", input=" << other_tm.ElapsedMS()
+            << ", transformer=" << trans_tm.ElapsedMS()
+            << ", [qkv=" << qkv_tm.ElapsedMS()
+            << ", fmha=" << fmha_tm.ElapsedMS()
+            << ", out_linear=" << out_linear_tm.ElapsedMS()
+            << ", expert=" << expert_tm.ElapsedMS()
+            << ", ln=" << ln_tm.ElapsedMS()
+            << ", gate/all2all=" << gate_tm.ElapsedMS() << "/"
+            << gate_nccl_tm.ElapsedMS()
+            << ", scatter=" << scatter_tm.ElapsedMS()
+            << ", gather=" << gather_tm.ElapsedMS() << "]";
+#endif
   }
 };
 
