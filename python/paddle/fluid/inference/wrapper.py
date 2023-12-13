@@ -48,10 +48,18 @@ def tensor_share_external_data(self, data):
     '''
     if isinstance(data, core.LoDTensor):
         self.share_external_data_bind(data)
+    elif isinstance(data, paddle.Tensor):
+        self._share_external_data_paddle_tensor_bind(data)
+    elif isinstance(data, paddle.fluid.framework.Variable):
+        raise TypeError(
+            "The interface 'share_external_data' can only be used in dynamic graph mode. "
+            "Maybe you called 'paddle.enable_static()' and you are in static graph mode now. "
+            "Please use 'copy_from_cpu' instead."
+        )
     else:
         raise TypeError(
-            "In share_external_data, we only support LoDTensor data type.")
-
+            "In share_external_data, we only support Tensor and LoDTensor."
+        )
 
 def convert_to_mixed_precision(model_file: str,
                                params_file: str,
