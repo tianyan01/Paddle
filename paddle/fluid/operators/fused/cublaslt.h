@@ -21,6 +21,7 @@ limitations under the License. */
 #include <unordered_map>
 #include "paddle/fluid/framework/tensor.h"
 #include "paddle/fluid/platform/dynload/cublasLt.h"
+#include "paddle/phi/backends/gpu/gpu_info.h"
 
 DECLARE_int64(cublaslt_exhaustive_search_times);
 
@@ -783,6 +784,13 @@ class CublasLtHelper {
         algo = &algo_;
     }
 #endif
+
+    // const int32_t arch = phi::backends::gpu::GetDeviceArchSM(-1);
+    // if (arch != 80) {
+    //   algo = nullptr;
+    //   workspace = nullptr;
+    //   workspace_size = 0;
+    // }
 
     status = dyl::cublasLtMatmul(handle_,
                                  matmul_desc_,
