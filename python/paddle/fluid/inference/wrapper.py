@@ -17,6 +17,8 @@ from ..core import PaddleInferPredictor, PaddleInferTensor
 from ..core import convert_to_mixed_precision_bind
 from .. import core
 
+import paddle
+
 import os
 import numpy as np
 from typing import Set
