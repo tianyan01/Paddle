@@ -8,15 +8,15 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
-//#define DEBUG_TMPROFILE_WEIGHT_ONLY
+// #define DEBUG_TMPROFILE_WEIGHT_ONLY
 #include "paddle/fluid/operators/fused/fused_multi_transformer_op.h"
 #ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
 #include "paddle/fluid/platform/timer.h"
 #endif
+#include "paddle/fluid/operators/fused/attn_gemm.h"
 #include "paddle/phi/kernels/funcs/scatter.cu.h"
 #include "paddle/phi/kernels/gpu/fused_moe_kernel.cu.h"
 #include "paddle/phi/kernels/weight_only_linear_kernel.h"
-#include "paddle/fluid/operators/fused/attn_gemm.h"
 namespace paddle {
 namespace operators {
 
@@ -66,7 +66,7 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       beam_size = beam_cache_offset->dims()[1];
     }
     // LOG(INFO) << "beam_size: " << beam_size;
-    
+
     auto *out = ctx.Output<Tensor>("Out");
     dev_ctx.Alloc<T>(out, out->numel() * sizeof(T));
 
@@ -104,8 +104,9 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
     }
     int hidden_size = num_head * dim_head;
     int qkv_output_size = 3 * hidden_size;
-    // weight only gemm 
-    auto weight_only_gemm = AttnMatMulWeightOnly<T>(dev_ctx, (weight_dtype == "int4"));
+    // weight only gemm
+    auto weight_only_gemm =
+        AttnMatMulWeightOnly<T>(dev_ctx, (weight_dtype == "int4"));
     int default_act = weight_only_gemm.GetActivation("none");
     int expert_act = weight_only_gemm.GetActivation(act_method);
 
@@ -346,16 +347,15 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       dev_ctx.Wait();
       qkv_tm.Resume();
 #endif
-      weight_only_gemm.Linear(
-          buf0,
-          *qkv_weights[i],
-          (time_step == nullptr) ? qkv_bias: nullptr,
-          *qkv_scales[i],
-          bsz_seq,          // M
-          qkv_output_size,  // N
-          dim_embed,        // K
-		  default_act,  	// none
-          &qkv_out);
+      weight_only_gemm.Linear(buf0,
+                              *qkv_weights[i],
+                              (time_step == nullptr) ? qkv_bias : nullptr,
+                              *qkv_scales[i],
+                              bsz_seq,          // M
+                              qkv_output_size,  // N
+                              dim_embed,        // K
+                              default_act,      // none
+                              &qkv_out);
 #ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
       dev_ctx.Wait();
       qkv_tm.Pause();
@@ -457,16 +457,15 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
               << ", weight=" << out_linear_weights[i]->dims()
               << ", output=" << buf0.dims();
 #endif
-      weight_only_gemm.Linear(
-          fmha_out,
-          *out_linear_weights[i],
-          nullptr,
-          *out_linear_scales[i],
-          bsz_seq,      // M
-          dim_embed,    // N
-          hidden_size,  // K
-		  default_act,  // none
-          &buf0);
+      weight_only_gemm.Linear(fmha_out,
+                              *out_linear_weights[i],
+                              nullptr,
+                              *out_linear_scales[i],
+                              bsz_seq,      // M
+                              dim_embed,    // N
+                              hidden_size,  // K
+                              default_act,  // none
+                              &buf0);
 #ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
       dev_ctx.Wait();
       out_linear_tm.Pause();
@@ -647,16 +646,15 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
                   << ", expert_out1=" << expert_out1.dims();
 #endif
 
-          weight_only_gemm.Linear(
-              tmp_inp,
-              *expert_weights1[expert_idx],
-              expert_biases1[expert_idx],
-              *expert_scales1[expert_idx],
-			  cur_expert_count,
-			  dim_feedforward,
-			  dim_embed,
-			  expert_act,  // gelu, relu
-              &expert_out1);
+          weight_only_gemm.Linear(tmp_inp,
+                                  *expert_weights1[expert_idx],
+                                  expert_biases1[expert_idx],
+                                  *expert_scales1[expert_idx],
+                                  cur_expert_count,
+                                  dim_feedforward,
+                                  dim_embed,
+                                  expert_act,  // gelu, relu
+                                  &expert_out1);
 
           // linear2 matmul & add
           Tensor expert_out2 = all_expert_out.Slice(last_index, end);
@@ -669,16 +667,15 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
                   << ", scale=" << expert_scales2[expert_idx]->dims()
                   << ", expert_out2=" << expert_out2.dims();
 #endif
-          weight_only_gemm.Linear(
-              expert_out1,
-              *expert_weights2[expert_idx],
-              expert_biases2[expert_idx],
-              *expert_scales2[expert_idx],
-			  cur_expert_count,
-			  dim_embed,
-			  dim_feedforward,
-              default_act,  // none
-              &expert_out2);
+          weight_only_gemm.Linear(expert_out1,
+                                  *expert_weights2[expert_idx],
+                                  expert_biases2[expert_idx],
+                                  *expert_scales2[expert_idx],
+                                  cur_expert_count,
+                                  dim_embed,
+                                  dim_feedforward,
+                                  default_act,  // none
+                                  &expert_out2);
           last_index = end;
         }
         // at last, concat all expert out

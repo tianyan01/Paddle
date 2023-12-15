@@ -105,10 +105,10 @@ void weight_permute_gpu(const GPUContext& dev_ctx,
         input_data, output_data, numel, total_k, total_n);
   }
 }
-template <typename T, int VectorSize = 8, typename TScale = float>
+template <typename T, int VectorSize = 8>
 __global__ void per_channel_quant_gpu(const T* weight_data,
                                       int8_t* quanted_weight_data,
-									  TScale* scale_data,
+                                      T* scale_data,
                                       int total_k,
                                       int total_vec_n) {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
@@ -134,7 +134,8 @@ __global__ void per_channel_quant_gpu(const T* weight_data,
     }
 #pragma unroll
     for (int i = 0; i < VectorSize; ++i) {
-      scale_data[n * VectorSize + i] = static_cast<TScale>(abs_max[i] / static_cast<float>(127.0f));
+      scale_data[n * VectorSize + i] =
+          static_cast<T>(abs_max[i] / static_cast<float>(127.0f));
     }
 
     for (int k = 0; k < total_k; ++k) {
@@ -158,11 +159,11 @@ __global__ void per_channel_quant_gpu(const T* weight_data,
   }
 }
 
-template <typename T, typename GPUContext, typename TScale = float>
+template <typename T, typename GPUContext>
 void weight_quant_gpu(const GPUContext& dev_ctx,
                       const T* weight_data,
                       int8_t* quanted_weight_data,
-					  TScale* scale_data,
+                      T* scale_data,
                       const std::vector<int>& shape) {
   int total_k = shape[0];
   int total_n = shape[1];
@@ -173,7 +174,7 @@ void weight_quant_gpu(const GPUContext& dev_ctx,
   constexpr int kVectorSize = 128 / sizeof(T) / 8;
   int vec_total_n = total_n / kVectorSize;
   int kGridSize = max(vec_total_n / kBlockSize, static_cast<int>(1));
-  per_channel_quant_gpu<T, kVectorSize, TScale><<<kGridSize, kBlockSize>>>(
+  per_channel_quant_gpu<T, kVectorSize><<<kGridSize, kBlockSize>>>(
       weight_data, quanted_weight_data, scale_data, total_k, vec_total_n);
 }
 

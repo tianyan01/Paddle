@@ -60,7 +60,7 @@ struct FastWeightOnlyHalfConverter<half, 4> {
 
   __device__ static inline void convert(half halves[kHalfLength],
                                         uint8_t chars[kWeightOnlyLength],
-										half scale) {
+                                        half scale) {
     *reinterpret_cast<Converter::result_type*>(halves) =
         Converter::convert(*reinterpret_cast<Converter::source_type*>(chars));
 #pragma unroll
@@ -82,7 +82,7 @@ struct FastWeightOnlyHalfConverter<__nv_bfloat16, 8> {
 
   __device__ static inline void convert(__nv_bfloat16 halves[kHalfLength],
                                         uint8_t chars[kWeightOnlyLength],
-										__nv_bfloat16 scale) {
+                                        __nv_bfloat16 scale) {
     *reinterpret_cast<Converter::result_type*>(halves) =
         Converter::convert(*reinterpret_cast<Converter::source_type*>(chars));
 #pragma unroll
@@ -103,7 +103,7 @@ struct FastWeightOnlyHalfConverter<__nv_bfloat16, 4> {
 
   __device__ static inline void convert(__nv_bfloat16 halves[kHalfLength],
                                         uint8_t chars[kWeightOnlyLength],
-										__nv_bfloat16 scale) {
+                                        __nv_bfloat16 scale) {
     *reinterpret_cast<Converter::result_type*>(halves) =
         Converter::convert(*reinterpret_cast<Converter::source_type*>(chars));
 #pragma unroll

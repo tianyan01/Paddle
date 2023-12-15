@@ -2791,7 +2791,7 @@ class FusedMultiTransformerMoeWeightOnly(Layer):
             qkv_scale = self.create_parameter(
                 shape=[int(3 * num_heads * self.head_dim)],
                 attr=qkv_scale_attr,
-                dtype="float32",
+                dtype=self._dtype,
                 is_bias=False,
                 default_initializer=Constant(1.0),
             )
@@ -2811,7 +2811,7 @@ class FusedMultiTransformerMoeWeightOnly(Layer):
             linear_scale = self.create_parameter(
                 shape=[embed_dim],
                 attr=linear_scale_attr,
-                dtype="float32",
+                dtype=self._dtype,
                 is_bias=False,
                 default_initializer=Constant(1.0),
             )
@@ -2886,7 +2886,7 @@ class FusedMultiTransformerMoeWeightOnly(Layer):
                 expert_scale1 = self.create_parameter(
                     shape=[dim_feedforward],
                     attr=expert_scale1_attr,
-                    dtype="float32",
+                    dtype=self._dtype,
                     is_bias=False,
                     default_initializer=nn.initializer.Constant(value=0.0)
                 )
@@ -2908,7 +2908,7 @@ class FusedMultiTransformerMoeWeightOnly(Layer):
                 expert_scale2 = self.create_parameter(
                     shape=[d_model],
                     attr=expert_scale2_attr,
-                    dtype="float32",
+                    dtype=self._dtype,
                     is_bias=False,
                     default_initializer=nn.initializer.Constant(value=0.0)
                 )
