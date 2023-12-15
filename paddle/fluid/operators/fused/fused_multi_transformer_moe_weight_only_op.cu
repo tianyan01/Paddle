@@ -16,6 +16,7 @@ limitations under the License. */
 #include "paddle/phi/kernels/funcs/scatter.cu.h"
 #include "paddle/phi/kernels/gpu/fused_moe_kernel.cu.h"
 #include "paddle/phi/kernels/weight_only_linear_kernel.h"
+#include "paddle/fluid/operators/fused/attn_gemm.h"
 namespace paddle {
 namespace operators {
 
@@ -65,7 +66,7 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       beam_size = beam_cache_offset->dims()[1];
     }
     // LOG(INFO) << "beam_size: " << beam_size;
-
+    
     auto *out = ctx.Output<Tensor>("Out");
     dev_ctx.Alloc<T>(out, out->numel() * sizeof(T));
 
@@ -103,6 +104,10 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
     }
     int hidden_size = num_head * dim_head;
     int qkv_output_size = 3 * hidden_size;
+    // weight only gemm 
+    auto weight_only_gemm = AttnMatMulWeightOnly<T>(dev_ctx, (weight_dtype == "int4"));
+    int default_act = weight_only_gemm.GetActivation("none");
+    int expert_act = weight_only_gemm.GetActivation(act_method);
 
     Tensor qkv_out;
     qkv_out.Resize({{bsz, seq_len, 3, num_head, dim_head}});
@@ -341,17 +346,15 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       dev_ctx.Wait();
       qkv_tm.Resume();
 #endif
-      phi::WeightOnlyLinear2Kernel<T, phi::GPUContext>(
-          dev_ctx,
+      weight_only_gemm.Linear(
           buf0,
           *qkv_weights[i],
-          paddle::make_optional((time_step == nullptr), *qkv_bias),
+          (time_step == nullptr) ? qkv_bias: nullptr,
           *qkv_scales[i],
           bsz_seq,          // M
           qkv_output_size,  // N
           dim_embed,        // K
-          weight_dtype,
-          "none",  // none, gelu, relu
+		  default_act,  	// none
           &qkv_out);
 #ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
       dev_ctx.Wait();
@@ -454,8 +457,7 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
               << ", weight=" << out_linear_weights[i]->dims()
               << ", output=" << buf0.dims();
 #endif
-      phi::WeightOnlyLinear2Kernel<T, phi::GPUContext>(
-          dev_ctx,
+      weight_only_gemm.Linear(
           fmha_out,
           *out_linear_weights[i],
           nullptr,
@@ -463,8 +465,7 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
           bsz_seq,      // M
           dim_embed,    // N
           hidden_size,  // K
-          weight_dtype,
-          "none",  // none, gelu, relu
+		  default_act,  // none
           &buf0);
 #ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
       dev_ctx.Wait();
@@ -646,14 +647,15 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
                   << ", expert_out1=" << expert_out1.dims();
 #endif
 
-          phi::WeightOnlyLinearKernel<T, phi::GPUContext>(
-              dev_ctx,
+          weight_only_gemm.Linear(
               tmp_inp,
               *expert_weights1[expert_idx],
-              *expert_biases1[expert_idx],
+              expert_biases1[expert_idx],
               *expert_scales1[expert_idx],
-              weight_dtype,
-              act_method,  // none, gelu, relu
+			  cur_expert_count,
+			  dim_feedforward,
+			  dim_embed,
+			  expert_act,  // gelu, relu
               &expert_out1);
 
           // linear2 matmul & add
@@ -667,14 +669,15 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
                   << ", scale=" << expert_scales2[expert_idx]->dims()
                   << ", expert_out2=" << expert_out2.dims();
 #endif
-          phi::WeightOnlyLinearKernel<T, phi::GPUContext>(
-              dev_ctx,
+          weight_only_gemm.Linear(
               expert_out1,
               *expert_weights2[expert_idx],
-              *expert_biases2[expert_idx],
+              expert_biases2[expert_idx],
               *expert_scales2[expert_idx],
-              weight_dtype,
-              "none",  // none, gelu, relu
+			  cur_expert_count,
+			  dim_embed,
+			  dim_feedforward,
+              default_act,  // none
               &expert_out2);
           last_index = end;
         }

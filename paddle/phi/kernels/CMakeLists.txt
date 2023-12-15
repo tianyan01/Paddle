@@ -175,6 +175,7 @@ if(WITH_CUTLASS)
     "fusion/cutlass/*.cu"
     "fusion/cutlass/memory_efficient_attention/autogen/impl/*.cu"
     "fusion/cutlass/memory_efficient_attention/autogen_variable/impl/*.cu"
+    "fusion/cutlass/cutlass_kernels/*.cu"
     "fusion/cutlass/cutlass_kernels/fpA_intB_gemm/autogen/*.cu"
     "fusion/cutlass/cutlass_kernels/fpA_intB_gemm/*.cu")
   list(APPEND kernel_cu ${cutlass_cu})

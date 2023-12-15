@@ -49,7 +49,7 @@ void WeightOnlyLinear2Kernel(const Context& dev_ctx,
   const T* x_data = x.data<T>();
   const int8_t* weight_data = weight.data<int8_t>();
   const T* bias_data = bias ? bias.get().data<T>() : nullptr;
-  const float* weight_scale_data = weight_scale.data<float>();
+  const T* weight_scale_data = weight_scale.data<T>();
   T* out_data = out->data<T>();
 
   // m > 1: run gemm.
@@ -60,44 +60,38 @@ If using arch = 70, we always dispatch to weightonly Gemm,
 we havenot support sm70 weightonly gemv, because sm70 weight layout is RowMajor.
 */
 #if defined(PADDLE_WITH_CUTLASS)
+	using InputType = typename phi::PDDataTypeTraits<T>::DataType;
     if (weight_dtype == "int8") {
       auto mixed_gemm_runner =
-          CutlassFpAIntBGemmRunner<typename PDDataTypeTraits<T>::DataType,
-                                   uint8_t>();
+          CutlassFpAIntBGemmRunner<InputType, uint8_t>();
       int mixgemm_max_size = std::max(m, k);
       int64_t mixgemm_workspace_size_bytes = mixed_gemm_runner.getWorkspaceSize(
           m, mixgemm_max_size, mixgemm_max_size);
-
-      //      DenseTensor mixgemm_workspace;
-      //      mixgemm_workspace.Resize({mixgemm_workspace_size_bytes});
-      //      dev_ctx.template Alloc<uint8_t>(&mixgemm_workspace);
-      //      char* mixgemm_workspace_data =
-      //          reinterpret_cast<char*>(mixgemm_workspace.data<uint8_t>());
+      
+      
       char* mixgemm_workspace_data = reinterpret_cast<char*>(
           dev_ctx.template GetWorkSpacePtr(mixgemm_workspace_size_bytes));
       if (bias_data) {
+    	auto act_type = phi::getActivationType(act_method);
         mixed_gemm_runner.gemm_bias_act(
-            reinterpret_cast<const typename PDDataTypeTraits<T>::DataType*>(
-                x_data),
+            reinterpret_cast<const InputType*>(x_data),
             reinterpret_cast<const uint8_t*>(weight_data),
-            weight_scale_data,
-            reinterpret_cast<const typename PDDataTypeTraits<T>::DataType*>(
-                bias_data),
-            reinterpret_cast<typename PDDataTypeTraits<T>::DataType*>(out_data),
+			reinterpret_cast<const InputType*>(weight_scale_data),
+            reinterpret_cast<const InputType*>(bias_data),
+            reinterpret_cast<InputType *>(out_data),
             m,
             n,
             k,
-            act_method,
+			act_type,
             mixgemm_workspace_data,
             mixgemm_workspace_size_bytes,
             dev_ctx.stream());
       } else {
         mixed_gemm_runner.gemm(
-            reinterpret_cast<const typename PDDataTypeTraits<T>::DataType*>(
-                x_data),
+            reinterpret_cast<const InputType*>(x_data),
             reinterpret_cast<const uint8_t*>(weight_data),
-            weight_scale_data,
-            reinterpret_cast<typename PDDataTypeTraits<T>::DataType*>(out_data),
+			reinterpret_cast<const InputType*>(weight_scale_data),
+            reinterpret_cast<InputType *>(out_data),
             m,
             n,
             k,
@@ -107,42 +101,35 @@ we havenot support sm70 weightonly gemv, because sm70 weight layout is RowMajor.
       }
     } else {
       auto mixed_gemm_runner =
-          CutlassFpAIntBGemmRunner<typename PDDataTypeTraits<T>::DataType,
-                                   cutlass::uint4b_t>();
+          CutlassFpAIntBGemmRunner<InputType, cutlass::uint4b_t>();
       int mixgemm_max_size = std::max(m, k);
 
       int64_t mixgemm_workspace_size_bytes = mixed_gemm_runner.getWorkspaceSize(
           m, mixgemm_max_size, mixgemm_max_size);
-      //      DenseTensor mixgemm_workspace;
-      //      mixgemm_workspace.Resize({mixgemm_workspace_size_bytes});
-      //      dev_ctx.template Alloc<uint8_t>(&mixgemm_workspace);
-      //      char* mixgemm_workspace_data =
-      //          reinterpret_cast<char*>(mixgemm_workspace.data<uint8_t>());
+      
       char* mixgemm_workspace_data = reinterpret_cast<char*>(
           dev_ctx.template GetWorkSpacePtr(mixgemm_workspace_size_bytes));
       if (bias_data) {
+    	auto act_type = phi::getActivationType(act_method);
         mixed_gemm_runner.gemm_bias_act(
-            reinterpret_cast<const typename PDDataTypeTraits<T>::DataType*>(
-                x_data),
+            reinterpret_cast<const InputType*>(x_data),
             reinterpret_cast<const cutlass::uint4b_t*>(weight_data),
-            weight_scale_data,
-            reinterpret_cast<const typename PDDataTypeTraits<T>::DataType*>(
-                bias_data),
-            reinterpret_cast<typename PDDataTypeTraits<T>::DataType*>(out_data),
+			reinterpret_cast<const InputType*>(weight_scale_data),
+            reinterpret_cast<const InputType*>(bias_data),
+            reinterpret_cast<InputType *>(out_data),
             m,
             n,
             k,
-            act_method,
+			act_type,
             mixgemm_workspace_data,
             mixgemm_workspace_size_bytes,
             dev_ctx.stream());
       } else {
         mixed_gemm_runner.gemm(
-            reinterpret_cast<const typename PDDataTypeTraits<T>::DataType*>(
-                x_data),
+            reinterpret_cast<const InputType*>(x_data),
             reinterpret_cast<const cutlass::uint4b_t*>(weight_data),
-            weight_scale_data,
-            reinterpret_cast<typename PDDataTypeTraits<T>::DataType*>(out_data),
+			reinterpret_cast<const InputType*>(weight_scale_data),
+            reinterpret_cast<InputType *>(out_data),
             m,
             n,
             k,
@@ -162,6 +149,7 @@ we havenot support sm70 weightonly gemv, because sm70 weight layout is RowMajor.
                                             weight_data,
                                             bias_data,
                                             weight_scale_data,
+                                            m,
                                             n,
                                             k,
                                             act_method,

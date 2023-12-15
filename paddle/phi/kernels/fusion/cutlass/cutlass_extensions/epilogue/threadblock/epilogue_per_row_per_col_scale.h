@@ -41,7 +41,7 @@ limitations under the License. */
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include "../epilogue_quant_helper.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/epilogue/epilogue_quant_helper.h"
 #include "cutlass/arch/memory.h"
 #include "cutlass/arch/memory_sm75.h"
 #include "cutlass/cutlass.h"

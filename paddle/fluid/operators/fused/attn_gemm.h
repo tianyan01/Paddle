@@ -23,7 +23,10 @@ limitations under the License. */
 #if (defined(PADDLE_WITH_CUDA) && CUDA_VERSION >= 11040)
 #include "paddle/phi/kernels/funcs/blas/blaslt_impl.cu.h"
 #endif
-
+#if defined(PADDLE_WITH_CUTLASS)
+#include "paddle/phi/common/datatype_traits.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm_template.h"
+#endif
 namespace paddle {
 namespace operators {
 
@@ -254,6 +257,139 @@ class AttnMatMul {
   int input_size_;
 
   int compute_bias_;
+};
+
+template <typename T>
+class AttnMatMulWeightOnly {
+#if defined(PADDLE_WITH_CUTLASS)
+  using InputType = typename phi::PDDataTypeTraits<T>::DataType;
+  using GemRunnerInt8 =
+      phi::CutlassFpAIntBGemmRunner<InputType,
+                                    uint8_t>;
+  using GemRunnerInt4 =
+      phi::CutlassFpAIntBGemmRunner<InputType,
+                                    cutlass::uint4b_t>;
+#endif
+ public:
+  // (m, n, k) = bsz_seq, output_size, input_size
+  AttnMatMulWeightOnly(const phi::GPUContext& dev_ctx, bool is_uint4)
+      : dev_ctx_(dev_ctx), is_uint4_(is_uint4) {}
+
+  ~AttnMatMulWeightOnly() {}
+  // get activation
+  int GetActivation(const std::string &act_method) {
+#if defined(PADDLE_WITH_CUTLASS)
+	 return static_cast<int>(phi::getActivationType(act_method));
+#else
+	 return 0;
+#endif
+  }
+  void Linear(const phi::DenseTensor& x,
+              const phi::DenseTensor& weight,
+              const phi::DenseTensor* bias,
+              const phi::DenseTensor& weight_scale,
+              const int m,
+              const int n,
+              const int k,
+              const int& act_method,  // none, gelu, relu
+              phi::DenseTensor* out) {
+#if defined(PADDLE_WITH_CUTLASS)
+    const T* x_data = x.data<T>();
+    const int8_t* weight_data = weight.data<int8_t>();
+    const T* bias_data = bias ? bias->data<T>() : nullptr;
+    const T* weight_scale_data = weight_scale.data<T>();
+    T* out_data = out->data<T>();
+
+    if (is_uint4_) {
+      int mixgemm_max_size = std::max(m, k);
+
+      int64_t mixgemm_workspace_size_bytes =
+          mixed_gemm_runner_int4_.getWorkspaceSize(
+              m, mixgemm_max_size, mixgemm_max_size);
+
+      char* mixgemm_workspace_data = reinterpret_cast<char*>(
+          dev_ctx_.template GetWorkSpacePtr(mixgemm_workspace_size_bytes));
+      if (bias_data) {
+        mixed_gemm_runner_int4_.gemm_bias_act(
+            reinterpret_cast<const InputType*>(
+                x_data),
+            reinterpret_cast<const cutlass::uint4b_t*>(weight_data),
+			reinterpret_cast<const InputType*>(weight_scale_data),
+            reinterpret_cast<const InputType*>(
+                bias_data),
+            reinterpret_cast<InputType *>(out_data),
+            m,
+            n,
+            k,
+            static_cast<phi::ActivationType>(act_method),
+            mixgemm_workspace_data,
+            mixgemm_workspace_size_bytes,
+			dev_ctx_.stream());
+      } else {
+        mixed_gemm_runner_int4_.gemm(
+            reinterpret_cast<const InputType*>(
+                x_data),
+            reinterpret_cast<const cutlass::uint4b_t*>(weight_data),
+			reinterpret_cast<const InputType*>(weight_scale_data),
+            reinterpret_cast<InputType *>(out_data),
+            m,
+            n,
+            k,
+            mixgemm_workspace_data,
+            mixgemm_workspace_size_bytes,
+			dev_ctx_.stream());
+      }
+    } else {
+      int mixgemm_max_size = std::max(m, k);
+      int64_t mixgemm_workspace_size_bytes =
+          mixed_gemm_runner_int8_.getWorkspaceSize(
+              m, mixgemm_max_size, mixgemm_max_size);
+      char* mixgemm_workspace_data = reinterpret_cast<char*>(
+          dev_ctx_.template GetWorkSpacePtr(mixgemm_workspace_size_bytes));
+      if (bias_data) {
+        mixed_gemm_runner_int8_.gemm_bias_act(
+            reinterpret_cast<const InputType*>(
+                x_data),
+            reinterpret_cast<const uint8_t*>(weight_data),
+			reinterpret_cast<const InputType*>(weight_scale_data),
+            reinterpret_cast<const InputType*>(
+                bias_data),
+            reinterpret_cast<InputType *>(out_data),
+            m,
+            n,
+            k,
+			static_cast<phi::ActivationType>(act_method),
+            mixgemm_workspace_data,
+            mixgemm_workspace_size_bytes,
+            dev_ctx_.stream());
+      } else {
+        mixed_gemm_runner_int8_.gemm(
+            reinterpret_cast<const InputType*>(
+                x_data),
+            reinterpret_cast<const uint8_t*>(weight_data),
+			reinterpret_cast<const InputType*>(weight_scale_data),
+            reinterpret_cast<InputType *>(out_data),
+            m,
+            n,
+            k,
+            mixgemm_workspace_data,
+            mixgemm_workspace_size_bytes,
+            dev_ctx_.stream());
+      }
+    }
+#else
+    PADDLE_THROW(platform::errors::InvalidArgument(
+        "this machine not support weight only"));
+#endif
+  }
+
+ private:
+  const phi::GPUContext& dev_ctx_;
+#if defined(PADDLE_WITH_CUTLASS)
+  GemRunnerInt8 mixed_gemm_runner_int8_;
+  GemRunnerInt4 mixed_gemm_runner_int4_;
+#endif
+  bool is_uint4_ = false;
 };
 
 }  // namespace operators

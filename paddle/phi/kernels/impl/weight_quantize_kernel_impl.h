@@ -42,22 +42,22 @@ inline T xabs(const T x) {
   return x < static_cast<T>(0.0) ? -x : x;
 }
 
-template <typename T>
+template <typename T, typename TScale>
 void per_channel_scale(
-    float* scale, const T* input, size_t m, size_t n, float bound) {
+	TScale* scale, const T* input, size_t m, size_t n, float bound) {
   for (size_t i = 0; i < n; ++i) {
     T max = input[i];
     for (size_t j = 0; j < m; ++j) {
       max = xabs(input[j * n + i]) > max ? xabs(input[j * n + i]) : max;
     }
-    scale[i] = static_cast<float>(static_cast<float>(max) / bound);
+    scale[i] = static_cast<TScale>(static_cast<float>(max) / bound);
   }
 }
 
-template <typename T, int quant_bit = 8>
+template <typename T, int quant_bit = 8, typename TScale = float>
 void per_channel_quant(int8_t* output,
                        const T* input,
-                       const float* scale,
+                       const TScale* scale,
                        size_t num_rows,
                        size_t num_cols) {
   size_t bytes_per_out_col = num_cols * quant_bit / 8;

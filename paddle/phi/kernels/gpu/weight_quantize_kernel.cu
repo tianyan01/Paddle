@@ -19,6 +19,9 @@
 #include "paddle/phi/kernels/funcs/math_function.h"
 #include "paddle/phi/kernels/impl/weight_quantize_kernel_gpu_impl.h"
 
+#include "paddle/phi/common/datatype_traits.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/cutlass_preprocessors.h"
+
 namespace phi {
 
 template <typename T, typename Context>
@@ -30,7 +33,7 @@ void WeightQuantizeKernel(const Context& dev_ctx,
   const int32_t arch = phi::backends::gpu::GetDeviceArchSM(-1);
   DenseTensor quanted_x;
   dev_ctx.template Alloc<int8_t>(out);
-  dev_ctx.template Alloc<float>(scale);
+  dev_ctx.template Alloc<T>(scale);
   size_t m = x.dims()[0];
   size_t n = x.dims()[1];
   quanted_x.Resize({static_cast<int64_t>(m), static_cast<int64_t>(n)});
@@ -49,14 +52,14 @@ void WeightQuantizeKernel(const Context& dev_ctx,
     weight_quant_gpu<T, Context>(dev_ctx,
                                  x.data<T>(),
                                  quanted_x.data<int8_t>(),
-                                 scale->data<float>(),
+                                 scale->data<T>(),
                                  weight_shape);
     trans(dev_ctx, quanted_x, out, axis);
   } else if (algo == "weight_only_int8") {
     weight_quant_gpu<T, Context>(dev_ctx,
                                  x.data<T>(),
                                  quanted_x.data<int8_t>(),
-                                 scale->data<float>(),
+                                 scale->data<T>(),
                                  weight_shape);
     weight_permute_gpu<Context>(dev_ctx,
                                 quanted_x.data<int8_t>(),
@@ -64,9 +67,34 @@ void WeightQuantizeKernel(const Context& dev_ctx,
                                 weight_shape,
                                 arch);
   } else if (algo == "weight_only_int4") {
-    phi::errors::Unimplemented(
-        "Weight quant gpu kernel currently don't support weight_only_int4 "
-        "algo, please use cpu version.");
+    //    phi::errors::Unimplemented(
+    //        "Weight quant gpu kernel currently don't support weight_only_int4
+    //        " "algo, please use cpu version.");
+    DenseTensor cpu_x, cpu_scale, cpu_out, trans_out;
+    cpu_scale.Resize(scale->dims());
+    T* scale_ptr = cpu_scale.mutable_data<T>(phi::CPUPlace());
+    cpu_out.Resize(out->dims());
+    int8_t* out_ptr = cpu_out.mutable_data<int8_t>(phi::CPUPlace());
+
+    phi::Copy(dev_ctx, x, phi::CPUPlace(), true, &cpu_x);
+    T* input_ptr = cpu_x.data<T>();
+
+    std::vector<size_t> wshape{m, n};
+
+    static constexpr int BITS_PER_ELT = 4;
+    phi::quant::symmetric_quantize<typename phi::PDDataTypeTraits<T>::DataType,
+                                   typename phi::PDDataTypeTraits<T>::DataType>(
+        out_ptr,
+        reinterpret_cast<typename phi::PDDataTypeTraits<T>::DataType*>(
+            scale_ptr),
+        reinterpret_cast<const typename phi::PDDataTypeTraits<T>::DataType*>(
+            input_ptr),
+        wshape,
+        phi::quant::QuantType::PACKED_INT4_WEIGHT_ONLY);
+
+    phi::Copy(dev_ctx, cpu_scale, scale->place(), false, scale);
+    phi::Copy(dev_ctx, cpu_out, out->place(), true, out);
+
   } else {
     phi::errors::Unimplemented(
         "The algo must be in ['weight_only_int8', 'weight_only_int4', "

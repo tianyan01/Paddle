@@ -31,8 +31,8 @@
 #include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/numeric_conversion.h"
 #include "paddle/phi/backends/gpu/gpu_info.h"
-#include "paddle/phi/kernels/fusion/cutlass/moe/default_moe_fc_traits.h"
-#include "paddle/phi/kernels/fusion/cutlass/moe/linear_combination_ft_gelu.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/gemm/kernel/default_moe_fc_traits.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/epilogue/thread/linear_combination_ft_gelu.h"
 #include "paddle/phi/kernels/fusion/cutlass/moe/moe_cutlass_kernel.h"
 #pragma GCC diagnostic pop
 
