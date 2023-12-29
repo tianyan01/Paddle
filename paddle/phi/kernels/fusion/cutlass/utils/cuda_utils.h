@@ -227,6 +227,7 @@ inline void myAssert(bool result,
   } while (0)
 
 #define FT_THROW(info) throwRuntimeError(__FILE__, __LINE__, info)
+#define FT_LOG_DEBUG(info)
 
 #ifdef SPARSITY_ENABLED
 #define CHECK_CUSPARSE(func)                                              \

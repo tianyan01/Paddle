@@ -8,15 +8,22 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
-// #define DEBUG_TMPROFILE_WEIGHT_ONLY
+#define DEBUG_PRINT_LINEAR_SHAPE
+#define DEBUG_TMPROFILE_WEIGHT_ONLY
 #include "paddle/fluid/operators/fused/fused_multi_transformer_op.h"
 #ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
 #include "paddle/fluid/platform/timer.h"
 #endif
 #include "paddle/fluid/operators/fused/attn_gemm.h"
+#include "paddle/phi/common/datatype_traits.h"
 #include "paddle/phi/kernels/funcs/scatter.cu.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/moe_gemm/moe_gemm_kernels_template.h"
 #include "paddle/phi/kernels/gpu/fused_moe_kernel.cu.h"
 #include "paddle/phi/kernels/weight_only_linear_kernel.h"
+
+PADDLE_DEFINE_EXPORTED_bool(enable_moe_gemm_cutlass,
+                            false,
+                            "enable moe gemm cutlass ,default false");
 namespace paddle {
 namespace operators {
 
@@ -109,6 +116,9 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
         AttnMatMulWeightOnly<T>(dev_ctx, (weight_dtype == "int4"));
     int default_act = weight_only_gemm.GetActivation("none");
     int expert_act = weight_only_gemm.GetActivation(act_method);
+
+    using InputType = typename phi::PDDataTypeTraits<T>::DataType;
+    phi::MoeGemmRunner<InputType, uint8_t> gemm_runner;
 
     Tensor qkv_out;
     qkv_out.Resize({{bsz, seq_len, 3, num_head, dim_head}});
@@ -263,11 +273,10 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
     dev_ctx.Alloc<int64_t>(&fwd_batch_size,
                            fwd_batch_size.numel() * sizeof(int64_t));
     // pos, temp pos
-    Tensor pos, temp_pos;
+    Tensor pos;
     pos.Resize({{out_batch_size}});
-    temp_pos.Resize({{out_batch_size}});
     dev_ctx.Alloc<int64_t>(&pos, pos.numel() * sizeof(int64_t));
-    dev_ctx.Alloc<int64_t>(&temp_pos, temp_pos.numel() * sizeof(int64_t));
+    
     // cumsum
     Tensor lec_cum;
     lec_cum.Resize({{tot_expert}});
@@ -294,7 +303,6 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
     dev_ctx.Alloc<int64_t>(&topk_tensor, topk_tensor.numel() * sizeof(int64_t));
     phi::FullKernel<int64_t, phi::GPUContext>(
         dev_ctx, {1}, topk, pos.dtype(), &topk_tensor);
-
     // moe nccl
     phi::NCCLMoECollective moe_pg(dev_ctx, moe_ring_id, num_expert);
 
@@ -303,6 +311,10 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
     dev_ctx.Alloc<T>(&buf0, buf0.numel() * sizeof(T));
     moe_out.ShareDataWith(*out);
     moe_out.Resize({{bsz_seq, dim_embed}});
+    // expert 
+    Tensor expert_out1;
+    Tensor global_scatter_out;
+    Tensor all_expert_out;
 
     const T *x_data = input_x->data<T>();
 #ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
@@ -527,6 +539,8 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
                                           false,
                                           &topk_value,
                                           &topk_idx);
+
+      phi::CheckTopkIndex<int64_t>(dev_ctx, topk_idx);
       // step4 prepare forward
       // step4.1 number count
       phi::NumberCountKernel<int64_t, phi::GPUContext>(
@@ -538,6 +552,7 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       gate_nccl_tm.Resume();
 #endif
       if (world_size > 1) {
+        VLOG(0) << "layer id=" << i << ", begin all2all";
         moe_pg.AllToAll<int64_t>(local_expert_count, global_expert_count);
       } else {
         global_expert_count = local_expert_count;
@@ -566,13 +581,12 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       // step4.3 cumsum & assign pos
       phi::CumsumKernel<int64_t, phi::GPUContext>(
           dev_ctx, local_expert_count, 0, false, false, false, &lec_cum);
+      // phi::funcs::set_constant<int64_t>(dev_ctx, &pos, static_cast<T>(-1));
       phi::AssignPosCompute<int64_t>(
           dev_ctx, &lec_cum, &topk_idx, &pos, out_batch_size);
       if (topk > 1) {
         phi::FloorDivideKernel<int64_t, phi::GPUContext>(
-            dev_ctx, pos, topk_tensor, &temp_pos);
-      } else {
-        temp_pos = pos;
+            dev_ctx, pos, topk_tensor, &pos);
       }
       framework::TensorCopy(
           fwd_expert_count, platform::CPUPlace(), &fwd_expert_count_cpu);
@@ -581,19 +595,17 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       dev_ctx.Wait();
       int fwd_bsz = fwd_batch_size_cpu.data<int64_t>()[0];
 
-      Tensor global_scatter_out;
       global_scatter_out.Resize({{fwd_bsz, dim_embed}});
       dev_ctx.Alloc<T>(&global_scatter_out,
                        global_scatter_out.numel() * sizeof(T));
 
-      Tensor all_expert_out;
       all_expert_out.Resize({{fwd_bsz, dim_embed}});
       dev_ctx.Alloc<T>(&all_expert_out, all_expert_out.numel() * sizeof(T));
 
       // step 5, MOEScatter
       // step 5.1, index select
       phi::IndexSelectKernel<T, phi::GPUContext>(
-          dev_ctx, sliced_inp, temp_pos, 0, &index_select_out);
+          dev_ctx, sliced_inp, pos, 0, &index_select_out);
 #ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
       dev_ctx.Wait();
       gate_tm.Pause();
@@ -602,6 +614,7 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       scatter_tm.Resume();
 #endif
       if (world_size > 1) {
+        VLOG(0) << "layer id=" << i << ", begin scatter x=" << index_select_out.dims();
         moe_pg.Scatter<T>(&index_select_out,
                           local_expert_count,
                           global_expert_count,
@@ -617,66 +630,133 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       expert_tm.Resume();
 #endif
 #ifdef DEBUG_PRINT_LINEAR_SHAPE
-      VLOG(0) << "begin expert fwd_bsz=" << fwd_bsz
-              << ", dim_feedforward = " << dim_feedforward;
+      VLOG(0) << "layer id=" << i 
+    		  << ", begin expert fwd_bsz=" << fwd_bsz
+          << ", dim_feedforward=" << dim_feedforward
+			    << ", dim_embed=" << dim_embed;
 #endif
       // step 6, Expert Computation
       if (fwd_bsz != 0) {
         // encoder, use matmul
-        int last_index = 0;
-        for (int idx = 0; idx < num_expert; idx++) {
-          int cur_expert_count = fwd_expert_count_cpu.data<int64_t>()[idx];
-          if (cur_expert_count <= 0) {
-            continue;
-          }
-          int end = cur_expert_count + last_index;
+        if (FLAGS_enable_moe_gemm_cutlass) {
+          int expert_idx = i * num_expert;
+#ifdef DEBUG_PRINT_LINEAR_SHAPE
+          VLOG(0) << "layer id=" << i << ", expert_idx=" << expert_idx
+        		  << ", numel=" << fwd_expert_count.numel()
+				  << ", dim_feedforward=" << dim_feedforward
+				  << ", dim_embed=" << dim_embed
+				  << ", num_expert=" << num_expert
+				  << ", global_scatter_out=" << global_scatter_out.dims()
+				  << ", expert_weights1=" << expert_weights1[expert_idx]->dims()
+				  << ", expert_weights2=" << expert_weights2[expert_idx]->dims();
+#endif
+          int64_t *total_rows_before_expert = fwd_expert_count.data<int64_t>();
+          const T *permuted_data = global_scatter_out.data<T>();
+          const int8_t *fc1_expert_weights =
+              expert_weights1[expert_idx]->data<int8_t>();
+          const T *fc1_scales = expert_scales1[expert_idx]->data<T>();
+          const T *fc1_expert_biases = expert_biases1[expert_idx]->data<T>();
 
-          Tensor expert_out1;
-          expert_out1.Resize({{cur_expert_count, dim_feedforward}});
+          expert_out1.Resize({{fwd_bsz, dim_feedforward}});
           dev_ctx.Alloc<T>(&expert_out1, expert_out1.numel() * sizeof(T));
 
-          Tensor tmp_inp = global_scatter_out.Slice(last_index, end);
-          int expert_idx = i * num_expert + idx;
-          // linear1   M = cur_expert_count, N = dim_feedforward, K = dim_embed
+          T *fc1_result = expert_out1.data<T>();
+
+          gemm_runner.moe_gemm_bias_act(
+              reinterpret_cast<const InputType *>(permuted_data),
+              reinterpret_cast<const uint8_t *>(fc1_expert_weights),
+              reinterpret_cast<const InputType *>(fc1_scales),
+              reinterpret_cast<const InputType *>(fc1_expert_biases),
+              reinterpret_cast<InputType *>(fc1_result),
+              total_rows_before_expert,
+              fwd_bsz,
+              dim_feedforward,
+              dim_embed,
+              num_expert,
+              static_cast<phi::ActivationType>(expert_act),
+              dev_ctx.stream());
+
+          const int8_t *fc2_expert_weights =
+              expert_weights2[expert_idx]->data<int8_t>();
+          const T *fc2_scales = expert_scales2[expert_idx]->data<T>();
+          const T *fc2_expert_biases = expert_biases2[expert_idx]->data<T>();
+          T *fc2_result = all_expert_out.data<T>();
+
+          gemm_runner.moe_gemm_bias_act(
+              reinterpret_cast<const InputType *>(fc1_result),
+              reinterpret_cast<const uint8_t *>(fc2_expert_weights),
+              reinterpret_cast<const InputType *>(fc2_scales),
+              reinterpret_cast<const InputType *>(fc2_expert_biases),
+              reinterpret_cast<InputType *>(fc2_result),
+              total_rows_before_expert,
+              fwd_bsz,
+              dim_embed,
+              dim_feedforward,
+              num_expert,
+              static_cast<phi::ActivationType>(default_act),
+              dev_ctx.stream());
+        } else {
+          int last_index = 0;
+          for (int idx = 0; idx < num_expert; idx++) {
+            int cur_expert_count = fwd_expert_count_cpu.data<int64_t>()[idx];
+            if (cur_expert_count <= 0) {
+              continue;
+            }
+            int end = cur_expert_count + last_index;
+
+            expert_out1.Resize({{cur_expert_count, dim_feedforward}});
+            dev_ctx.Alloc<T>(&expert_out1, expert_out1.numel() * sizeof(T));
+
+            Tensor tmp_inp = global_scatter_out.Slice(last_index, end);
+            int expert_idx = i * num_expert + idx;
+            // linear1   M = cur_expert_count, N = dim_feedforward, K =
+            // dim_embed
 #ifdef DEBUG_PRINT_LINEAR_SHAPE
-          VLOG(0) << "expert id=" << idx << ", liner1 input=" << tmp_inp.dims()
-                  << ", weight=" << expert_weights1[expert_idx]->dims()
-                  << ", bias=" << expert_biases1[expert_idx]->dims()
-                  << ", scale=" << expert_scales1[expert_idx]->dims()
-                  << ", expert_out1=" << expert_out1.dims();
+            VLOG(0) << "expert id=" << idx
+                    << ", liner1 input=" << tmp_inp.dims()
+                    << ", weight=" << expert_weights1[expert_idx]->dims() << ", ptr=" << (int64_t)(expert_weights1[expert_idx]->data<int8_t>())
+                    << ", bias=" << expert_biases1[expert_idx]->dims() << ", ptr=" << (int64_t)(expert_biases1[expert_idx]->data<T>())
+                    << ", scale=" << expert_scales1[expert_idx]->dims() << ", ptr=" << (int64_t)(expert_scales1[expert_idx]->data<T>())
+                    << ", expert_out1=" << expert_out1.dims();
 #endif
 
-          weight_only_gemm.Linear(tmp_inp,
-                                  *expert_weights1[expert_idx],
-                                  expert_biases1[expert_idx],
-                                  *expert_scales1[expert_idx],
-                                  cur_expert_count,
-                                  dim_feedforward,
-                                  dim_embed,
-                                  expert_act,  // gelu, relu
-                                  &expert_out1);
+            weight_only_gemm.Linear(tmp_inp,
+                                    *expert_weights1[expert_idx],
+                                    expert_biases1[expert_idx],
+                                    *expert_scales1[expert_idx],
+                                    cur_expert_count,
+                                    dim_feedforward,
+                                    dim_embed,
+                                    expert_act,  // gelu, relu
+                                    &expert_out1);
 
-          // linear2 matmul & add
-          Tensor expert_out2 = all_expert_out.Slice(last_index, end);
-          // linear2  M = cur_expert_count, N = dim_embed, K = dim_feedforward
+            // linear2 matmul & add
+            Tensor expert_out2 = all_expert_out.Slice(last_index, end);
+            // linear2  M = cur_expert_count, N = dim_embed, K = dim_feedforward
 #ifdef DEBUG_PRINT_LINEAR_SHAPE
-          VLOG(0) << "expert id=" << idx
-                  << ", liner2 input=" << expert_out1.dims()
-                  << ", weight=" << expert_weights2[expert_idx]->dims()
-                  << ", bias=" << expert_biases2[expert_idx]->dims()
-                  << ", scale=" << expert_scales2[expert_idx]->dims()
-                  << ", expert_out2=" << expert_out2.dims();
+            VLOG(0) << "expert id=" << idx
+                    << ", liner2 input=" << expert_out1.dims()
+                    << ", weight=" << expert_weights2[expert_idx]->dims()
+                    << ", bias=" << expert_biases2[expert_idx]->dims()
+                    << ", scale=" << expert_scales2[expert_idx]->dims()
+                    << ", expert_out2=" << expert_out2.dims();
+            dev_ctx.Wait();
 #endif
-          weight_only_gemm.Linear(expert_out1,
-                                  *expert_weights2[expert_idx],
-                                  expert_biases2[expert_idx],
-                                  *expert_scales2[expert_idx],
-                                  cur_expert_count,
-                                  dim_embed,
-                                  dim_feedforward,
-                                  default_act,  // none
-                                  &expert_out2);
-          last_index = end;
+            weight_only_gemm.Linear(expert_out1,
+                                    *expert_weights2[expert_idx],
+                                    expert_biases2[expert_idx],
+                                    *expert_scales2[expert_idx],
+                                    cur_expert_count,
+                                    dim_embed,
+                                    dim_feedforward,
+                                    default_act,  // none
+                                    &expert_out2);
+#ifdef DEBUG_PRINT_LINEAR_SHAPE
+            VLOG(0) << "layer id=" << i << ", expert_idx=" << expert_idx << " end";
+            dev_ctx.Wait();
+#endif
+            last_index = end;
+          }
         }
         // at last, concat all expert out
       } else {
@@ -689,6 +769,8 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
 #endif
       // step7. MOEGather
       if (world_size > 1) {
+        VLOG(0) << "layer id=" << i << ", begin gather data all_expert_out=" << all_expert_out.dims() 
+          << ", global_gather_out=" << global_gather_out.dims() << ", pos=" << pos.dims();
         moe_pg.Gather<T>(&all_expert_out, &global_gather_out);
       } else {
         global_gather_out = all_expert_out;
@@ -697,6 +779,10 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       dev_ctx.Wait();
       gather_tm.Pause();
 #endif
+      VLOG(0) << "layer id=" << i 
+        << ", begin  global_gather_out=" << global_gather_out.dims() 
+        << ", pos=" << pos.dims()
+        << ", moe_gather_out=" << moe_gather_out.dims();
       // step 7.2, local_gather or scatter
       phi::funcs::GPUScatterAssign<T, int64_t>(
           dev_ctx, global_gather_out, pos, &moe_gather_out, true);

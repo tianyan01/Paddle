@@ -22,107 +22,11 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #pragma GCC diagnostic ignored "-Wunused-function"
-
-#include "cutlass/array.h"
-#include "cutlass/epilogue/thread/linear_combination.h"
-#include "cutlass/epilogue/thread/linear_combination_relu.h"
-#include "cutlass/gemm/device/gemm_grouped.h"
-#include "cutlass/gemm/gemm.h"
-#include "cutlass/gemm/kernel/default_gemm_grouped.h"
-#include "cutlass/numeric_conversion.h"
-#include "paddle/phi/backends/gpu/gpu_info.h"
-#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/gemm/kernel/default_moe_fc_traits.h"
-#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/epilogue/thread/linear_combination_ft_gelu.h"
-#include "paddle/phi/kernels/fusion/cutlass/moe/moe_cutlass_kernel.h"
+#include "paddle/phi/common/datatype_traits.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/moe_gemm/moe_gemm_kernels_template.h"
 #pragma GCC diagnostic pop
 
 namespace phi {
-
-namespace {
-
-inline int getSMVersion() {
-  const int device = phi::backends::gpu::GetCurrentDeviceId();
-  const phi::gpuDeviceProp prop =
-      phi::backends::gpu::GetDeviceProperties(device);
-  return prop.major * 10 + prop.minor;
-}
-
-struct EpilogueOpBiasReLU {};
-
-struct EpilogueOpBiasFtGelu {};
-
-struct EpilogueOpBias {};
-
-struct EpilogueOpNoBias {};
-
-template <typename ElementType,
-          int ElementsPerVectorAccess,
-          typename ElementAccumulator,
-          typename Op>
-struct Epilogue {};
-
-template <typename ElementType,
-          int ElementsPerVectorAccess,
-          typename ElementAccumulator>
-struct Epilogue<ElementType,
-                ElementsPerVectorAccess,
-                ElementAccumulator,
-                EpilogueOpBiasReLU> {
-  using Op = cutlass::epilogue::thread::LinearCombinationRelu<
-      ElementType,
-      ElementsPerVectorAccess,
-      ElementAccumulator,
-      ElementAccumulator,
-      cutlass::epilogue::thread::ScaleType::NoBetaScaling>;
-};
-
-template <typename ElementType,
-          int ElementsPerVectorAccess,
-          typename ElementAccumulator>
-struct Epilogue<ElementType,
-                ElementsPerVectorAccess,
-                ElementAccumulator,
-                EpilogueOpBiasFtGelu> {
-  using Op = cutlass::epilogue::thread::LinearCombinationFtGelu<
-      ElementType,
-      ElementsPerVectorAccess,
-      ElementAccumulator,
-      ElementAccumulator,
-      cutlass::epilogue::thread::ScaleType::NoBetaScaling>;
-};
-
-template <typename ElementType,
-          int ElementsPerVectorAccess,
-          typename ElementAccumulator>
-struct Epilogue<ElementType,
-                ElementsPerVectorAccess,
-                ElementAccumulator,
-                EpilogueOpBias> {
-  using Op = cutlass::epilogue::thread::LinearCombination<
-      ElementType,
-      ElementsPerVectorAccess,
-      ElementAccumulator,
-      ElementAccumulator,
-      cutlass::epilogue::thread::ScaleType::NoBetaScaling>;
-};
-
-template <typename ElementType,
-          int ElementsPerVectorAccess,
-          typename ElementAccumulator>
-struct Epilogue<ElementType,
-                ElementsPerVectorAccess,
-                ElementAccumulator,
-                EpilogueOpNoBias> {
-  using Op = cutlass::epilogue::thread::LinearCombination<
-      ElementType,
-      ElementsPerVectorAccess,
-      ElementAccumulator,
-      ElementAccumulator,
-      cutlass::epilogue::thread::ScaleType::Nothing>;
-};
-
-}  // namespace
-
 namespace fusion {
 
 template <typename T>
@@ -323,294 +227,6 @@ void InitMoeRoutingKernelLauncher(
   }
 }
 
-template <typename T, typename WeightType, typename arch, typename EpilogueType>
-void GenericMoeGemmKernelLauncher(const T* A,
-                                  const T* B,
-                                  const T* weight_scales,
-                                  const T* biases,
-                                  T* C,
-                                  int64_t* total_rows_before_expert,
-                                  int64_t gemm_n,
-                                  int64_t gemm_k,
-                                  int num_experts,
-                                  const int multi_processor_count,
-                                  cudaStream_t stream) {
-  static_assert(cutlass::platform::is_same<T, half>::value ||
-                    cutlass::platform::is_same<T, float>::value,
-                "Specialized for half, float");
-  static_assert(
-      cutlass::platform::is_same<T, WeightType>::value ||
-          cutlass::platform::is_same<WeightType, uint8_t>::value ||
-          cutlass::platform::is_same<WeightType, cutlass::uint4b_t>::value,
-      "cutlass weight type only support float, half, uint8_t, uint4b_t");
-  // The cutlass type for the input elements. This is needed to convert to
-  // cutlass::half_t if necessary.
-  using ElementType_ = typename cutlass::platform::conditional<
-      cutlass::platform::is_same<T, half>::value,
-      cutlass::half_t,
-      T>::type;
-  using ElementType = ElementType_;
-  using CutlassWeightType_ = typename cutlass::platform::conditional<
-      cutlass::platform::is_same<WeightType, half>::value,
-      cutlass::half_t,
-      WeightType>::type;
-  using CutlassWeightType = CutlassWeightType_;
-
-  // We need separate config for each architecture since we will target
-  // different tensorcore instructions. For float, we do not target TCs.
-  using MoeArchTraits = cutlass::gemm::kernel::
-      MoeArchTraits<ElementType, CutlassWeightType, arch>;
-  using ElementAccumulator = typename MoeArchTraits::AccType;
-  using EpilogueOp = typename Epilogue<ElementType,
-                                       MoeArchTraits::ElementsPerAccessC,
-                                       ElementAccumulator,
-                                       EpilogueType>::Op;
-
-  // Finally, set up the kernel.
-  using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-      ElementType,
-      cutlass::layout::RowMajor,
-      cutlass::ComplexTransform::kNone,
-      MoeArchTraits::ElementsPerAccessA,
-      CutlassWeightType,
-      typename MoeArchTraits::LayoutB,
-      cutlass::ComplexTransform::kNone,
-      MoeArchTraits::ElementsPerAccessB,
-      ElementType,
-      cutlass::layout::RowMajor,
-      ElementAccumulator,
-      typename MoeArchTraits::OperatorClass,
-      arch,
-      typename MoeArchTraits::ThreadBlockShape,
-      typename MoeArchTraits::WarpShape,
-      typename MoeArchTraits::InstructionShape,
-      EpilogueOp,
-      cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
-      MoeArchTraits::Stages,
-      cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly,
-      typename MoeArchTraits::Operator>::GemmKernel;
-
-  using GemmKernel =
-      cutlass::gemm::kernel::MoeFCGemm<typename GemmKernel_::Mma,
-                                       typename GemmKernel_::Epilogue,
-                                       typename GemmKernel_::ThreadblockSwizzle,
-                                       GemmKernel_::kGroupScheduleMode>;
-  using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
-
-  int occupancy = GemmGrouped::maximum_active_blocks();
-  const int threadblock_count = multi_processor_count * occupancy;
-  if (occupancy == 0) {
-    PADDLE_THROW(phi::errors::Fatal(
-        "[MoE Runner] GPU lacks the shared memory resources to run GroupedGEMM "
-        "kernel"));
-  }
-
-  typename EpilogueOp::Params epilogue_op(ElementAccumulator(1.f),
-                                          ElementAccumulator(1.f));
-  typename GemmGrouped::Arguments args(
-      num_experts,
-      threadblock_count,
-      epilogue_op,
-      reinterpret_cast<const ElementType*>(A),
-      reinterpret_cast<const CutlassWeightType*>(B),
-      reinterpret_cast<const ElementType*>(weight_scales),
-      reinterpret_cast<const ElementType*>(biases),
-      reinterpret_cast<ElementType*>(C),
-      total_rows_before_expert,
-      gemm_n,
-      gemm_k);
-  GemmGrouped gemm;
-  auto can_implement = gemm.can_implement(args);
-  if (can_implement != cutlass::Status::kSuccess) {
-    std::string err_msg = "MoEFC kernel will fail for params. Error: " +
-                          std::string(cutlassGetStatusString(can_implement));
-    PADDLE_THROW(phi::errors::Fatal("[MoE Runner] " + err_msg));
-  }
-  auto init_status = gemm.initialize(args);
-  if (init_status != cutlass::Status::kSuccess) {
-    std::string err_msg =
-        "Failed to initialize cutlass variable batched gemm. Error: " +
-        std::string(cutlassGetStatusString(init_status));
-    PADDLE_THROW(phi::errors::Fatal("[MoE Runner] " + err_msg));
-  }
-  auto run_status = gemm.run(stream);
-  if (run_status != cutlass::Status::kSuccess) {
-    std::string err_msg =
-        "Failed to run cutlass variable batched gemm. Error: " +
-        std::string(cutlassGetStatusString(run_status));
-    PADDLE_THROW(phi::errors::Fatal("[MoE Runner] " + err_msg));
-  }
-}
-
-template <typename T>
-void gemm_bias_act(const T* A,
-                   const T* B,
-                   const T* weight_scales,
-                   const T* biases,
-                   T* C,
-                   int64_t* total_rows_before_expert,
-                   int64_t gemm_n,
-                   int64_t gemm_k,
-                   int num_experts,
-                   int sm,
-                   int multi_processor_count,
-                   const std::string& act_type,
-                   cudaStream_t stream) {
-  if (act_type == "gelu") {
-    if (sm == 75) {
-      GenericMoeGemmKernelLauncher<T,
-                                   T,
-                                   cutlass::arch::Sm75,
-                                   EpilogueOpBiasFtGelu>(
-          A,
-          B,
-          weight_scales,
-          biases,
-          C,
-          total_rows_before_expert,
-          gemm_n,
-          gemm_k,
-          num_experts,
-          multi_processor_count,
-          stream);
-    } else if (sm == 80 || sm == 86) {
-      GenericMoeGemmKernelLauncher<T,
-                                   T,
-                                   cutlass::arch::Sm80,
-                                   EpilogueOpBiasFtGelu>(
-          A,
-          B,
-          weight_scales,
-          biases,
-          C,
-          total_rows_before_expert,
-          gemm_n,
-          gemm_k,
-          num_experts,
-          multi_processor_count,
-          stream);
-    } else {
-      GenericMoeGemmKernelLauncher<T,
-                                   T,
-                                   cutlass::arch::Sm70,
-                                   EpilogueOpBiasFtGelu>(
-          A,
-          B,
-          weight_scales,
-          biases,
-          C,
-          total_rows_before_expert,
-          gemm_n,
-          gemm_k,
-          num_experts,
-          multi_processor_count,
-          stream);
-    }
-  } else {
-    // act type is relu.
-    if (sm == 75) {
-      GenericMoeGemmKernelLauncher<T,
-                                   T,
-                                   cutlass::arch::Sm75,
-                                   EpilogueOpBiasReLU>(A,
-                                                       B,
-                                                       weight_scales,
-                                                       biases,
-                                                       C,
-                                                       total_rows_before_expert,
-                                                       gemm_n,
-                                                       gemm_k,
-                                                       num_experts,
-                                                       multi_processor_count,
-                                                       stream);
-    } else if (sm == 80 || sm == 86) {
-      GenericMoeGemmKernelLauncher<T,
-                                   T,
-                                   cutlass::arch::Sm80,
-                                   EpilogueOpBiasReLU>(A,
-                                                       B,
-                                                       weight_scales,
-                                                       biases,
-                                                       C,
-                                                       total_rows_before_expert,
-                                                       gemm_n,
-                                                       gemm_k,
-                                                       num_experts,
-                                                       multi_processor_count,
-                                                       stream);
-    } else {
-      GenericMoeGemmKernelLauncher<T,
-                                   T,
-                                   cutlass::arch::Sm70,
-                                   EpilogueOpBiasReLU>(A,
-                                                       B,
-                                                       weight_scales,
-                                                       biases,
-                                                       C,
-                                                       total_rows_before_expert,
-                                                       gemm_n,
-                                                       gemm_k,
-                                                       num_experts,
-                                                       multi_processor_count,
-                                                       stream);
-    }
-  }
-}
-
-template <typename T>
-void gemm(const T* A,
-          const T* B,
-          const T* weight_scales,
-          T* C,
-          int64_t* total_rows_before_expert,
-          const int gemm_n,
-          const int gemm_k,
-          const int num_experts,
-          int sm,
-          int multi_processor_count,
-          cudaStream_t stream) {
-  if (sm == 75) {
-    GenericMoeGemmKernelLauncher<T, T, cutlass::arch::Sm75, EpilogueOpNoBias>(
-        A,
-        B,
-        weight_scales,
-        nullptr,
-        C,
-        total_rows_before_expert,
-        gemm_n,
-        gemm_k,
-        num_experts,
-        multi_processor_count,
-        stream);
-  } else if (sm == 80 || sm == 86) {
-    GenericMoeGemmKernelLauncher<T, T, cutlass::arch::Sm80, EpilogueOpNoBias>(
-        A,
-        B,
-        weight_scales,
-        nullptr,
-        C,
-        total_rows_before_expert,
-        gemm_n,
-        gemm_k,
-        num_experts,
-        multi_processor_count,
-        stream);
-  } else {
-    GenericMoeGemmKernelLauncher<T, T, cutlass::arch::Sm70, EpilogueOpNoBias>(
-        A,
-        B,
-        weight_scales,
-        nullptr,
-        C,
-        total_rows_before_expert,
-        gemm_n,
-        gemm_k,
-        num_experts,
-        multi_processor_count,
-        stream);
-  }
-}
-
 template <typename T>
 void finalize_moe_routing_kernelLauncher(
     const T* expanded_permuted_rows,
@@ -736,10 +352,6 @@ void MoeKernel(const Context& ctx,
   funcs::SetConstant<Context, int> set_len;
   set_len(ctx, &input_lengths_tensor, static_cast<int>(max_seq_len));
 
-  int sm = getSMVersion();
-  int multi_processor_count = phi::backends::gpu::GetGPUMultiProcessors(
-      phi::backends::gpu::GetCurrentDeviceId());
-
   InitExpertChoiceRouteKernelLauncher<T>(
       expert_for_source_row,
       source_rows,
@@ -815,57 +427,35 @@ void MoeKernel(const Context& ctx,
 
   const T* fc1_scales = nullptr;
   const T* fc2_scales = nullptr;
-  if (IS_FP16) {
-    gemm_bias_act(reinterpret_cast<const __half*>(permuted_data),
-                  reinterpret_cast<const __half*>(fc1_expert_weights),
-                  reinterpret_cast<const __half*>(fc1_scales),
-                  reinterpret_cast<const __half*>(fc1_expert_biases),
-                  reinterpret_cast<__half*>(fc1_result),
-                  total_rows_before_expert,
-                  inter_size,
-                  hidden_size,
-                  num_experts,
-                  sm,
-                  multi_processor_count,
-                  act_type,
-                  ctx.stream());
-    gemm(reinterpret_cast<const __half*>(fc1_result),
-         reinterpret_cast<const __half*>(fc2_expert_weights),
-         reinterpret_cast<const __half*>(fc2_scales),
-         reinterpret_cast<__half*>(fc2_result),
-         total_rows_before_expert,
-         hidden_size,
-         inter_size,
-         num_experts,
-         sm,
-         multi_processor_count,
-         ctx.stream());
-  } else {
-    gemm_bias_act<float>(reinterpret_cast<const float*>(permuted_data),
-                         reinterpret_cast<const float*>(fc1_expert_weights),
-                         reinterpret_cast<const float*>(fc1_scales),
-                         reinterpret_cast<const float*>(fc1_expert_biases),
-                         reinterpret_cast<float*>(fc1_result),
-                         total_rows_before_expert,
-                         inter_size,
-                         hidden_size,
-                         num_experts,
-                         sm,
-                         multi_processor_count,
-                         act_type,
-                         ctx.stream());
-    gemm<float>(reinterpret_cast<const float*>(fc1_result),
-                reinterpret_cast<const float*>(fc2_expert_weights),
-                reinterpret_cast<const float*>(fc2_scales),
-                reinterpret_cast<float*>(fc2_result),
-                total_rows_before_expert,
-                hidden_size,
-                inter_size,
-                num_experts,
-                sm,
-                multi_processor_count,
-                ctx.stream());
-  }
+
+  auto activation_type = phi::getActivationType(act_type);
+
+  using InputType = typename phi::PDDataTypeTraits<T>::DataType;
+
+  MoeGemmRunner<InputType, InputType> gemm_runner;
+  gemm_runner.moe_gemm_bias_act(
+      reinterpret_cast<const InputType*>(permuted_data),
+      reinterpret_cast<const InputType*>(fc1_expert_weights),
+      reinterpret_cast<const InputType*>(fc1_scales),
+      reinterpret_cast<const InputType*>(fc1_expert_biases),
+      reinterpret_cast<InputType*>(fc1_result),
+      total_rows_before_expert,
+      num_rows,
+      inter_size,
+      hidden_size,
+      num_experts,
+      activation_type,
+      ctx.stream());
+  gemm_runner.moe_gemm(reinterpret_cast<const InputType*>(fc1_result),
+                       reinterpret_cast<const InputType*>(fc2_expert_weights),
+                       reinterpret_cast<const InputType*>(fc2_scales),
+                       reinterpret_cast<InputType*>(fc2_result),
+                       total_rows_before_expert,
+                       num_rows,
+                       hidden_size,
+                       inter_size,
+                       num_experts,
+                       ctx.stream());
 
   finalize_moe_routing_kernelLauncher(fc2_result,
                                       output_,
@@ -886,4 +476,4 @@ void MoeKernel(const Context& ctx,
 }  // namespace phi
 
 PD_REGISTER_KERNEL(
-    moe, GPU, ALL_LAYOUT, phi::fusion::MoeKernel, float, phi::dtype::float16) {}
+    moe, GPU, ALL_LAYOUT, phi::fusion::MoeKernel, phi::dtype::float16) {}

@@ -178,10 +178,12 @@ inline T* DenseTensor::mutable_data(const Place& place, size_t requested_size) {
                    requested_size));
 }
 
-void DenseTensor::ShareBufferWith(const DenseTensor& tensor) {
+void DenseTensor::ShareBufferWith(const DenseTensor& tensor, bool with_dtype) {
   holder_ = tensor.holder_;
   meta_.offset = tensor.meta().offset;
-  meta_.dtype = tensor.dtype();
+  if (with_dtype) {
+    meta_.dtype = tensor.dtype();
+  }
 }
 
 #define LEGACY_DATA_MEMBER_FUNC_INSTANTIATION(dtype)                \

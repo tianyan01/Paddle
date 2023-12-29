@@ -64,8 +64,7 @@ void clear() {
   meta_.offset = 0;
 }
 
-void ShareBufferWith(const DenseTensor& tensor);
-
+void ShareBufferWith(const DenseTensor& tensor, bool with_dtype = true);
 void ShareDataTypeWith(const DenseTensor& tensor) {
   meta_.dtype = tensor.meta().dtype;
 }
