@@ -64,7 +64,7 @@ struct File {
 
 struct Node {
     uint32_t id = 0;
-    uint16_t label = 0;
+    uint32_t label = 0;
     std::vector<uint32_t> child;
     uint8_t aleaf = 0;
 };
@@ -74,7 +74,7 @@ public:
     virtual ~Trie() {}
     int load(const std::string& dir, const uint32_t thr_num=20u);
 
-    uint16_t label(uint32_t id) {
+    uint32_t label(uint32_t id) {
         return label_.at(id);
     }
 
@@ -157,7 +157,7 @@ protected:
     void load_file(uint32_t thr_id, File& file);
     void stat_file(uint32_t thr_id, File& file);
 
-    std::vector<uint16_t> label_;
+    std::vector<uint32_t> label_;
     std::vector<uint8_t>  aleaf_;
     std::vector<uint32_t> child_mem_;
     std::vector<uint32_t> mem_off_;

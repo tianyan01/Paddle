@@ -69,7 +69,7 @@ enum class Phase {
 };
 
 public:
-    TrieManager(uint16_t endid) : endid_(endid),
+    TrieManager(uint32_t endid) : endid_(endid),
             place_(platform::GetCurrentDeviceId()) {
         thread_ = std::thread(&TrieManager::run, this);
     }
@@ -94,7 +94,7 @@ public:
         return _s_instance;
     }
 
-    static std::shared_ptr<TrieManager> SetInstance(uint16_t endid) {
+    static std::shared_ptr<TrieManager> SetInstance(uint32_t endid) {
         static std::mutex mutex;
         std::lock_guard<std::mutex> lock(mutex);
         if (nullptr == _s_instance) {
@@ -111,6 +111,7 @@ public:
         return trie_.load(dir, thr_num);
     }
     void reset();
+    void reset(const std::vector<int>& labels);
     void search_start(const Tensor* d_parent, const Tensor* d_select);
     void search_wait();
 
@@ -124,7 +125,7 @@ protected:
     // cpu
     Tensor parent_idx_;
     Tensor select_ids_;
-    std::vector<std::unordered_map<uint16_t, uint32_t>> label2node_;
+    std::vector<std::unordered_map<uint32_t, uint32_t>> label2node_;
 
     // cpu
     Tensor next_out_;
