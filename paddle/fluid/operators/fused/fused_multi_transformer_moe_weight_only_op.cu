@@ -540,7 +540,7 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
                                           &topk_value,
                                           &topk_idx);
 
-      phi::CheckTopkIndex<int64_t>(dev_ctx, topk_idx);
+      // phi::CheckTopkIndex<int64_t>(dev_ctx, topk_idx);
       // step4 prepare forward
       // step4.1 number count
       phi::NumberCountKernel<int64_t, phi::GPUContext>(
