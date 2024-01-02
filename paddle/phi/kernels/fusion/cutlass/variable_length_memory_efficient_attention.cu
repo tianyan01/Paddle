@@ -11,9 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
+#include "paddle/phi/core/dense_tensor.h"
+#include "paddle/phi/core/errors.h"
+#include "paddle/phi/core/kernel_registry.h"
+#ifdef PADDLE_WITH_MEMORY_EFFICIENT_ATTENTION
 #include "paddle/phi/kernels/fusion/cutlass/memory_efficient_attention/autogen_variable/cutlass_forward.h"
-
+#endif
 namespace phi {
 namespace fusion {
 
@@ -29,6 +32,7 @@ void MultiHeadAttentionVariableForwardKernel(
     const float scale,
     const bool causal,
     DenseTensor* output) {
+#ifdef PADDLE_WITH_MEMORY_EFFICIENT_ATTENTION
   ctx.template Alloc<T>(output);
   Params params{};
   // [B, N, S, H]
@@ -114,6 +118,7 @@ void MultiHeadAttentionVariableForwardKernel(
       kernel_launched,
       true,
       phi::errors::InvalidArgument("the kernel should not be launched"));
+#endif
 }
 
 }  // namespace fusion

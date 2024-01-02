@@ -43,6 +43,7 @@ void generic_moe_gemm_kernelLauncher_template<{T},
     const {T}*          biases,
     {T}*                C,
     int64_t*          total_rows_before_expert,
+    int64_t           num_rows,
     int64_t           gemm_n,
     int64_t           gemm_k,
     int               num_experts,
@@ -63,6 +64,7 @@ void generic_moe_gemm_kernelLauncher_template<{T},
         biases,
         C,
         total_rows_before_expert,
+        num_rows,
         gemm_n,
         gemm_k,
         num_experts,
@@ -85,29 +87,24 @@ WeightTypes = {
     "fp16": ["half", "uint8_t", "cutlass::uint4b_t"], 
     "bf16": ["uint8_t", "cutlass::uint4b_t"]}
 ThreadblockShapes = [
-    "cutlass::gemm::GemmShape<16, 128, 64>",
     "cutlass::gemm::GemmShape<32, 128, 64>",
     "cutlass::gemm::GemmShape<64, 128, 64>",
     "cutlass::gemm::GemmShape<128, 128, 64>",
-    "cutlass::gemm::GemmShape<128, 256, 64>",
 ]
 WarpShapes = [
-    "cutlass::gemm::GemmShape<16, 32, 64>",
     "cutlass::gemm::GemmShape<32, 32, 64>",
-    "cutlass::gemm::GemmShape<64, 64, 64>",
-    "cutlass::gemm::GemmShape<64, 64, 64>",
-    "cutlass::gemm::GemmShape<64, 64, 64>",
+    "cutlass::gemm::GemmShape<64, 32, 64>",
+    "cutlass::gemm::GemmShape<128, 32, 64>",
 ]
-
 ThreadblockShapes_sm70 = [
     "cutlass::gemm::GemmShape<32, 128, 64>",
     "cutlass::gemm::GemmShape<64, 128, 64>",
 ]
 WarpShapes_sm70 = [
     "cutlass::gemm::GemmShape<32, 32, 64>",
-    "cutlass::gemm::GemmShape<64, 64, 64>",
+    "cutlass::gemm::GemmShape<64, 32, 64>",
 ]
-StagesList = {70: [2], 80: [2, 3, 4, 5]}
+StagesList = {70: [2], 80: [2, 3, 4]}
 
 ElementTypes = {"fp16": "half", "bf16": "__nv_bfloat16"}
 Archs = {
@@ -118,7 +115,7 @@ EpilogueTags = {
     "bias": "EpilogueOpBias",
     "biasFtGelu": "EpilogueOpBiasFtGelu",
     "biasReLU": "EpilogueOpBiasReLU",
-    "noBias": "EpilogueOpNoBias",
+    "noBias": "EpilogueOpDefault",
 }
 
 

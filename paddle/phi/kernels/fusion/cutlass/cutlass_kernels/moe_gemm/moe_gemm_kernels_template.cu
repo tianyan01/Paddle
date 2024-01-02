@@ -48,6 +48,7 @@ void dispatch_moe_gemm_config(const T* A,
                           const T* biases,
                           T* C,
                           int64_t* total_rows_before_expert,
+                          int64_t num_rows,
                           int64_t gemm_n,
                           int64_t gemm_k,
                           int num_experts,
@@ -71,6 +72,7 @@ void dispatch_moe_gemm_config(const T* A,
                                   biases,
                                   C,
                                   total_rows_before_expert,
+                                  num_rows,
                                   gemm_n,
                                   gemm_k,
                                   num_experts,
@@ -93,6 +95,7 @@ void dispatch_moe_gemm_config(const T* A,
                                   biases,
                                   C,
                                   total_rows_before_expert,
+                                  num_rows,
                                   gemm_n,
                                   gemm_k,
                                   num_experts,
@@ -115,28 +118,7 @@ void dispatch_moe_gemm_config(const T* A,
                                   biases,
                                   C,
                                   total_rows_before_expert,
-                                  gemm_n,
-                                  gemm_k,
-                                  num_experts,
-                                  gemm_config,
-                                  multi_processor_count,
-                                  stream,
-                                  occupancy);
-      break;
-    case 5:
-      using DispatcherStages5 = moe_dispatch_stages<T,
-                                                WeightType,
-                                                arch,
-                                                EpilogueTag,
-                                                ThreadblockShape,
-                                                WarpShape,
-                                                5>;
-      DispatcherStages4::dispatch(A,
-                                  B,
-                                  weight_scales,
-                                  biases,
-                                  C,
-                                  total_rows_before_expert,
+                                  num_rows,
                                   gemm_n,
                                   gemm_k,
                                   num_experts,
@@ -162,7 +144,7 @@ void dispatch_moe_gemm_to_cutlass(const T* A,
                                   const T* biases,
                                   T* C,
                                   int64_t* total_rows_before_expert,
-                                  int64_t total_rows,
+                                  int64_t num_rows,
                                   int64_t gemm_n,
                                   int64_t gemm_k,
                                   int num_experts,
@@ -174,29 +156,6 @@ void dispatch_moe_gemm_to_cutlass(const T* A,
   FT_LOG_DEBUG(__PRETTY_FUNCTION__);
 
   switch (gemm_config.tile_config) {
-#if defined(USE_FPAINTB_GEMM_WITH_SM80) || defined(USE_FPAINTB_GEMM_WITH_SM86)
-    case CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64:
-      dispatch_moe_gemm_config<T,
-                           WeightType,
-                           arch,
-                           EpilogueTag,
-                           cutlass::gemm::GemmShape<16, 128, 64>,
-                           cutlass::gemm::GemmShape<16, 32, 64>>(
-          A,
-          B,
-          weight_scales,
-          biases,
-          C,
-          total_rows_before_expert,
-          gemm_n,
-          gemm_k,
-          num_experts,
-          gemm_config,
-          multi_processor_count,
-          stream,
-          occupancy);
-      break;
-#endif
     case CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
       dispatch_moe_gemm_config<T,
                            WeightType,
@@ -210,6 +169,7 @@ void dispatch_moe_gemm_to_cutlass(const T* A,
           biases,
           C,
           total_rows_before_expert,
+          num_rows,
           gemm_n,
           gemm_k,
           num_experts,
@@ -218,19 +178,20 @@ void dispatch_moe_gemm_to_cutlass(const T* A,
           stream,
           occupancy);
       break;
-    case CutlassTileConfig::CtaShape64x128x64_WarpShape64x64x64:
+    case CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64:
       dispatch_moe_gemm_config<T,
                            WeightType,
                            arch,
                            EpilogueTag,
                            cutlass::gemm::GemmShape<64, 128, 64>,
-                           cutlass::gemm::GemmShape<64, 64, 64>>(
+                           cutlass::gemm::GemmShape<64, 32, 64>>(
           A,
           B,
           weight_scales,
           biases,
           C,
           total_rows_before_expert,
+          num_rows,
           gemm_n,
           gemm_k,
           num_experts,
@@ -239,20 +200,20 @@ void dispatch_moe_gemm_to_cutlass(const T* A,
           stream,
           occupancy);
       break;
-#if defined(USE_FPAINTB_GEMM_WITH_SM80) || defined(USE_FPAINTB_GEMM_WITH_SM86)
-    case CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64:
+    case CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64:
       dispatch_moe_gemm_config<T,
                            WeightType,
                            arch,
                            EpilogueTag,
                            cutlass::gemm::GemmShape<128, 128, 64>,
-                           cutlass::gemm::GemmShape<64, 64, 64>>(
+                           cutlass::gemm::GemmShape<128, 32, 64>>(
           A,
           B,
           weight_scales,
           biases,
           C,
           total_rows_before_expert,
+          num_rows,
           gemm_n,
           gemm_k,
           num_experts,
@@ -261,28 +222,6 @@ void dispatch_moe_gemm_to_cutlass(const T* A,
           stream,
           occupancy);
       break;
-    case CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64:
-      dispatch_moe_gemm_config<T,
-                           WeightType,
-                           arch,
-                           EpilogueTag,
-                           cutlass::gemm::GemmShape<128, 256, 64>,
-                           cutlass::gemm::GemmShape<64, 64, 64>>(
-          A,
-          B,
-          weight_scales,
-          biases,
-          C,
-          total_rows_before_expert,
-          gemm_n,
-          gemm_k,
-          num_experts,
-          gemm_config,
-          multi_processor_count,
-          stream,
-          occupancy);
-      break;
-#endif
     case CutlassTileConfig::Undefined:
       throw std::runtime_error(
           "[FT Error][dispatch_moe_gemm_to_cutlass][SIMT] gemm config "
@@ -308,7 +247,7 @@ void dispatch_moe_gemm_to_cutlass_sm7x(const T* A,
                                        const T* biases,
                                        T* C,
                                        int64_t* total_rows_before_expert,
-                                       int64_t total_rows,
+                                       int64_t num_rows,
                                        int64_t gemm_n,
                                        int64_t gemm_k,
                                        int num_experts,
@@ -335,6 +274,7 @@ void dispatch_moe_gemm_to_cutlass_sm7x(const T* A,
           biases,
           C,
           total_rows_before_expert,
+          num_rows,
           gemm_n,
           gemm_k,
           num_experts,
@@ -343,19 +283,20 @@ void dispatch_moe_gemm_to_cutlass_sm7x(const T* A,
           stream,
           occupancy);
       break;
-    case CutlassTileConfig::CtaShape64x128x64_WarpShape64x64x64:
+    case CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64:
       dispatch_moe_gemm_config<T,
                            WeightType,
                            arch,
                            EpilogueTag,
                            cutlass::gemm::GemmShape<64, 128, 64>,
-                           cutlass::gemm::GemmShape<64, 64, 64>>(
+                           cutlass::gemm::GemmShape<64, 32, 64>>(
           A,
           B,
           weight_scales,
           biases,
           C,
           total_rows_before_expert,
+          num_rows,
           gemm_n,
           gemm_k,
           num_experts,
@@ -400,7 +341,7 @@ void MoeGemmRunner<T, WeightType>::dispatch_to_arch<EpilogueTag>(
     const T* biases,
     T* C,
     int64_t* total_rows_before_expert,
-    int64_t total_rows,
+    int64_t num_rows,
     int64_t gemm_n,
     int64_t gemm_k,
     int num_experts,
@@ -420,7 +361,7 @@ void MoeGemmRunner<T, WeightType>::dispatch_to_arch<EpilogueTag>(
                                                    biases,
                                                    C,
                                                    total_rows_before_expert,
-                                                   total_rows,
+                                                   num_rows,
                                                    gemm_n,
                                                    gemm_k,
                                                    num_experts,
@@ -446,7 +387,7 @@ void MoeGemmRunner<T, WeightType>::dispatch_to_arch<EpilogueTag>(
                                                    biases,
                                                    C,
                                                    total_rows_before_expert,
-                                                   total_rows,
+                                                   num_rows,
                                                    gemm_n,
                                                    gemm_k,
                                                    num_experts,
@@ -457,8 +398,8 @@ void MoeGemmRunner<T, WeightType>::dispatch_to_arch<EpilogueTag>(
                                                    occupancy);
   }
 #endif
-#if defined(USE_FPAINTB_GEMM_WITH_SM80) || defined(USE_FPAINTB_GEMM_WITH_SM86)
-  else if (sm_ >= 80 && sm_ < 90) {
+#if defined(USE_FPAINTB_GEMM_WITH_SM80) || defined(USE_FPAINTB_GEMM_WITH_SM90)
+  else if (sm_ >= 80 && sm_ <= 90) {
     dispatch_moe_gemm_to_cutlass<T,
                                  WeightType,
                                  cutlass::arch::Sm80,
@@ -468,7 +409,7 @@ void MoeGemmRunner<T, WeightType>::dispatch_to_arch<EpilogueTag>(
                                               biases,
                                               C,
                                               total_rows_before_expert,
-                                              total_rows,
+                                              num_rows,
                                               gemm_n,
                                               gemm_k,
                                               num_experts,
@@ -502,8 +443,11 @@ void MoeGemmRunner<T, WeightType>::run_gemm<EpilogueTag>(
   FT_LOG_DEBUG(__PRETTY_FUNCTION__);
   static constexpr bool is_weight_only = !std::is_same<T, WeightType>::value;
   static constexpr bool only_simt_configs = std::is_same<T, float>::value;
+
+  static constexpr int workspace_bytes = 0;  // No workspace for MoE GEMMs.
+  static constexpr int split_k_limit = 1;  // MoE GEMM does not support split-k.
   std::vector<CutlassGemmConfig> candidate_configs =
-      get_candidate_configs(sm_, is_weight_only, only_simt_configs, false);
+      get_candidate_configs(sm_, is_weight_only, only_simt_configs, false, split_k_limit);
   std::vector<int> occupancies(candidate_configs.size());
 
   for (size_t ii = 0; ii < candidate_configs.size(); ++ii) {
@@ -522,8 +466,6 @@ void MoeGemmRunner<T, WeightType>::run_gemm<EpilogueTag>(
                                   &occupancies[ii]);
   }
 
-  static constexpr int workspace_bytes = 0;  // No workspace for MoE GEMMs.
-  static constexpr int split_k_limit = 1;  // MoE GEMM does not support split-k.
   CutlassGemmConfig chosen_config =
       estimate_best_config_from_occupancies(candidate_configs,
                                             occupancies,
@@ -645,7 +587,7 @@ void MoeGemmRunner<T, WeightType>::moe_gemm(const T* A,
                                             int num_experts,
                                             cudaStream_t stream) {
   FT_LOG_DEBUG(__PRETTY_FUNCTION__);
-  run_gemm<EpilogueOpNoBias>(A,
+  run_gemm<EpilogueOpDefault>(A,
                              B,
                              weight_scales,
                              nullptr,

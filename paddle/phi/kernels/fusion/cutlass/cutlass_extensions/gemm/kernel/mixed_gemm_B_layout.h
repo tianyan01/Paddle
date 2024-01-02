@@ -62,7 +62,7 @@ struct LayoutDetailsB {};
 template <typename TypeB>
 struct LayoutDetailsB<TypeB, arch::Sm70> {
   static constexpr int ThreadblockK = 64;
-  using Layout = layout::RowMajor;
+  using Layout = layout::ColumnMajor;
   static constexpr int ElementsPerAccess = 8;
   using Operator = cutlass::arch::OpMultiplyAdd;
 };
@@ -75,7 +75,7 @@ struct LayoutDetailsB<
     Arch,
     typename platform::enable_if<Arch::kMinComputeCapability >= 75>::type> {
   static constexpr int ThreadblockK = 64;
-  using Layout = layout::RowMajor;
+  using Layout = layout::ColumnMajor;
   static constexpr int ElementsPerAccess =
       128 / cutlass::sizeof_bits<half_t>::value;
   using Operator = cutlass::arch::OpMultiplyAdd;
@@ -87,7 +87,7 @@ struct LayoutDetailsB<
     Arch,
     typename platform::enable_if<Arch::kMinComputeCapability >= 75>::type> {
   static constexpr int ThreadblockK = 64;
-  using Layout = layout::RowMajor;
+  using Layout = layout::ColumnMajor;
   static constexpr int ElementsPerAccess =
       128 / cutlass::sizeof_bits<bfloat16_t>::value;
   using Operator = cutlass::arch::OpMultiplyAdd;

@@ -44,7 +44,7 @@ limitations under the License. */
 #include "cutlass/epilogue/thread/linear_combination_generic.h"
 #include "cutlass/epilogue/thread/linear_combination_relu.h"
 #include "cutlass/epilogue/thread/linear_combination_silu.h"
-#include "epilogue/thread/ft_fused_activations.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/epilogue/thread/fused_activations.h"
 
 namespace phi {
 struct EpilogueOpBiasSilu {};
@@ -53,15 +53,24 @@ struct EpilogueOpBiasReLU {};
 
 struct EpilogueOpBiasFtGelu {};
 
+struct EpilogueOpDefaultSilu {};
+
+struct EpilogueOpDefaultReLU {};
+
+struct EpilogueOpDefaultFtGelu {};
+
 struct EpilogueOpBias {};
 
-struct EpilogueOpNoBias {};
+struct EpilogueOpDefault {};
 
 template <typename ElementType,
           int ElementsPerVectorAccess,
           typename ElementAccumulator,
           typename Op>
 struct Epilogue {};
+
+constexpr auto BiasScaleMode =
+    cutlass::epilogue::thread::ScaleType::NoBetaScaling;
 
 template <typename ElementType,
           int ElementsPerVectorAccess,
@@ -70,12 +79,12 @@ struct Epilogue<ElementType,
                 ElementsPerVectorAccess,
                 ElementAccumulator,
                 EpilogueOpBiasSilu> {
-  using Op = cutlass::epilogue::thread::LinearCombinationSilu<
-      ElementType,
-      ElementsPerVectorAccess,
-      ElementAccumulator,
-      ElementAccumulator,
-      cutlass::epilogue::thread::ScaleType::NoBetaScaling>;
+  using Op =
+      cutlass::epilogue::thread::LinearCombinationSilu<ElementType,
+                                                       ElementsPerVectorAccess,
+                                                       ElementAccumulator,
+                                                       ElementAccumulator,
+                                                       BiasScaleMode>;
 };
 
 template <typename ElementType,
@@ -85,12 +94,12 @@ struct Epilogue<ElementType,
                 ElementsPerVectorAccess,
                 ElementAccumulator,
                 EpilogueOpBiasReLU> {
-  using Op = cutlass::epilogue::thread::LinearCombinationRelu<
-      ElementType,
-      ElementsPerVectorAccess,
-      ElementAccumulator,
-      ElementAccumulator,
-      cutlass::epilogue::thread::ScaleType::NoBetaScaling>;
+  using Op =
+      cutlass::epilogue::thread::LinearCombinationRelu<ElementType,
+                                                       ElementsPerVectorAccess,
+                                                       ElementAccumulator,
+                                                       ElementAccumulator,
+                                                       BiasScaleMode>;
 };
 
 template <typename ElementType,
@@ -106,7 +115,7 @@ struct Epilogue<ElementType,
       ElementsPerVectorAccess,
       ElementAccumulator,
       ElementAccumulator,
-      cutlass::epilogue::thread::ScaleType::NoBetaScaling,
+      BiasScaleMode,
       cutlass::FloatRoundStyle::round_to_nearest,
       true>;
 };
@@ -118,12 +127,29 @@ struct Epilogue<ElementType,
                 ElementsPerVectorAccess,
                 ElementAccumulator,
                 EpilogueOpBias> {
-  using Op = cutlass::epilogue::thread::LinearCombination<
-      ElementType,
-      ElementsPerVectorAccess,
-      ElementAccumulator,
-      ElementAccumulator,
-      cutlass::epilogue::thread::ScaleType::NoBetaScaling>;
+  using Op =
+      cutlass::epilogue::thread::LinearCombination<ElementType,
+                                                   ElementsPerVectorAccess,
+                                                   ElementAccumulator,
+                                                   ElementAccumulator,
+                                                   BiasScaleMode>;
+};
+
+constexpr auto DefaultScaleMode = cutlass::epilogue::thread::ScaleType::Default;
+
+template <typename ElementType,
+          int ElementsPerVectorAccess,
+          typename ElementAccumulator>
+struct Epilogue<ElementType,
+                ElementsPerVectorAccess,
+                ElementAccumulator,
+                EpilogueOpDefaultSilu> {
+  using Op =
+      cutlass::epilogue::thread::LinearCombinationSilu<ElementType,
+                                                       ElementsPerVectorAccess,
+                                                       ElementAccumulator,
+                                                       ElementAccumulator,
+                                                       DefaultScaleMode>;
 };
 
 template <typename ElementType,
@@ -132,12 +158,45 @@ template <typename ElementType,
 struct Epilogue<ElementType,
                 ElementsPerVectorAccess,
                 ElementAccumulator,
-                EpilogueOpNoBias> {
-  using Op = cutlass::epilogue::thread::LinearCombination<
+                EpilogueOpDefaultReLU> {
+  using Op =
+      cutlass::epilogue::thread::LinearCombinationRelu<ElementType,
+                                                       ElementsPerVectorAccess,
+                                                       ElementAccumulator,
+                                                       ElementAccumulator,
+                                                       DefaultScaleMode>;
+};
+
+template <typename ElementType,
+          int ElementsPerVectorAccess,
+          typename ElementAccumulator>
+struct Epilogue<ElementType,
+                ElementsPerVectorAccess,
+                ElementAccumulator,
+                EpilogueOpDefaultFtGelu> {
+  using Op = cutlass::epilogue::thread::LinearCombinationGeneric<
+      cutlass::epilogue::thread::GELU_taylor,
       ElementType,
       ElementsPerVectorAccess,
       ElementAccumulator,
       ElementAccumulator,
-      cutlass::epilogue::thread::ScaleType::Default>;
+      DefaultScaleMode,
+      cutlass::FloatRoundStyle::round_to_nearest,
+      true>;
+};
+
+template <typename ElementType,
+          int ElementsPerVectorAccess,
+          typename ElementAccumulator>
+struct Epilogue<ElementType,
+                ElementsPerVectorAccess,
+                ElementAccumulator,
+                EpilogueOpDefault> {
+  using Op =
+      cutlass::epilogue::thread::LinearCombination<ElementType,
+                                                   ElementsPerVectorAccess,
+                                                   ElementAccumulator,
+                                                   ElementAccumulator,
+                                                   DefaultScaleMode>;
 };
 }  // namespace phi

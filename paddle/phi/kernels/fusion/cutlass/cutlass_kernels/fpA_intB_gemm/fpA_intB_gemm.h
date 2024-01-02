@@ -30,7 +30,7 @@ limitations under the License. */
 
 #pragma once
 #include <unordered_map>
-#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/ft_gemm_configs.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/gemm_configs.h"
 // #include "src/fastertransformer/utils/allocator.h"
 #include "cuda_runtime_api.h"  // NOLINT
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/activation_types.h"
@@ -116,7 +116,6 @@ class CutlassFpAIntBGemmRunner {
 
  private:
   static constexpr int split_k_limit = 7;
-
   int sm_;
   int multi_processor_count_;
   CutlassGemmConfigCache config_cache_;

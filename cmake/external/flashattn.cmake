@@ -19,14 +19,14 @@ add_definitions(-DPADDLE_WITH_FLASHATTN)
 set(FLASHATTN_PREFIX_DIR ${THIRD_PARTY_PATH}/flashattn)
 set(FLASHATTN_SOURCE_SUBDIR csrc)
 set(FLASHATTN_INSTALL_DIR ${THIRD_PARTY_PATH}/install/flashattn)
-set(SOURCE_DIR ${PADDLE_SOURCE_DIR}/third_party/flashattn)
+set(SOURCE_DIR ${THIRD_PARTY_PATH}/flashattn/src/extern_flashattn)
 #set(FLASHATTN_TAG 0598fa245bbfb8c4462002600864518c0e37e714)
 set(FLASHATTN_TAG 705e8c69fe1511aa6abd4bfea493f24e119193ee)
 set(FLASHATTN_INCLUDE_DIR
     "${FLASHATTN_INSTALL_DIR}/include"
     CACHE PATH "flash-attn Directory" FORCE)
 set(FLASHATTN_LIB_DIR
-    "${FLASHATTN_INSTALL_DIR}/lib"
+    "${FLASHATTN_INSTALL_DIR}/lib"ex
     CACHE PATH "flash-attn Library Directory" FORCE)
 
 if(WIN32)

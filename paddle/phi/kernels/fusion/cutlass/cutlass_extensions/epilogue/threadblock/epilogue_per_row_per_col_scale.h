@@ -214,6 +214,14 @@ class EpilogueVisitorPerRowPerCol {
     if (beta_ == ElementAccumulator()) {
       iterator_C_.clear_mask();
     }
+
+    if (!per_channel_quant_ && (ptr_alpha_col_ != nullptr)) {
+      element_alpha_col_ = *ptr_alpha_col_;
+    }
+
+    if (!per_token_quant_ && (ptr_alpha_row_ != nullptr)) {
+      element_alpha_row_ = *ptr_alpha_row_;
+    }
   }
 
   /// Helper to indicate split-K behavior
@@ -239,14 +247,6 @@ class EpilogueVisitorPerRowPerCol {
   void begin_epilogue() {
     if (per_channel_quant_) {
       iterator_alpha_col_.load(fragment_alpha_col_);
-    } else if (ptr_alpha_col_ != nullptr) {
-      arch::global_load<AlphaScaleElementType, sizeof(AlphaScaleElementType)>(
-          element_alpha_col_, ptr_alpha_col_, true);
-    }
-
-    if (!per_token_quant_ && ptr_alpha_row_ != nullptr) {
-      arch::global_load<AlphaScaleElementType, sizeof(AlphaScaleElementType)>(
-          element_alpha_row_, ptr_alpha_row_, true);
     }
   }
 
@@ -261,25 +261,22 @@ class EpilogueVisitorPerRowPerCol {
       iterator_C_.load(fragment_C_);
       ++iterator_C_;
     }
-
-    // load alpha_row in begin_step only when per token(row) scaling is used
-    if (per_token_quant_) {
-      int thread_offset_row =
-          iterator_D_.thread_start_row() +
-          OutputTileIterator::ThreadMap::iteration_offset(0).row();
-
-      // element_alpha_row_ = ptr_alpha_row_[thread_offset_row];
-      arch::global_load<AlphaScaleElementType, sizeof(AlphaScaleElementType)>(
-          element_alpha_row_,
-          ptr_alpha_row_ + thread_offset_row,
-          thread_offset_row < extent_.row());
-    }
   }
 
   /// Called at the start of a row
   CUTLASS_DEVICE
   void begin_row(int row_idx) {
-    // Clear accumulators for max and sum when starting a whole row
+    // load alpha_row in begin_step only when per token(row) scaling is used
+    if (per_token_quant_) {
+      int thread_offset_row =
+          iterator_D_.thread_start_row() +
+          OutputTileIterator::ThreadMap::iteration_offset(row_idx).row();
+
+      arch::global_load<AlphaScaleElementType, sizeof(AlphaScaleElementType)>(
+          element_alpha_row_,
+          ptr_alpha_row_ + thread_offset_row,
+          thread_offset_row < extent_.row());
+    }
   }
 
   /// Called after accumulators have been exchanged for each accumulator vector
@@ -297,7 +294,7 @@ class EpilogueVisitorPerRowPerCol {
     ComputeFragment result = source_converter(accum);
     if (per_channel_quant_) {
       ComputeFragment alpha_col =
-          reinterpret_cast<ComputeFragment*>(&fragment_alpha_col_)[frag_idx];
+          reinterpret_cast<ComputeFragment*>(&fragment_alpha_col_)[column_idx];
       result = per_token_channel_scale_accumulator_(
           result, alpha_col, element_alpha_row_);
     } else {
@@ -312,6 +309,10 @@ class EpilogueVisitorPerRowPerCol {
         reinterpret_cast<OutputVector*>(&fragment_D_)[frag_idx];
     output = output_converter(result);
   }
+
+  /// Called at the end of a row
+  CUTLASS_DEVICE
+  void end_row(int row_idx) {}
 
   /// Called after all accumulator elements have been visited
   CUTLASS_DEVICE
