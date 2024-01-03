@@ -273,10 +273,13 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
     dev_ctx.Alloc<int64_t>(&fwd_batch_size,
                            fwd_batch_size.numel() * sizeof(int64_t));
     // pos, temp pos
-    Tensor pos;
+    Tensor pos, ins_pos;
     pos.Resize({{out_batch_size}});
+    ins_pos.Resize({{out_batch_size}});
     dev_ctx.Alloc<int64_t>(&pos, pos.numel() * sizeof(int64_t));
-    
+    if (topk > 1) {
+      dev_ctx.Alloc<int64_t>(&ins_pos, ins_pos.numel() * sizeof(int64_t));
+    }
     // cumsum
     Tensor lec_cum;
     lec_cum.Resize({{tot_expert}});
@@ -552,7 +555,9 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       gate_nccl_tm.Resume();
 #endif
       if (world_size > 1) {
+#ifdef DEBUG_PRINT_LINEAR_SHAPE
         VLOG(0) << "layer id=" << i << ", begin all2all";
+#endif
         moe_pg.AllToAll<int64_t>(local_expert_count, global_expert_count);
       } else {
         global_expert_count = local_expert_count;
@@ -586,7 +591,9 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
           dev_ctx, &lec_cum, &topk_idx, &pos, out_batch_size);
       if (topk > 1) {
         phi::FloorDivideKernel<int64_t, phi::GPUContext>(
-            dev_ctx, pos, topk_tensor, &pos);
+            dev_ctx, pos, topk_tensor, &ins_pos);
+      } else {
+        ins_pos = pos;
       }
       framework::TensorCopy(
           fwd_expert_count, platform::CPUPlace(), &fwd_expert_count_cpu);
@@ -605,7 +612,7 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       // step 5, MOEScatter
       // step 5.1, index select
       phi::IndexSelectKernel<T, phi::GPUContext>(
-          dev_ctx, sliced_inp, pos, 0, &index_select_out);
+          dev_ctx, sliced_inp, ins_pos, 0, &index_select_out);
 #ifdef DEBUG_TMPROFILE_WEIGHT_ONLY
       dev_ctx.Wait();
       gate_tm.Pause();
@@ -614,7 +621,9 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       scatter_tm.Resume();
 #endif
       if (world_size > 1) {
+#ifdef DEBUG_PRINT_LINEAR_SHAPE
         VLOG(0) << "layer id=" << i << ", begin scatter x=" << index_select_out.dims();
+#endif
         moe_pg.Scatter<T>(&index_select_out,
                           local_expert_count,
                           global_expert_count,
@@ -769,8 +778,10 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
 #endif
       // step7. MOEGather
       if (world_size > 1) {
+#ifdef DEBUG_PRINT_LINEAR_SHAPE
         VLOG(0) << "layer id=" << i << ", begin gather data all_expert_out=" << all_expert_out.dims() 
           << ", global_gather_out=" << global_gather_out.dims() << ", pos=" << pos.dims();
+#endif
         moe_pg.Gather<T>(&all_expert_out, &global_gather_out);
       } else {
         global_gather_out = all_expert_out;
@@ -779,10 +790,12 @@ class FusedMultiTransformerMoeWeightOnlyOpKernel
       dev_ctx.Wait();
       gather_tm.Pause();
 #endif
+#ifdef DEBUG_PRINT_LINEAR_SHAPE
       VLOG(0) << "layer id=" << i 
         << ", begin  global_gather_out=" << global_gather_out.dims() 
         << ", pos=" << pos.dims()
         << ", moe_gather_out=" << moe_gather_out.dims();
+#endif
       // step 7.2, local_gather or scatter
       phi::funcs::GPUScatterAssign<T, int64_t>(
           dev_ctx, global_gather_out, pos, &moe_gather_out, true);
