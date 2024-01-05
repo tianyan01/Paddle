@@ -73,7 +73,7 @@ struct BaseMoeProblemVisitor {
     void const* workspace;
     int32_t tile_count;
 
-    //
+    //ppc
     // Methods
     //
 
@@ -155,9 +155,8 @@ struct BaseMoeProblemVisitor {
 
   CUTLASS_HOST_DEVICE
   cutlass::gemm::GemmCoord problem_size(int idx) const {
-    const int64_t prev_problem_row =
-        idx == 0 ? 0 : params.last_row_for_problem[idx - 1];
-    const int64_t current_problem_row = params.last_row_for_problem[idx];
+    const int64_t prev_problem_row = params.last_row_for_problem[idx];
+    const int64_t current_problem_row = params.last_row_for_problem[idx + 1];
     const int64_t gemm_m = current_problem_row - prev_problem_row;
     GemmCoord problem(GemmCoord::Index(gemm_m),
                       GemmCoord::Index(params.gemm_n),

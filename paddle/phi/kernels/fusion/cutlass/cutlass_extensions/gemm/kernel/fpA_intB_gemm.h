@@ -39,6 +39,7 @@ limitations under the License. */
 
 #include "cutlass/arch/arch.h"
 #include "cutlass/gemm/gemm.h"
+#include "cutlass/gemm/kernel/params_universal_base.h"
 #include "cutlass/matrix_coord.h"
 #include "cutlass/semaphore.h"
 
@@ -69,10 +70,10 @@ struct GemmFpAIntB {
   using ElementA = typename Mma::IteratorA::Element;
   using LayoutA = typename Mma::IteratorA::Layout;
   using ElementB = typename Mma::IteratorB::Element;
-  using LayoutB = typename Mma::IteratorB::Layout;
+  using LayoutB = typename Mma::IteratorB::Element;
   using ElementC = typename Epilogue::OutputTileIterator::Element;
   using LayoutC = typename Mma::LayoutC;
-  using ElementScale = typename Mma::IteratorA::Element;
+  using ElementScale = ElementC;
 
   static ComplexTransform const kTransformA = Mma::kTransformA;
   static ComplexTransform const kTransformB = Mma::kTransformA;
@@ -94,19 +95,24 @@ struct GemmFpAIntB {
   /// Warp count (concept: GemmShape)
   using WarpCount = typename Mma::WarpCount;
   static int const kThreadCount = 32 * WarpCount::kCount;
-  static int const kSplitKAlignment = const_max(
-      128 / sizeof_bits<ElementA>::value, 128 / sizeof_bits<ElementB>::value);
 
   static constexpr int kInterleave =
       Mma::IteratorB::Shape::kRow / Mma::Shape::kK;
 
   /// Parameters structure
-  struct Arguments : UniversalArgumentsBase {
+  struct Arguments {
+    GemmUniversalMode mode = GemmUniversalMode::kGemm;
+
+    cutlass::gemm::GemmCoord problem_size;
+    int group_size;
     typename Mma::IteratorA::TensorRef ref_A;
     typename Mma::IteratorB::TensorRef ref_B;
     typename Mma::IteratorScale::TensorRef ref_scale;
     typename Epilogue::OutputTileIterator::TensorRef ref_C;
     typename Epilogue::OutputTileIterator::TensorRef ref_D;
+
+    // Control serial split-k
+    int batch_count;
 
     typename EpilogueOutputOp::Params output_op;
 
@@ -114,6 +120,9 @@ struct GemmFpAIntB {
     int const* gather_A_indices;
     int const* gather_B_indices;
     int const* scatter_D_indices;
+
+    // Included so we can use Gemm Universal
+    int batch_stride_D = 0;
 
     //
     // Methods
@@ -124,6 +133,7 @@ struct GemmFpAIntB {
 
     CUTLASS_HOST_DEVICE
     Arguments(cutlass::gemm::GemmCoord const& problem_size,
+              const int group_size,
               typename Mma::IteratorA::TensorRef ref_A,
               typename Mma::IteratorB::TensorRef ref_B,
               typename Mma::IteratorScale::TensorRef ref_scale,
@@ -135,18 +145,14 @@ struct GemmFpAIntB {
               int const* gather_A_indices = nullptr,
               int const* gather_B_indices = nullptr,
               int const* scatter_D_indices = nullptr)
-        :  // TODO(wangbojun) hard code here for GemmUniversalMode::kGemm and
-           // batch_stride_D
-          UniversalArgumentsBase(
-              GemmUniversalMode::kGemm,
-              problem_size,
-              /*serial_split_k_factor=*/serial_split_k_factor,
-              /*batch_stride_D=*/0),
+        : problem_size(problem_size),
+          group_size(group_size),
           ref_A(ref_A),
           ref_B(ref_B),
           ref_scale(ref_scale),
           ref_C(ref_C),
           ref_D(ref_D),
+          batch_count(serial_split_k_factor),
           output_op(output_op),
           gather_A_indices(gather_A_indices),
           gather_B_indices(gather_B_indices),
@@ -154,28 +160,24 @@ struct GemmFpAIntB {
   };
 
   /// Parameters structure
-  struct Params : UniversalParamsBase<ThreadblockSwizzle,
-                                      ThreadblockShape,
-                                      ElementA,
-                                      ElementB,
-                                      ElementC> {
-    using ParamsBase = UniversalParamsBase<ThreadblockSwizzle,
-                                           ThreadblockShape,
-                                           ElementA,
-                                           ElementB,
-                                           ElementC>;
-
+  struct Params {
+    cutlass::gemm::GemmCoord problem_size;
+    int group_size;
+    cutlass::gemm::GemmCoord grid_tiled_shape;
+    int swizzle_log_tile;
     typename Mma::IteratorA::Params params_A;
-    typename Mma::IteratorB::Params params_B;
-    typename Mma::IteratorScale::Params params_scale;
-    typename Epilogue::OutputTileIterator::Params params_C;
-    typename Epilogue::OutputTileIterator::Params params_D;
     typename Mma::IteratorA::TensorRef ref_A;
+    typename Mma::IteratorB::Params params_B;
     typename Mma::IteratorB::TensorRef ref_B;
+    typename Mma::IteratorScale::Params params_scale;
     typename Mma::IteratorScale::TensorRef ref_scale;
+    typename Epilogue::OutputTileIterator::Params params_C;
     typename Epilogue::OutputTileIterator::TensorRef ref_C;
+    typename Epilogue::OutputTileIterator::Params params_D;
     typename Epilogue::OutputTileIterator::TensorRef ref_D;
     typename EpilogueOutputOp::Params output_op;
+    int* semaphore;
+    int gemm_k_size;
     // For gather+scatter operations
     int const* gather_A_indices;
     int const* gather_B_indices;
@@ -186,11 +188,17 @@ struct GemmFpAIntB {
     //
 
     CUTLASS_HOST_DEVICE
-    Params() = default;
+    Params() : swizzle_log_tile(0), semaphore(0), gemm_k_size(0) {}
 
     CUTLASS_HOST_DEVICE
-    Params(Arguments const& args, int device_sms, int sm_occupancy)
-        : ParamsBase(args, device_sms, sm_occupancy),
+    Params(Arguments const& args,
+           cutlass::gemm::GemmCoord const& grid_tiled_shape,
+           const int gemm_k_size,
+           void* workspace = nullptr)
+        : problem_size(args.problem_size),
+          group_size(args.group_size),
+          grid_tiled_shape(grid_tiled_shape),
+          swizzle_log_tile(ThreadblockSwizzle().get_log_tile(grid_tiled_shape)),
           params_A(args.ref_A.layout()),
           ref_A(args.ref_A),
           params_B(args.ref_B.layout()),
@@ -202,6 +210,8 @@ struct GemmFpAIntB {
           params_D(args.ref_D.layout()),
           ref_D(args.ref_D),
           output_op(args.output_op),
+          semaphore(static_cast<int*>(workspace)),
+          gemm_k_size(gemm_k_size),
           gather_A_indices(args.gather_A_indices),
           gather_B_indices(args.gather_B_indices),
           scatter_D_indices(args.scatter_D_indices) {}
@@ -272,19 +282,22 @@ struct GemmFpAIntB {
       return Status::kErrorMisalignedOperand;
     }
 
+    if (!args.ref_scale.good()) {
+      return Status::kErrorNotSupported;
+    }
+
+    if constexpr (isFinegrained(Mma::QuantOp)) {
+      if (args.group_size != 64 && args.group_size != 128) {
+        return Status::kErrorNotSupported;
+      }
+    }
+
     return Status::kSuccess;
   }
 
   static size_t get_extra_workspace_size(
       Arguments const& args, cutlass::gemm::GemmCoord const& grid_tiled_shape) {
     return 0;
-  }
-
-  CUTLASS_DEVICE
-  static void invoke(Params const& params,
-                     SharedStorage& shared_storage) {  // NOLINT
-    GemmFpAIntB op;
-    op(params, shared_storage);
   }
 
   // The dummy template parameter is not used and exists so that we can compile
@@ -294,10 +307,45 @@ struct GemmFpAIntB {
   struct KernelRunner {
     CUTLASS_DEVICE
     static void run_kernel(Params const& params,
-                           SharedStorage& shared_storage) {  // NOLINT
+                           SharedStorage& shared_storage) {
       CUTLASS_NOT_IMPLEMENTED();
     }
   };
+
+  // Initializes the fine grained scale+bias iterator. Needed since the fine
+  // grained iterator has a different constructor signature than a regular
+  // cutlass iterator
+  template <typename IteratorScale,
+            WeightOnlyQuantOp op,
+            std::enable_if_t<isFinegrained(op), bool> = true>
+  CUTLASS_DEVICE static IteratorScale initialize_scale(
+      typename IteratorScale::Params const& params,
+      typename IteratorScale::Pointer pointer_scale,
+      typename IteratorScale::TensorCoord extent,
+      int thread_id,
+      typename IteratorScale::TensorCoord const& threadblock_offset,
+      int group_size) {
+    return IteratorScale(params,
+                         pointer_scale,
+                         extent,
+                         thread_id,
+                         threadblock_offset,
+                         group_size);
+  }
+
+  template <typename IteratorScale,
+            WeightOnlyQuantOp op,
+            std::enable_if_t<!isFinegrained(op), bool> = true>
+  CUTLASS_DEVICE static IteratorScale initialize_scale(
+      typename IteratorScale::Params const& params,
+      typename IteratorScale::Pointer pointer_scale,
+      typename IteratorScale::TensorCoord extent,
+      int thread_id,
+      typename IteratorScale::TensorCoord const& threadblock_offset,
+      int group_size) {
+    return IteratorScale(
+        params, pointer_scale, extent, thread_id, threadblock_offset);
+  }
 
   template <typename dummy>
   struct KernelRunner<true, dummy> {
@@ -334,8 +382,12 @@ struct GemmFpAIntB {
           threadblock_tile_offset.k() * params.gemm_k_size * kInterleave,
           threadblock_tile_offset.n() * Mma::Shape::kN / kInterleave};
 
+      typename MatrixCoord::Index fg_row_offset =
+          threadblock_tile_offset.k() * params.gemm_k_size / 64;
+      typename MatrixCoord::Index scale_row_offset =
+          isFinegrained(Mma::QuantOp) ? fg_row_offset : 0;
       cutlass::MatrixCoord tb_offset_scale{
-          0, threadblock_tile_offset.n() * Mma::Shape::kN};
+          scale_row_offset, threadblock_tile_offset.n() * Mma::Shape::kN};
 
       // Problem size is a function of threadblock index in the K dimension
       int problem_size_k =
@@ -367,11 +419,16 @@ struct GemmFpAIntB {
           tb_offset_B,
           params.gather_B_indices);
 
-      typename Mma::IteratorScale iterator_scale(params.params_scale,
-                                                 params.ref_scale.data(),
-                                                 {1, params.problem_size.n()},
-                                                 thread_idx,
-                                                 tb_offset_scale);
+      typename MatrixCoord::Index scale_row_extent =
+          isFinegrained(Mma::QuantOp) ? problem_size_k / 64 : 1;
+      typename Mma::IteratorScale iterator_scale =
+          initialize_scale<typename Mma::IteratorScale, Mma::QuantOp>(
+              params.params_scale,
+              params.ref_scale.data(),
+              {scale_row_extent, params.problem_size.n()},
+              thread_idx,
+              tb_offset_scale,
+              params.group_size);
 
       // Broadcast the warp_id computed by lane 0 to ensure dependent code
       // is compiled as warp-uniform.
@@ -382,7 +439,11 @@ struct GemmFpAIntB {
       // Main loop
       //
       // Construct thread-scoped matrix multiply
-      Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
+      Mma mma(shared_storage.main_loop,
+              params.group_size,
+              thread_idx,
+              warp_idx,
+              lane_idx);
 
       typename Mma::FragmentC accumulators;
 
@@ -496,21 +557,25 @@ struct GemmFpAIntB {
     */
   /// Executes one GEMM
   CUTLASS_DEVICE
-  void operator()(Params const& params,
-                  SharedStorage& shared_storage) {  // NOLINT
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700) && (__CUDA_ARCH__ < 750)
+  void operator()(Params const& params, SharedStorage& shared_storage) {
+#if defined(__CUDA_ARCH__)
+#if (__CUDA_ARCH__ >= 700) && (__CUDA_ARCH__ < 750)
     static constexpr bool compile_needed =
         platform::is_same<KernelArch, arch::Sm70>::value;
     KernelRunner<compile_needed>::run_kernel(params, shared_storage);
-
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
+#elif (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
     static constexpr bool compile_needed =
         platform::is_same<KernelArch, arch::Sm75>::value;
     KernelRunner<compile_needed>::run_kernel(params, shared_storage);
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
+#elif (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ <= 900)
     static constexpr bool compile_needed =
         platform::is_same<KernelArch, arch::Sm80>::value;
     KernelRunner<compile_needed>::run_kernel(params, shared_storage);
+#else
+    static_assert(false,
+                  "Invalid architecture being compiled. Only Volta+ supported "
+                  "in weight-only quantization kernels.");
+#endif
 #else
     CUTLASS_NOT_IMPLEMENTED();
 #endif

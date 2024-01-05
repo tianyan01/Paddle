@@ -29,66 +29,72 @@
  *POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
-
 /*! \file
-    \brief Scheduler for grouped GEMM
+  \brief Functor performing linear combination with a maximum operation used by
+  epilogues.
 */
 
 #pragma once
 
+#include "cutlass/array.h"
 #include "cutlass/cutlass.h"
-#include "cutlass/gemm/gemm.h"
-#include "cutlass/gemm/kernel/gemm_grouped_problem_visitor.h"
-#include "cutlass/matrix_coord.h"
-
-#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/gemm/kernel/gemm_moe_problem_visitor.h"
-#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/gemm/kernel/moe_problem_visitor.h"
+#include "cutlass/epilogue/thread/activation.h"
+#include "cutlass/epilogue/thread/linear_combination_generic.h"
+#include "cutlass/epilogue/thread/scale_type.h"
+#include "cutlass/functional.h"
+#include "cutlass/half.h"
+#include "cutlass/numeric_conversion.h"
+#include "cutlass/numeric_types.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {
-namespace gemm {
-namespace kernel {
-
-/// Visitor class to abstract away the algorithm for iterating over tiles
-template <typename ThreadblockShape,
-          GroupScheduleMode GroupScheduleMode_,
-          int PrefetchTileCount,
-          int ThreadCount,
-          bool Transposed = false>
-struct GemmMoeProblemVisitor
-    : public MoeProblemVisitor<
-          detail::GemmGroupedProblemSizeHelper<ThreadblockShape, Transposed>,
-          ThreadblockShape,
-          GroupScheduleMode_,
-          PrefetchTileCount,
-          ThreadCount> {
-  static bool const kTransposed = Transposed;
-
-  using ProblemSizeHelper =
-      detail::GemmGroupedProblemSizeHelper<ThreadblockShape, Transposed>;
-  using Base = MoeProblemVisitor<ProblemSizeHelper,
-                                 ThreadblockShape,
-                                 GroupScheduleMode_,
-                                 PrefetchTileCount,
-                                 ThreadCount>;
-  using Params = typename Base::Params;
-  using SharedStorage = typename Base::SharedStorage;
-
-  //
-  // Methods
-  //
-  CUTLASS_DEVICE
-  GemmMoeProblemVisitor(Params const& params_,
-                        SharedStorage& shared_storage_,
-                        int32_t block_idx)
-      : Base(params_, shared_storage_, block_idx) {}
-};
+namespace epilogue {
+namespace thread {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace kernel
-}  // namespace gemm
+__forceinline__ __device__ float copysignf_pos(float a, float b) {
+  float r;
+  r = __int_as_float(__float_as_int(a) | (__float_as_int(b) & 0x80000000));
+  return r;
+}
+
+__forceinline__ __device__ float tanh_opt(float x) {
+#if (__CUDACC_VER_MAJOR__ < 11) || (__CUDA_ARCH__ < 750)
+  const float exp_val = -1.f * fabs(2 * x);
+  return copysignf_pos((1.0f - __expf(exp_val)) / (__expf(exp_val) + 1.0f), x);
+#else
+  return fast_tanh(x);
+#endif
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+template <>
+struct GELU_taylor<float> {
+  static const bool kIsHeavy = true;
+
+  CUTLASS_DEVICE
+  float operator()(float const& z) const {
+    float k0 = float(0.7978845608028654);
+    float k1 = float(0.044715);
+
+    return float(
+        cutlass::constants::half<float>() * z *
+        (cutlass::constants::one<float>() +
+         tanh_opt(k0 * z * (cutlass::constants::one<float>() + k1 * z * z))));
+  }
+
+  using Params = LinearCombinationGenericParams<float>;
+
+  CUTLASS_DEVICE
+  float operator()(float const& scalar, Params const& params_) const {
+    return this->operator()(scalar);
+  }
+};
+
+}  // namespace thread
+}  // namespace epilogue
 }  // namespace cutlass
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

@@ -78,35 +78,42 @@ template <
     /// Instruction-level tile size (concept: GemmShape)
     typename InstructionShape,
     /// Operation performed by GEMM
-    typename Operator>
-struct DqMma<
-    ElementA,
-    LayoutA,
-    kAlignmentA,
-    ElementB,
-    LayoutB,
-    kAlignmentB,
-    ElementScale,
-    LayoutScale,
-    kAlignmentScale,
-    ElementAccumulator,
-    layout::RowMajor,
-    OperatorClass,
-    ArchTag,
-    ThreadblockShape,
-    WarpShape,
-    InstructionShape,
-    2,
-    Operator,
-    SharedMemoryClearOption::kNone,
-    typename platform::enable_if<(ArchTag::kMinComputeCapability < 80)>::type> {
+    typename Operator_>
+struct DqMma<ElementA,
+             LayoutA,
+             kAlignmentA,
+             ElementB,
+             LayoutB,
+             kAlignmentB,
+             ElementScale,
+             LayoutScale,
+             kAlignmentScale,
+             ElementAccumulator,
+             layout::RowMajor,
+             OperatorClass,
+             ArchTag,
+             ThreadblockShape,
+             WarpShape,
+             InstructionShape,
+             2,
+             Operator_,
+             SharedMemoryClearOption::kNone,
+             typename platform::enable_if<(
+                 ArchTag::kMinComputeCapability < 80 &&
+                 !layout::IsColumnMajorTileInterleave<LayoutB>::value)>::type> {
   static_assert(platform::is_same<ElementA, half_t>::value ||
                     platform::is_same<ElementA, bfloat16_t>::value,
                 "Element A must be fp16 or bf16");
 
   static_assert(platform::is_same<ElementB, uint8_t>::value ||
                     platform::is_same<ElementB, uint4b_t>::value,
-                "Element B must be int8 or uint4");
+                "Element B must be uint8 or uint4");
+
+  using OperatorInfo = arch::DetagOperator<Operator_>;
+  using Operator = typename OperatorInfo::Operator;
+  static_assert(OperatorInfo::QuantOp ==
+                    WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY,
+                "");
 
   static constexpr bool DqAfterLDG =
       platform::is_same<arch::OpMultiplyAdd, Operator>::value;
@@ -193,7 +200,8 @@ struct DqMma<
       layout::RowMajor,
       typename MmaCore::MmaPolicy,
       typename Converters::TransformAfterLDG,
-      typename Converters::TransformAfterLDS>;
+      typename Converters::TransformAfterLDS,
+      OperatorInfo::QuantOp>;
 };
 
 // Specialization to handle column major interleave B
@@ -206,6 +214,8 @@ template <
     int kAlignmentA,
     /// Type for element B
     typename ElementB,
+    /// Layout type for B matrix operand
+    typename LayoutB,
     /// Access granularity of B matrix in units of elements
     int kAlignmentB,
     /// Element type for the input scale
@@ -227,39 +237,42 @@ template <
     /// Instruction-level tile size (concept: GemmShape)
     typename InstructionShape,
     /// Operation performed by GEMM
-    typename Operator,
-    ///
-    int RowsPerTile,
-    ///
-    int ColumnsInterleaved>
-struct DqMma<
-    ElementA,
-    LayoutA,
-    kAlignmentA,
-    ElementB,
-    layout::ColumnMajorTileInterleave<RowsPerTile, ColumnsInterleaved>,
-    kAlignmentB,
-    ElementScale,
-    LayoutScale,
-    kAlignmentScale,
-    ElementAccumulator,
-    layout::RowMajor,
-    OperatorClass,
-    ArchTag,
-    ThreadblockShape,
-    WarpShape,
-    InstructionShape,
-    2,
-    Operator,
-    SharedMemoryClearOption::kNone,
-    typename platform::enable_if<(ArchTag::kMinComputeCapability < 80)>::type> {
+    typename Operator_>
+struct DqMma<ElementA,
+             LayoutA,
+             kAlignmentA,
+             ElementB,
+             LayoutB,
+             kAlignmentB,
+             ElementScale,
+             LayoutScale,
+             kAlignmentScale,
+             ElementAccumulator,
+             layout::RowMajor,
+             OperatorClass,
+             ArchTag,
+             ThreadblockShape,
+             WarpShape,
+             InstructionShape,
+             2,
+             Operator_,
+             SharedMemoryClearOption::kNone,
+             typename platform::enable_if<(
+                 ArchTag::kMinComputeCapability < 80 &&
+                 layout::IsColumnMajorTileInterleave<LayoutB>::value)>::type> {
   static_assert(platform::is_same<ElementA, half_t>::value ||
                     platform::is_same<ElementA, bfloat16_t>::value,
                 "Element A must be fp16 or bf16");
 
   static_assert(platform::is_same<ElementB, uint8_t>::value ||
                     platform::is_same<ElementB, uint4b_t>::value,
-                "Element B must be int8 or uint4");
+                "Element B must be uint8 or uint4");
+
+  using OperatorInfo = arch::DetagOperator<Operator_>;
+  using Operator = typename OperatorInfo::Operator;
+  static_assert(OperatorInfo::QuantOp ==
+                    WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY,
+                "");
 
   static constexpr bool DqAfterLDG =
       platform::is_same<arch::OpMultiplyAdd, Operator>::value;
@@ -295,6 +308,8 @@ struct DqMma<
       kAlignmentA>;
 
  private:
+  static constexpr int ColumnsInterleaved = LayoutB::kColumnsInterleaved;
+  static constexpr int RowsPerTile = LayoutB::kRowsPerTile;
   static_assert(!(MmaCore::Shape::kN % ColumnsInterleaved), "");
   static_assert(RowsPerTile == MmaCore::Shape::kK, "");
 
@@ -368,7 +383,8 @@ struct DqMma<
       layout::RowMajor,
       typename MmaCore::MmaPolicy,
       typename Converters::TransformAfterLDG,
-      typename Converters::TransformAfterLDS>;
+      typename Converters::TransformAfterLDS,
+      OperatorInfo::QuantOp>;
 };
 
 }  // namespace threadblock

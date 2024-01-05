@@ -20,8 +20,9 @@
 #include "paddle/phi/kernels/impl/weight_quantize_kernel_gpu_impl.h"
 
 #include "paddle/phi/common/datatype_traits.h"
+#if defined(PADDLE_WITH_CUTLASS)
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/cutlass_preprocessors.h"
-
+#endif
 namespace phi {
 
 template <typename T, typename Context>
@@ -30,6 +31,7 @@ void WeightQuantizeKernel(const Context& dev_ctx,
                           const std::string& algo,
                           DenseTensor* out,
                           DenseTensor* scale) {
+#if defined(PADDLE_WITH_CUTLASS)
   const int32_t arch = phi::backends::gpu::GetDeviceArchSM(-1);
   DenseTensor quanted_x;
   dev_ctx.template Alloc<int8_t>(out);
@@ -101,6 +103,7 @@ void WeightQuantizeKernel(const Context& dev_ctx,
         "'llm.int8'], but got[%s]",
         algo);
   }
+#endif
 }
 }  // namespace phi
 

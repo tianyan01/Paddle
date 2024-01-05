@@ -20,14 +20,16 @@ limitations under the License. */
 #include "paddle/phi/common/float16.h"
 #include "paddle/phi/core/kernel_registry.h"
 #include "paddle/phi/kernels/funcs/aligned_vector.h"
+#if defined(PADDLE_WITH_CUTLASS)
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm_template.h"
+#endif
 #include "paddle/phi/kernels/matmul_kernel.h"
 
 namespace phi {
 
 template <typename T, int WeightBit>
 struct FastWeightOnlyHalfConverter;
-
+#if defined(PADDLE_WITH_CUTLASS)
 template <>
 struct FastWeightOnlyHalfConverter<half, 8> {
   using Converter =
@@ -69,7 +71,7 @@ struct FastWeightOnlyHalfConverter<half, 4> {
     }
   }
 };
-
+#endif
 #if defined(PADDLE_CUDA_BF16)
 template <>
 struct FastWeightOnlyHalfConverter<__nv_bfloat16, 8> {
@@ -234,6 +236,7 @@ void WeightDequantize(const Context& dev_ctx,
                       const std::string& algo,
                       const bool transpose,
                       DenseTensor* out) {
+#if defined(PADDLE_WITH_CUTLASS)
   using DataType = typename PDDataTypeTraits<T>::DataType;
 
   int n = scale.dims()[0];
@@ -258,6 +261,7 @@ void WeightDequantize(const Context& dev_ctx,
         n,
         k);
   }
+#endif
 }
 
 }  // namespace phi

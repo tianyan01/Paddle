@@ -15,8 +15,9 @@
  */
 
 #pragma once
+#include <unordered_map>
 #include <cuda_runtime_api.h>
-#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/ft_gemm_configs.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/gemm_configs.h"
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/activation_types.h"
 
 namespace phi {
@@ -24,6 +25,7 @@ namespace phi {
 template <typename T, /*The type used for activations/scales/compute*/
           typename WeightType /* The type for the MoE weights */>
 class MoeGemmRunner {
+  using CutlassGemmConfigCache = typename std::unordered_map<int64_t, CutlassGemmConfig>;
  public:
   MoeGemmRunner();
 
@@ -83,6 +85,7 @@ class MoeGemmRunner {
  private:
   int sm_;
   int multi_processor_count_;
+  CutlassGemmConfigCache config_cache_;
 };
 
 }  // namespace phi

@@ -329,7 +329,7 @@ void MoeKernel(const Context& ctx,
   total_rows_before_expert =
       reinterpret_cast<int64_t*>(padded_expert_scales + padded_num_moe_inputs);
   sorted_softmax_output =
-      reinterpret_cast<T*>(total_rows_before_expert + padded_experts);
+      reinterpret_cast<T*>(total_rows_before_expert + padded_experts + 1);
   attr_mask =
       reinterpret_cast<T*>(sorted_softmax_output + padded_num_moe_inputs);
   fc1_result = reinterpret_cast<T*>(attr_mask + num_moe_inputs);

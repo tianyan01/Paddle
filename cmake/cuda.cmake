@@ -290,10 +290,10 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${NVCC_FLAGS_EXTRA}")
 message(STATUS "NVCC_FLAGS_EXTRA: ${NVCC_FLAGS_EXTRA}, NVCC_ARCH_BIN: ${NVCC_ARCH_BIN}")
 
 # Set C++14 support
-set(CUDA_PROPAGATE_HOST_FLAGS OFF)
+set(CUDA_PROPAGATE_HOST_FLAGS ON)
 # Release/Debug flags set by cmake. Such as -O3 -g -DNDEBUG etc.
 # So, don't set these flags here.
-set(CMAKE_CUDA_STANDARD 14)
+set(CMAKE_CUDA_STANDARD 17)
 
 # (Note) For windows, if delete /W[1-4], /W1 will be added defaultly and conflic with -w
 # So replace /W[1-4] with /W0
@@ -321,6 +321,7 @@ if(WIN32)
     endforeach()
   endif()
 endif()
+message(STATUS "CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
 
 mark_as_advanced(CUDA_BUILD_CUBIN CUDA_BUILD_EMULATION CUDA_VERBOSE_BUILD)
 mark_as_advanced(CUDA_SDK_ROOT_DIR CUDA_SEPARABLE_COMPILATION)
