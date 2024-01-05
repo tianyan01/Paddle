@@ -182,7 +182,7 @@ if(WITH_CUTLASS)
   file(
     GLOB cutlass_cu
     RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
-    "fusion/cutlass/*.cu"
+    # "fusion/cutlass/*.cu"
     # "fusion/cutlass/memory_efficient_attention/autogen/impl/*.cu"
     # "fusion/cutlass/memory_efficient_attention/autogen_variable/impl/*.cu"
     "fusion/cutlass/cutlass_kernels/*.cu"

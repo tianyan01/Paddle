@@ -179,7 +179,7 @@ size_t getWorkspaceSize(const int num_rows,
   total_ws_bytes += sizeof(int) * num_experts * k;        // permuted_experts_
   total_ws_bytes += buf_size * sizeof(T);                 // permuted_data_
   total_ws_bytes +=
-      padded_experts * sizeof(int64_t);  // Hold total_rows_before_expert_
+      (padded_experts + 1) * sizeof(int64_t);  // Hold total_rows_before_expert_ add 1 for the first element 0
 
   total_ws_bytes += sizeof(T) * num_moe_inputs;         // attr_mask: [e, n]
   total_ws_bytes += sizeof(T) * padded_num_moe_inputs;  // sorted_softmax_output
@@ -222,7 +222,10 @@ __global__ void initialize_expert_choice_route_kernel(
     attr_mask[start + i] = (T)1.0f;
   }
   if (threadIdx.x == 0) {
-    total_rows_before_expert[blockIdx.x] = batch_size * k * (blockIdx.x + 1);
+    if (blockIdx.x == 0) {
+      total_rows_before_expert[0] = 0;
+    }
+    total_rows_before_expert[blockIdx.x + 1] = batch_size * k * (blockIdx.x + 1);
   }
 }
 

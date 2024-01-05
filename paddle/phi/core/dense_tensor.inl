@@ -63,7 +63,8 @@ void clear() {
   holder_.reset();
   meta_.offset = 0;
 }
-
+// tensor list used continue memory buffer
+void ShareBufferWithTensors(const std::vector<DenseTensor>& tensors);
 void ShareBufferWith(const DenseTensor& tensor, bool with_dtype = true);
 void ShareDataTypeWith(const DenseTensor& tensor) {
   meta_.dtype = tensor.meta().dtype;

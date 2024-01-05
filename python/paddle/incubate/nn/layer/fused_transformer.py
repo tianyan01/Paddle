@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from paddle.nn import functional as F
 from paddle.incubate.nn import functional as incubate_f
 from paddle.nn import Layer
@@ -1985,6 +1986,9 @@ class FusedMultiTransformerMoe(Layer):
         ), "Expected dim_feedforward to be greater than 0, but received {}".format(
             dim_feedforward
         )
+        gemm_cutlass = (os.getenv("FLAGS_enable_moe_gemm_cutlass", "false") == "true")
+        if gemm_cutlass:
+            print("FusedMultiTransformerMoe use cutlass gemm")
         # only support mp/dp
         # for moe config
         self.group = moe_group
@@ -2137,7 +2141,7 @@ class FusedMultiTransformerMoe(Layer):
                 expert_bias2_attr = get_attr(expert_bias2_attrs, i * num_expert + j)
                 
                 expert_weight1 = self.create_parameter(
-                    shape=[d_model, dim_feedforward],
+                    shape=[d_model, dim_feedforward] if not gemm_cutlass else [dim_feedforward, d_model],
                     attr=expert_weight1_attr,
                     dtype=self._dtype,
                     is_bias=False,
@@ -2151,7 +2155,7 @@ class FusedMultiTransformerMoe(Layer):
                     default_initializer=nn.initializer.Constant(value=0.0)
                 )
                 expert_weight2 = self.create_parameter(
-                    shape=[dim_feedforward, d_model],
+                    shape=[dim_feedforward, d_model] if not gemm_cutlass else [d_model, dim_feedforward],
                     attr=expert_weight2_attr,
                     dtype=self._dtype,
                     is_bias=False,
@@ -2175,6 +2179,8 @@ class FusedMultiTransformerMoe(Layer):
         self.dropout_rate = dropout_rate
         self.activation = activation
         self.name = name
+        if gemm_cutlass:
+            self._share_expert_param(num_layers, num_expert, dim_feedforward, d_model)
 
     def forward(self, src, attn_mask=None, caches=None, seq_lens=None, beam_offset=None, time_step=None):
         """
@@ -2255,6 +2261,54 @@ class FusedMultiTransformerMoe(Layer):
         trans_to_fp16(self.expert_weights2)
         trans_to_fp16(self.expert_biases2)
         self._dtype = dtype
+
+    def _share_expert_param(self, num_layers, num_expert, dim_feedforward, d_model):
+        """
+        share_param
+        """
+        def shard_tensor(dst_tensor, parent_tensor, pos):
+            tmp = parent_tensor.value().get_tensor()._slice(pos, pos + 1)
+            dst_tensor.value().get_tensor()._share_data_buffer(tmp, False)
+            #print(dst_tensor)
+
+        self.shared_weights1, self.shared_biases1 = ParameterList(), ParameterList()
+        self.shared_weights2, self.shared_biases2 = ParameterList(), ParameterList()
+
+        for i in range(num_layers):
+            shared_weight1 = paddle.create_parameter(
+                name=f"moe.expert.layer{i}.shared_weight1",
+                shape=[num_expert, dim_feedforward, d_model],
+                dtype=self._dtype,
+                default_initializer=nn.initializer.Constant(value=0.0)) 
+            shared_bias1 = paddle.create_parameter(
+                name=f"moe.expert.layer{i}.shared_bias1",
+                shape=[num_expert, dim_feedforward],
+                dtype=self._dtype,
+                default_initializer=nn.initializer.Constant(value=0.0)) 
+            
+            shared_weight2 = paddle.create_parameter(
+                name=f"moe.expert.layer{i}.shared_weight2",
+                shape=[num_expert, d_model, dim_feedforward],
+                dtype=self._dtype,
+                default_initializer=nn.initializer.Constant(value=0.0)) 
+            shared_bias2 = paddle.create_parameter(
+                name=f"moe.expert.layer{i}.shared_bias2",
+                shape=[num_expert, d_model],
+                dtype=self._dtype,
+                default_initializer=nn.initializer.Constant(value=0.0)) 
+
+            for j in range(self.num_expert):
+                expert_idx = j + i * self.num_expert
+                shard_tensor(self.expert_weights1[expert_idx], shared_weight1, j)
+                shard_tensor(self.expert_biases1[expert_idx], shared_bias1, j)
+                shard_tensor(self.expert_weights2[expert_idx], shared_weight2, j)
+                shard_tensor(self.expert_biases2[expert_idx], shared_bias2, j)
+
+            self.shared_weights1.append(shared_weight1)
+            self.shared_biases1.append(shared_bias1)
+
+            self.shared_weights2.append(shared_weight2)
+            self.shared_biases2.append(shared_bias2)
 
 
 class FusedMultiTransformerMoeINT8(Layer):
@@ -2937,7 +2991,7 @@ class FusedMultiTransformerMoeWeightOnly(Layer):
         self.activation = activation
         self.name = name
         self._int8_decorate()
-        #self._share_expert_param(num_layers, num_expert, dim_feedforward, d_model, weight_int8)
+        self._share_expert_param(num_layers, num_expert, dim_feedforward, d_model, weight_int8)
         self._dtype = "int8"
 
     def forward(self, src, attn_mask=None, caches=None, seq_lens=None, beam_offset=None, time_step=None):

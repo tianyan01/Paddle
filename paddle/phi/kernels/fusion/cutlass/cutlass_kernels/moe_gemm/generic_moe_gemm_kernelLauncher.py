@@ -85,28 +85,47 @@ epilogue_tags = ["bias", "biasFtGelu", "biasReLU", "noBias"]
 
 WeightTypes = {
     "fp16": ["half", "uint8_t", "cutlass::uint4b_t"], 
-    "bf16": ["uint8_t", "cutlass::uint4b_t"]}
-ThreadblockShapes = [
-    "cutlass::gemm::GemmShape<32, 128, 64>",
-    "cutlass::gemm::GemmShape<64, 128, 64>",
-    "cutlass::gemm::GemmShape<128, 128, 64>",
-]
-WarpShapes = [
-    "cutlass::gemm::GemmShape<32, 32, 64>",
-    "cutlass::gemm::GemmShape<64, 32, 64>",
-    "cutlass::gemm::GemmShape<128, 32, 64>",
-]
-ThreadblockShapes_sm70 = [
-    "cutlass::gemm::GemmShape<32, 128, 64>",
-    "cutlass::gemm::GemmShape<64, 128, 64>",
-]
-WarpShapes_sm70 = [
-    "cutlass::gemm::GemmShape<32, 32, 64>",
-    "cutlass::gemm::GemmShape<64, 32, 64>",
-]
+    "bf16": ["uint8_t", "cutlass::uint4b_t"],
+    "float": ["float"]
+}
+
+ThreadBlockWrapShapes = {
+    "float" :  {
+        "ThreadblockShapes": [
+            "cutlass::gemm::GemmShape<128, 128, 8>",
+        ],
+        "WarpShapes": [
+            "cutlass::gemm::GemmShape<64, 64, 8>"
+        ],
+    },
+    "half" :  {
+        "ThreadblockShapes": [
+            "cutlass::gemm::GemmShape<32, 128, 64>",
+            "cutlass::gemm::GemmShape<64, 128, 64>",
+            "cutlass::gemm::GemmShape<128, 128, 64>",
+        ],
+        "WarpShapes": [
+            "cutlass::gemm::GemmShape<32, 32, 64>",
+            "cutlass::gemm::GemmShape<32, 64, 64>",
+            "cutlass::gemm::GemmShape<64, 32, 64>",
+        ],
+    },
+    "default" :  {
+        "ThreadblockShapes" : [
+            "cutlass::gemm::GemmShape<32, 128, 64>",
+            "cutlass::gemm::GemmShape<64, 128, 64>",
+            "cutlass::gemm::GemmShape<128, 128, 64>",
+        ],
+        "WarpShapes": [
+            "cutlass::gemm::GemmShape<32, 32, 64>",
+            "cutlass::gemm::GemmShape<64, 32, 64>",
+            "cutlass::gemm::GemmShape<128, 32, 64>",
+        ]
+    }
+}
 StagesList = {70: [2], 80: [2, 3, 4]}
 
-ElementTypes = {"fp16": "half", "bf16": "__nv_bfloat16"}
+ElementTypes = {"fp16": "half", "bf16": "__nv_bfloat16", "float": "float"}
 Archs = {
     70: "cutlass::arch::Sm70",
     80: "cutlass::arch::Sm80",
@@ -176,11 +195,12 @@ def generate_source_cu(
     element_type: str, WeightType:str, arch: int, epilogue_tag: str, stages: int
 ):
     all_code = CommonHead
-    ThreadblockShapes_arch = ThreadblockShapes
-    WarpShapes_arch = WarpShapes
-    if arch < 80:
-        ThreadblockShapes_arch = ThreadblockShapes_sm70
-        WarpShapes_arch = WarpShapes_sm70
+    ThreadblockShapes_arch = ThreadBlockWrapShapes["default"]["ThreadblockShapes"]
+    WarpShapes_arch = ThreadBlockWrapShapes["default"]["WarpShapes"]
+    if WeightType in ThreadBlockWrapShapes:
+        ThreadblockShapes_arch = ThreadBlockWrapShapes[WeightType]["ThreadblockShapes"]
+        WarpShapes_arch = ThreadBlockWrapShapes[WeightType]["WarpShapes"]
+
     for i in range(len(ThreadblockShapes_arch)):
         value_dict = {
             "T": ElementTypes[element_type],
