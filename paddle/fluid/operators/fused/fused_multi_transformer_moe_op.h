@@ -88,7 +88,7 @@ void MatMulINT8ToT(const phi::GPUContext& dev_ctx,
                (void*)workspace->data<int8_t>(),
                workspace->numel());
 
-  dequantize_kernel_launcher<T>(output_tmp->data<int32_t>(),
+  dequantize_kernel_launcher<int32_t, T>(output_tmp->data<int32_t>(),
                                 output->data<T>(),
                                 m,
                                 n,

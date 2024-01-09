@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <cusparseLt.h>
 #include "paddle/phi/backends/gpu/forwards.h"
 
 namespace phi {

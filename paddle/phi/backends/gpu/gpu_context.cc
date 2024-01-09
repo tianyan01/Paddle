@@ -42,6 +42,8 @@ limitations under the License. */
 #endif  // !defined(__APPLE__) && defined(PADDLE_WITH_NCCL)
 #endif  // PADDLE_WITH_CUDA
 
+#include "paddle/phi/backends/dynload/cusparseLt.h"
+
 #ifdef PADDLE_WITH_HIP
 #include "paddle/phi/backends/dynload/miopen.h"
 #include "paddle/phi/backends/dynload/rocblas.h"
@@ -444,6 +446,31 @@ struct GPUContext::Impl {
     return blaslt_handle_;
   }
 
+  void SetSparseLtHandle(cusparseLtHandle_t* sparselt) {
+    sparselt_handle_ = sparselt;
+  }
+
+  void SetSparseLtHandle(
+      std::function<cusparseLtHandle_t*()>&& handle_creator) {
+    sparselt_handle_creator_ = std::move(handle_creator);
+  }
+
+  cusparseLtHandle_t* GetSparseLtHandle() {
+    std::call_once(flag_sparselt_, [&]() {
+      if (!sparselt_handle_) {
+        if (!sparselt_handle_creator_) {
+          sparselt_handle_ = &sparselt_ori_handle_;
+          phi::InitSparseLtHandle(sparselt_handle_);
+        } else {
+          sparselt_handle_ = sparselt_handle_creator_();
+        }
+      }
+    });
+    PD_CHECK(sparselt_handle_ != nullptr,
+             "the gpu sparseLT handle is nullptr.");
+    return sparselt_handle_;
+  }
+
   dnnHandle_t GetDnnHandle() {
     std::call_once(flag_dnn_, [&]() {
       if (!dnn_handle_) {
@@ -687,6 +714,10 @@ struct GPUContext::Impl {
   std::function<blasHandle_t()> blas_tf32_tensor_core_handle_creator_{nullptr};
   blasLtHandle_t blaslt_handle_{nullptr};
   std::function<blasLtHandle_t()> blaslt_handle_creator_{nullptr};
+  cusparseLtHandle_t sparselt_ori_handle_;
+  cusparseLtHandle_t* sparselt_handle_{nullptr};
+  std::function<cusparseLtHandle_t*()> sparselt_handle_creator_{nullptr};
+
   dnnHandle_t dnn_handle_{nullptr};
   std::function<dnnHandle_t()> dnn_handle_creator_{nullptr};
   solverHandle_t solver_handle_{nullptr};
@@ -698,6 +729,7 @@ struct GPUContext::Impl {
   std::once_flag flag_sparse_;
   std::once_flag flag_blas_;
   std::once_flag flag_blaslt_;
+  std::once_flag flag_sparselt_;
   std::once_flag flag_dnn_;
   std::once_flag flag_slover_;
   std::once_flag flag_cublas_;
@@ -757,6 +789,10 @@ blasHandle_t GPUContext::cublas_handle() const {
 
 blasLtHandle_t GPUContext::cublaslt_handle() const {
   return impl_->GetBlasLtHandle();
+}
+
+cusparseLtHandle_t* GPUContext::cusparselt_handle() const {
+  return impl_->GetSparseLtHandle();
 }
 
 solverHandle_t GPUContext::cusolver_dn_handle() const {
@@ -907,6 +943,15 @@ void GPUContext::SetSolverHandle(std::function<solverHandle_t()>&& func) {
 
 void GPUContext::SetSparseHandle(sparseHandle_t handle) {
   impl_->SetSparseHandle(handle);
+}
+
+void GPUContext::SetSparseLtHandle(cusparseLtHandle_t* handle) {
+  impl_->SetSparseLtHandle(handle);
+}
+
+void GPUContext::SetSparseLtHandle(
+    std::function<cusparseLtHandle_t*()>&& func) {
+  impl_->SetSparseLtHandle(std::move(func));
 }
 
 void GPUContext::SetSparseHandle(std::function<sparseHandle_t()>&& func) {

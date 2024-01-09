@@ -25,6 +25,7 @@
 #include "paddle/phi/backends/dynload/cudnn.h"
 #include "paddle/phi/backends/dynload/cusolver.h"
 #include "paddle/phi/backends/dynload/cusparse.h"
+#include "paddle/phi/backends/dynload/cusparseLt.h"
 #if !defined(__APPLE__) && defined(PADDLE_WITH_NCCL)
 #include "paddle/phi/backends/dynload/nccl.h"
 #endif  // !defined(__APPLE__) && defined(PADDLE_WITH_NCCL)
@@ -286,6 +287,19 @@ void DestroySparseHandle(sparseHandle_t handle) {
   }
 #endif
 #endif
+}
+
+void InitSparseLtHandle(cusparseLtHandle_t* handle) {
+  // ROCM is not yet supported
+  // The generic APIs is supported from CUDA10.1
+  PADDLE_RETRY_CUDA_SUCCESS(dynload::cusparseLtInit(handle));
+}
+
+void DestroySparseLtHandle(cusparseLtHandle_t* handle) {
+  if (handle != nullptr) {
+    PADDLE_RETRY_CUDA_SUCCESS(dynload::cusparseLtDestroy(handle));
+    handle = nullptr;
+  }
 }
 
 }  // namespace phi

@@ -28,12 +28,13 @@ using phi::backends::gpu::GpuLaunchConfig;
 
 constexpr int DequantKernelVecSize = 4;
 
-
-template<typename T>
-struct QuantFunc{
-  HOSTDEVICE int8_t operator()(const T x, const float scale, const float max_bound,
+template <typename T>
+struct QuantFunc {
+  HOSTDEVICE int8_t operator()(const T x,
+                               const float scale,
+                               const float max_bound,
                                const float min_bound) {
-    float tmp = static_cast<float>(x) * max_bound *  scale;
+    float tmp = static_cast<float>(x) * max_bound * scale;
     tmp = round(tmp);
     if (tmp > max_bound)
       tmp = max_bound;
@@ -43,11 +44,14 @@ struct QuantFunc{
   }
 };
 
-template<typename T, int VecSize>
-__global__ void QuantActKernel(const T* x, const int32_t rows, const int32_t cols, float scale, int8_t* quant_x,  
+template <typename T, int VecSize>
+__global__ void QuantActKernel(const T* x,
+                               const int32_t rows,
+                               const int32_t cols,
+                               float scale,
+                               int8_t* quant_x,
                                const float max_bound,
                                const float min_bound) {
-  
   using InVec = phi::AlignedVector<T, VecSize>;
   using OutVec = phi::AlignedVector<int8_t, VecSize>;
 
@@ -56,38 +60,47 @@ __global__ void QuantActKernel(const T* x, const int32_t rows, const int32_t col
 
   InVec in_vec;
   OutVec out_vec;
-  for(int32_t linear_index = (blockIdx.x * blockDim.x + threadIdx.x) * VecSize; linear_index < num_items; linear_index += stride){
-        phi::Load<T, VecSize>(x + linear_index, &in_vec);
-        #pragma unroll
-        for (int i = 0; i < VecSize; ++i) {
-          out_vec[i] = QuantFunc<T>()(in_vec[i], scale, max_bound, min_bound);
-        }
-        phi::Store(out_vec, quant_x + linear_index);
+  for (int32_t linear_index = (blockIdx.x * blockDim.x + threadIdx.x) * VecSize;
+       linear_index < num_items;
+       linear_index += stride) {
+    phi::Load<T, VecSize>(x + linear_index, &in_vec);
+#pragma unroll
+    for (int i = 0; i < VecSize; ++i) {
+      out_vec[i] = QuantFunc<T>()(in_vec[i], scale, max_bound, min_bound);
+    }
+    phi::Store(out_vec, quant_x + linear_index);
   }
 }
 
+template <typename T>
+void LaunchQuantActKernel(const T* x,
+                          const int32_t rows,
+                          const int32_t cols,
+                          int8_t* quant_x,
+                          float scale,
+                          const float max_bound,
+                          const float min_bound,
+                          gpuStream_t stream) {
+  constexpr int NumThreads = 256;
+  constexpr int VecSize = 16 / sizeof(T);
 
-template<typename T> 
-void LaunchQuantActKernel(const T* x, const int32_t rows, const int32_t cols, int8_t* quant_x, float scale, 
-                               const float max_bound, const float min_bound, gpuStream_t stream) {
-  constexpr int NumThreads=256;
-  constexpr int VecSize= 16 / sizeof(T);
-
-  constexpr int kNumWaves = 8; 
+  constexpr int kNumWaves = 8;
   int dev;
   cudaGetDevice(&dev);
   int sm_count;
   cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
   int tpm;
   cudaDeviceGetAttribute(&tpm, cudaDevAttrMaxThreadsPerMultiProcessor, dev);
-  const int elem_cnt = rows*cols;
-  const int launch_elem_cnt = elem_cnt / VecSize; 
-  const int grid_size = std::max<int>(1, std::min<int64_t>((launch_elem_cnt + NumThreads - 1) / NumThreads,
-                                      sm_count * tpm / NumThreads * kNumWaves));
+  const int elem_cnt = rows * cols;
+  const int launch_elem_cnt = elem_cnt / VecSize;
+  const int grid_size = std::max<int>(
+      1,
+      std::min<int64_t>((launch_elem_cnt + NumThreads - 1) / NumThreads,
+                        sm_count * tpm / NumThreads * kNumWaves));
 
-  QuantActKernel<T, VecSize><<<grid_size, NumThreads, 0, stream>>>(x, rows, cols, scale, quant_x, max_bound, min_bound);                                                            
+  QuantActKernel<T, VecSize><<<grid_size, NumThreads, 0, stream>>>(
+      x, rows, cols, scale, quant_x, max_bound, min_bound);
 }
-
 
 template <typename T>
 __forceinline__ __device__ int8_t quant_helper(const T input,
@@ -158,9 +171,9 @@ void quantize_kernel_launcher(const T* input,
                                               min_bound);
 }
 
-template <typename T, int VecSize>
-__global__ void dequantize_kernel(T* output,
-                                  const int32_t* input,
+template <typename TI, typename TO, int VecSize>
+__global__ void dequantize_kernel(TO* output,
+                                  const TI* input,
                                   const int m,  // batch size
                                   const int n,  // hidden
                                   const float quant_in_scale,
@@ -170,36 +183,51 @@ __global__ void dequantize_kernel(T* output,
   int idx = (blockIdx.x * blockDim.x + threadIdx.x) * VecSize;
   int col_id = idx % n;
 
-  phi::AlignedVector<int32_t, VecSize> in_vec;
+  phi::AlignedVector<TI, VecSize> in_vec;
   phi::AlignedVector<float, VecSize> out_scale_vec;
-  phi::AlignedVector<T, VecSize> out_vec;
+  phi::AlignedVector<TO, VecSize> out_vec;
 
   for (; idx < numel; idx += stride) {
-    phi::Load<int32_t, VecSize>(input + idx, &in_vec);
+    phi::Load<TI, VecSize>(input + idx, &in_vec);
     phi::Load<float, VecSize>(dequant_out_scale_data + col_id, &out_scale_vec);
 
 #pragma unroll
     for (int i = 0; i < VecSize; ++i) {
       out_vec[i] =
-          static_cast<T>(static_cast<float>(in_vec[i]) * out_scale_vec[i]);
+          static_cast<TO>(static_cast<float>(in_vec[i]) * out_scale_vec[i]);
     }
 
-    phi::Store<T, VecSize>(out_vec, output + idx);
+    phi::Store<TO, VecSize>(out_vec, output + idx);
   }
 }
 
-template <typename T>
-void dequantize_kernel_launcher(const int32_t* input,
-                                T* output,
+template <typename TI, typename TO>
+void dequantize_kernel_launcher(const TI* input,
+                                TO* output,
                                 const int m,  // m
                                 const int n,  // n
                                 gpuStream_t stream,
                                 GpuLaunchConfig* gpu_config,
                                 const float quant_in_scale,
                                 const float* dequant_out_scale_data) {
-  dequantize_kernel<T, DequantKernelVecSize>
+  dequantize_kernel<TI, TO, DequantKernelVecSize>
       <<<gpu_config->block_per_grid, gpu_config->thread_per_block, 0, stream>>>(
           output, input, m, n, quant_in_scale, dequant_out_scale_data);
+}
+
+template <typename T>
+__global__ void scale_kernel(T* src, float x, const int n) {
+  int i = blockIdx.x * blockDim.y + threadIdx.y;
+  if (i < n) {
+    src[i] = src[i] * x;
+  }
+}
+
+template <typename T>
+void scale_launch(T* src, float x, const int n, gpuStream_t stream) {
+  dim3 grid((n - 1) / 256 + 1);
+  dim3 block(1, 256);
+  scale_kernel<<<grid, block, 0, stream>>>(src, x, n);
 }
 
 }  // namespace operators

@@ -20,6 +20,8 @@ limitations under the License. */
 
 #include <cub/cub.cuh>
 
+#include <fstream>
+#include <iomanip>
 #include "paddle/fluid/framework/op_registry.h"
 #include "paddle/fluid/framework/operator.h"
 #include "paddle/fluid/operators/fused/attention_layer_norm.h"
@@ -37,22 +39,19 @@ limitations under the License. */
 #include "paddle/fluid/platform/device/gpu/nccl_helper.h"
 // #endif
 
-#include <fstream> 
-#include <iomanip> 
-
 DECLARE_bool(gemm_use_half_precision_compute_type);
 
 namespace paddle {
 namespace operators {
 
 template <typename T>
-void print_tensor(const T *t, int size, const char *name){
-  using namespace std;
-  ofstream out_txt_file;
-  out_txt_file.open(name, ios::out | ios::trunc);
-  out_txt_file << fixed;
-  for(int i=0; i < size; i++){
-    out_txt_file << setprecision(8) << static_cast<float>(t[i]) << endl;
+void print_tensor(const T *t, int size, const char *name) {
+  std::ofstream out_txt_file;
+  out_txt_file.open(name, std::ios::out | std::ios::trunc);
+  out_txt_file << std::fixed;
+  for (int i = 0; i < size; i++) {
+    out_txt_file << std::setprecision(8) << static_cast<float>(t[i])
+                 << std::endl;
   }
   out_txt_file.close();
 }
@@ -108,7 +107,6 @@ using float16 = plat::float16;
 #define MMHA_USE_FP32_ACUM_FOR_FMA
 // #define MMHA_USE_HMMA_FOR_REDUCTION
 
-
 template <typename T>
 struct Masked_multihead_attention_params {
   // output buffer, [B, 1(seq_len), num_head * dim_head]
@@ -126,7 +124,7 @@ struct Masked_multihead_attention_params {
   // v [B, num_head, max_seq_len, dim_head]
   T *cache_kv;
   // [B, max_seq_len]
-  const int* beam_cache_offset = nullptr;
+  const int *beam_cache_offset = nullptr;
 
   const int *sequence_lengths{nullptr};
 
@@ -135,7 +133,7 @@ struct Masked_multihead_attention_params {
   const T *rotary_emb;
   int rotary_emb_dims;
 
-  int batch_size; // batch * beam
+  int batch_size;  // batch * beam
   int beam_width;
   int num_head;
   int timestep;  // cache_seq_length
@@ -940,14 +938,14 @@ __global__ void masked_multihead_attention_kernel(
   __syncthreads();
 #endif
 
-  using K_vec = typename K_vec_<T, THREADS_PER_KEY>::Type; // uint2
-  constexpr int K_VEC_SIZE = sizeof(K_vec) / sizeof(T); // 2
+  using K_vec = typename K_vec_<T, THREADS_PER_KEY>::Type;  // uint2
+  constexpr int K_VEC_SIZE = sizeof(K_vec) / sizeof(T);     // 2
   static_assert(Dh_MAX % K_VEC_SIZE == 0, "");
-  constexpr int K_ELTS_PER_THREAD = Dh_MAX / THREADS_PER_KEY; // 32
-  constexpr int K_VECS_PER_THREAD = K_ELTS_PER_THREAD / K_VEC_SIZE; // 16
+  constexpr int K_ELTS_PER_THREAD = Dh_MAX / THREADS_PER_KEY;        // 32
+  constexpr int K_VECS_PER_THREAD = K_ELTS_PER_THREAD / K_VEC_SIZE;  // 16
 
-  int ko = tid / THREADS_PER_KEY; // 0 ~ 63
-  int ki = (tid % THREADS_PER_KEY) * K_VEC_SIZE; // 0 or 2
+  int ko = tid / THREADS_PER_KEY;                 // 0 ~ 63
+  int ki = (tid % THREADS_PER_KEY) * K_VEC_SIZE;  // 0 or 2
 
   static_assert(Dh_MAX == THREADS_PER_KEY * K_VEC_SIZE * K_VECS_PER_THREAD, "");
 
@@ -958,13 +956,15 @@ __global__ void masked_multihead_attention_kernel(
         &q_smem[ki + i * THREADS_PER_KEY * K_VEC_SIZE]);
   }
 
-  constexpr int K_PER_ITER = THREADS_PER_BLOCK / THREADS_PER_KEY; //128/2 = 64
-  constexpr int K_PER_WARP = WARP_SIZE / THREADS_PER_KEY; // 32/2 = 16
+  constexpr int K_PER_ITER = THREADS_PER_BLOCK / THREADS_PER_KEY;  // 128/2 = 64
+  constexpr int K_PER_WARP = WARP_SIZE / THREADS_PER_KEY;          // 32/2 = 16
 
   T *k_cache = &params.cache_kv[bhi * params.max_seq_length * Dh + ki];
   T *k_cache_batch = &params.cache_kv[bbhi * params.max_seq_length * Dh + ki];
-  int ti_end = div_up(act_time_step, K_PER_WARP) * K_PER_WARP; // 160
-  const int *beam_offsets = params.beam_cache_offset ? &params.beam_cache_offset[bi_seq_len_offset] : nullptr;
+  int ti_end = div_up(act_time_step, K_PER_WARP) * K_PER_WARP;  // 160
+  const int *beam_offsets = params.beam_cache_offset
+                                ? &params.beam_cache_offset[bi_seq_len_offset]
+                                : nullptr;
 
   for (int ti = ko; ti < ti_end; ti += K_PER_ITER) {
     K_vec k[K_VECS_PER_THREAD];
@@ -973,11 +973,15 @@ __global__ void masked_multihead_attention_kernel(
 #pragma unroll
     for (int ii = 0; ii < K_VECS_PER_THREAD; ++ii) {
       // get beam_offset of this location
-      const int beam_offset = beam_offsets ? beam_offsets[ti] * params.num_head * params.max_seq_length * Dh : 0;
+      const int beam_offset =
+          beam_offsets
+              ? beam_offsets[ti] * params.num_head * params.max_seq_length * Dh
+              : 0;
       int jj = ii * params.max_seq_length + ti;
       if (ti < act_time_step) {
         // k[ii] =
-        //     (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.max_seq_length)
+        //     (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh *
+        //     params.max_seq_length)
         //         ? *reinterpret_cast<const K_vec *>(
         //               &k_cache[jj * QK_ELTS_IN_16B])
         //         : k_vec_zero;
@@ -1078,8 +1082,12 @@ __global__ void masked_multihead_attention_kernel(
   constexpr int V_PER_ITER = THREADS_PER_BLOCK / THREADS_PER_VALUE;
   if (Dh == Dh_MAX || vi < Dh) {
     for (int ti = vo; ti < act_time_step; ti += V_PER_ITER) {
-      const int beam_offset = beam_offsets ? beam_offsets[ti] * params.num_head * params.max_seq_length * Dh : 0;
-      V_vec v = *reinterpret_cast<const V_vec *>(&v_cache_batch[beam_offset + ti * Dh]);
+      const int beam_offset =
+          beam_offsets
+              ? beam_offsets[ti] * params.num_head * params.max_seq_length * Dh
+              : 0;
+      V_vec v = *reinterpret_cast<const V_vec *>(
+          &v_cache_batch[beam_offset + ti * Dh]);
 #if defined(MMHA_USE_FP32_ACUM_FOR_LOGITS)
       float logit = logits_smem[ti];
       out = fma(logit, cast_to_float(v), out);
@@ -1188,16 +1196,22 @@ inline size_t smem_size_in_bytes(
   return max(softmax_sz, red_sz);
 }
 
-#define MMHA_LAUNCH_KERNEL(                                                                                                  \
-    T, Dh, Dh_MAX, THDS_PER_KEY, THDS_PER_VALUE, THDS_PER_BLOCK, stream)                                                     \
-  size_t smem_sz =                                                                                                           \
-      smem_size_in_bytes<T>(params, Dh, THDS_PER_VALUE, THDS_PER_BLOCK);                                                     \
-  constexpr auto kernel_fn = masked_multihead_attention_kernel<T, Dh, Dh_MAX, THDS_PER_KEY, THDS_PER_VALUE, THDS_PER_BLOCK>; \
-  if (smem_sz > 0xc000) {                                                                                                    \
-    cudaFuncSetAttribute(                                                                                                    \
-        kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_sz);                                                    \
-  }                                                                                                                          \
-  dim3 grid(params.num_head, params.batch_size);                                                                             \
+#define MMHA_LAUNCH_KERNEL(                                               \
+    T, Dh, Dh_MAX, THDS_PER_KEY, THDS_PER_VALUE, THDS_PER_BLOCK, stream)  \
+  size_t smem_sz =                                                        \
+      smem_size_in_bytes<T>(params, Dh, THDS_PER_VALUE, THDS_PER_BLOCK);  \
+  constexpr auto kernel_fn =                                              \
+      masked_multihead_attention_kernel<T,                                \
+                                        Dh,                               \
+                                        Dh_MAX,                           \
+                                        THDS_PER_KEY,                     \
+                                        THDS_PER_VALUE,                   \
+                                        THDS_PER_BLOCK>;                  \
+  if (smem_sz > 0xc000) {                                                 \
+    cudaFuncSetAttribute(                                                 \
+        kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_sz); \
+  }                                                                       \
+  dim3 grid(params.num_head, params.batch_size);                          \
   kernel_fn<<<grid, THDS_PER_BLOCK, smem_sz, stream>>>(params)
 
 template <typename T, int Dh, int Dh_MAX>
@@ -1254,7 +1268,8 @@ void fmha(const phi::GPUContext &dev_ctx,
   }
 
   if (beam_cache_offset_tensor) {
-    // LOG(INFO) << "beam_cache_offset_tensor.dims: " << beam_cache_offset_tensor->dims().to_str();
+    // LOG(INFO) << "beam_cache_offset_tensor.dims: " <<
+    // beam_cache_offset_tensor->dims().to_str();
     params.beam_cache_offset = beam_cache_offset_tensor->data<int>();
   }
 
@@ -1341,7 +1356,7 @@ __global__ void write_cache_k_kernel(T *cache_k,
   if (seq_lens && seq_lens[bi] == 0) {
     return;
   }
-  
+
   const int hi = blockIdx.z;
   constexpr int X_ELEMS = VEC_16B / sizeof(T);
 
@@ -1453,12 +1468,17 @@ void write_cache_kv(const phi::GPUContext &dev_ctx,
                     const int seq_len,
                     const int max_seq_len,
                     const int dim_head) {
-  write_cache_kv(dev_ctx, 
-                 cache_k, 
-                 cache_v, 
-                 k, v, nullptr, 
-                 bsz, num_head, seq_len, 
-                 max_seq_len, dim_head);
+  write_cache_kv(dev_ctx,
+                 cache_k,
+                 cache_v,
+                 k,
+                 v,
+                 nullptr,
+                 bsz,
+                 num_head,
+                 seq_len,
+                 max_seq_len,
+                 dim_head);
 }
 
 template <typename T, int VecSize, bool ComputeBias>
@@ -1795,10 +1815,10 @@ __global__ void InitOutValueKernel(T *output_data,
   int64_t global_thread_idx = bid * blockDim.x + tid;
 
   for (int linear_index = global_thread_idx * VecSize,
-               step = gridDim.x * blockDim.x * VecSize;
+           step = gridDim.x * blockDim.x * VecSize;
        linear_index < numel;
        linear_index += step) {
-    for (int i = 0; i < VecSize; i ++) {
+    for (int i = 0; i < VecSize; i++) {
       output_data[linear_index + i] = init_value;
     }
   }
@@ -1810,18 +1830,18 @@ void InitValue(const phi::GPUContext &dev_ctx,
                const int64_t numel,
                const T init_value) {
   constexpr int PackSize = VEC_16B / sizeof(T);
-  PADDLE_ENFORCE_EQ(numel % PackSize,
-                    0,
-                    platform::errors::PreconditionNotMet(
-                        "numel=%d must be divisible by vec_size=%d",
-                        numel,
-                        PackSize));
+  PADDLE_ENFORCE_EQ(
+      numel % PackSize,
+      0,
+      platform::errors::PreconditionNotMet(
+          "numel=%d must be divisible by vec_size=%d", numel, PackSize));
   const int pack_num = numel / PackSize;
   const int blocksize = 128;
   int grid_size = 1;
   GetNumBlocks(pack_num, &grid_size);
-  InitOutValueKernel<T, PackSize><<<grid_size, blocksize, 0, dev_ctx.stream()>>>(
-      output_data, numel, init_value);
+  InitOutValueKernel<T, PackSize>
+      <<<grid_size, blocksize, 0, dev_ctx.stream()>>>(
+          output_data, numel, init_value);
 }
 
 template <typename T, typename Functor, int VecSize>
@@ -1922,6 +1942,91 @@ class FFNGluHelper {
   int hid_dim_;
   int dim_ffn_;
   int dim_embed_;
+};
+
+template <typename T>
+class FFNSparseLtGluHelper {
+ public:
+  FFNSparseLtGluHelper(const phi::GPUContext &dev_ctx,
+                       const std::string &act_method,
+                       int padding_token_num,
+                       int token_num,
+                       int hid_dim,
+                       int dim_ffn,
+                       int dim_embed)
+      : dev_ctx_(dev_ctx),
+        act_method_(act_method),
+        padding_token_num_(padding_token_num),
+        token_num_(token_num),
+        hid_dim_(hid_dim),
+        dim_ffn_(dim_ffn),
+        dim_embed_(dim_embed) {
+    attn_linear_computel =
+        std::shared_ptr<AttnCuSparseMatMul<T>>(new AttnCuSparseMatMul<T>(
+            dev_ctx_, padding_token_num_, dim_ffn_, dim_embed_, true));
+  }
+
+  void reset(int padding_token_num, int token_num) {
+    token_num_ = token_num;
+    padding_token_num_ = padding_token_num;
+    attn_linear_computel->reset(padding_token_num_);
+  }
+
+  // dst = act(fc(src[0]) + bias) * src[1]
+  void Compute(const phi::DenseTensor *input,
+               const void *weight,
+               const phi::DenseTensor *bias,
+               phi::DenseTensor *bias_out,
+               phi::DenseTensor *output) {
+    // input's shape [token_num, dim_ffn], bias' shape [dim_ffn]
+    // output's shape [token_num, hid_dim], bias_out's shape [token_num,
+    // dim_ffn]
+    attn_linear_computel->ComputeForward(
+        weight, input, bias, bias_out, bias_out);
+
+    using Functor = GeluFunctor<T>;
+
+    Functor functor;
+    constexpr int VecSize = 16;
+    constexpr int PackSize = VecSize / sizeof(T);
+    const int elem_cnt = token_num_ * hid_dim_;
+    const int blocksize = 128;
+    int grid_size = 1;
+    switch (hid_dim_ % PackSize) {
+      case 0:
+        GetNumBlocks(elem_cnt / PackSize, &grid_size);
+        ActFFNGlu<T, Functor, PackSize>
+            <<<grid_size, blocksize, 0, dev_ctx_.stream()>>>(
+                bias_out->data<T>(),
+                output->data<T>(),
+                functor,
+                token_num_,
+                hid_dim_,
+                elem_cnt);
+        break;
+      default:
+        GetNumBlocks(elem_cnt, &grid_size);
+        ActFFNGlu<T, Functor, 1>
+            <<<grid_size, blocksize, 0, dev_ctx_.stream()>>>(
+                bias_out->data<T>(),
+                output->data<T>(),
+                functor,
+                token_num_,
+                hid_dim_,
+                elem_cnt);
+        break;
+    }
+  }
+
+ private:
+  const phi::GPUContext &dev_ctx_;
+  std::string act_method_;
+  int padding_token_num_;
+  int token_num_;
+  int hid_dim_;
+  int dim_ffn_;
+  int dim_embed_;
+  std::shared_ptr<AttnCuSparseMatMul<T>> attn_linear_computel = nullptr;
 };
 
 }  // namespace

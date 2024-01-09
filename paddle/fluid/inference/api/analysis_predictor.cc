@@ -49,6 +49,7 @@
 #include "paddle/fluid/inference/utils/model_utils.h"
 #include "paddle/fluid/inference/utils/singleton.h"
 #include "paddle/fluid/memory/memcpy.h"
+#include "paddle/fluid/operators/fused/cusparseLt.h"
 #include "paddle/fluid/platform/cpu_helper.h"
 #include "paddle/fluid/platform/device/gpu/gpu_info.h"
 #include "paddle/fluid/platform/device_context.h"
@@ -435,6 +436,8 @@ void AnalysisPredictor::InitDeviceContexts() {
           gpu_context->SetSolverHandle(
               gpu_resource->GetSolverDnHandleCreator());
           gpu_context->SetSparseHandle(gpu_resource->GetSparseHandleCreator());
+          gpu_context->SetSparseLtHandle(
+                 gpu_resource->GetSparseLtHandleCreator());
           gpu_context->SetEigenDevice(gpu_resource->GetGpuEigenDeviceCreator());
           gpu_context->SetComputeCapability(
               gpu_resource->GetGpuComputeCapability());
@@ -447,6 +450,10 @@ void AnalysisPredictor::InitDeviceContexts() {
               gpu_resource->GetGPUMultiProcessors());
           gpu_context->SetDriverVersion(gpu_resource->GetGpuDriverVersion());
           gpu_context->SetRuntimeVersion(gpu_resource->GetGpuRuntimeVersion());
+          paddle::operators::WeightCache::Instance().init(
+              place_,
+              phi::Stream(
+                  reinterpret_cast<phi::StreamId>(gpu_resource->GetStream())));
           VLOG(1) << "thread id is " << std::this_thread::get_id()
                   << ", stream id is "
                   << reinterpret_cast<void *>(gpu_resource->GetStream())

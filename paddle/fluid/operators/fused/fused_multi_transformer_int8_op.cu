@@ -15,24 +15,24 @@ limitations under the License. */
 #include "paddle/fluid/operators/fused/attn_gemm_int8.h"
 #include "paddle/fluid/operators/fused/fused_multi_transformer_op.h"
 #include "paddle/fluid/operators/fused/layernorm_quant_dequant.h"
-
+DECLARE_bool(is_w_prune);
+DECLARE_double(scale_for_w_prune);
 // DECLARE_int32(debug_layer_id);
 
 namespace paddle {
 namespace operators {
-// #define _DEBUG_FUSED_MULTI_TRANSFORMER
 
 template <typename T>
-static void PrintMatrix(const T* mat_d, int num, std::string name) {
+static void PrintMatrix(const T *mat_d, int num, std::string name) {
   std::vector<T> tmp(num);
   cudaMemcpy(tmp.data(), mat_d, sizeof(T) * num, cudaMemcpyDeviceToHost);
 
   std::ofstream outfile;
-  outfile.open(name+".txt", std::ios::out);
+  outfile.open(name + ".txt", std::ios::out);
   std::stringstream ss;
 
   for (int i = 0; i < num; ++i) {
-    if(std::is_same<T, int8_t>::value) {
+    if (std::is_same<T, int8_t>::value) {
       ss << static_cast<int>(tmp[i]) << std::endl;
     } else {
       ss << std::setprecision(8) << tmp[i] << std::endl;
@@ -129,6 +129,11 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
     if (token_num == 0) {
       return;
     }
+    auto padding_token_num = token_num;
+    padding_token_num =
+        (padding_token_num % 16 == 0)
+            ? padding_token_num
+            : (padding_token_num + 16 - (padding_token_num % 16));
 
     auto *padding_offset_data =
         encoder_remove_padding ? padding_offset_tensor.data<int>() : nullptr;
@@ -165,6 +170,14 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
     // (transA, transB, compute_bias) = (false, trans_qkvw, false)
     AttnMatmulINT8<T> qkv_compute(
         dev_ctx, token_num, output_size, input_size, false /*compute_bias*/);
+    AttnCuSparseMatmulINT8<T> qkv_sparselt_compute(
+        dev_ctx,
+        padding_token_num,
+        token_num,
+        output_size,
+        input_size,
+        false,
+        (0.125f / FLAGS_scale_for_w_prune));
     phi::DenseTensor qkv_out;
     qkv_out.Resize({{token_num, 3, num_head, dim_head}});
     auto *qkv_out_data =
@@ -183,7 +196,7 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
     auto cache_kvs = ctx.MultiInput<phi::DenseTensor>("CacheKV");
     auto cache_kv_outs = ctx.MultiOutput<phi::DenseTensor>("CacheKVOut");
     // auto *time_step = ctx.Input<phi::DenseTensor>("TimeStep");
-    
+
     auto pre_caches = ctx.MultiInput<phi::DenseTensor>("PreCaches");
     int cache_offset = 0;
     if (pre_caches.size() > 0) {
@@ -209,8 +222,14 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
         &kv_transpose_out, kv_transpose_out.numel() * sizeof(T));
 
     if (encoder_remove_padding) {
-      InitValue(dev_ctx, q_transpose_out_data, q_transpose_out.numel(), static_cast<T>(0.));
-      InitValue(dev_ctx, kv_transpose_out_data, kv_transpose_out.numel(), static_cast<T>(0.));
+      InitValue(dev_ctx,
+                q_transpose_out_data,
+                q_transpose_out.numel(),
+                static_cast<T>(0.));
+      InitValue(dev_ctx,
+                kv_transpose_out_data,
+                kv_transpose_out.numel(),
+                static_cast<T>(0.));
     }
 
     qk_out.Resize({{bsz, num_head, seq_len, out_seq_len}});
@@ -256,7 +275,14 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
     // (transA, transB, compute_bias) = (false, false, false)
     AttnMatmulINT8<T> out_linear_compute(
         dev_ctx, token_num, dim_embed, hidden_size, false);
-
+    AttnCuSparseMatmulINT8<T> out_sparselt_linear_compute(
+        dev_ctx,
+        padding_token_num,
+        token_num,
+        dim_embed,
+        hidden_size,
+        false,
+        (0.0625f / FLAGS_scale_for_w_prune));
     // 5. ln(residual + bias)
     DropoutParam dropout_param2(true, 0, true, true, 0.0, nullptr, 0);
     FusedDropoutLayerNormHelper<T, uint8_t, int32_t, int8_t>
@@ -269,7 +295,7 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
         fused_dropout_layernorm_helper_for_post_layernorm(
             dev_ctx, token_num, dim_embed, dropout_param2, epsilon);
 
-    using LayerNormComputeType = float; 
+    using LayerNormComputeType = float;
     auto ffn_ln_scales = ctx.MultiInput<phi::DenseTensor>("FFNLnScale");
     auto ffn_ln_biases = ctx.MultiInput<phi::DenseTensor>("FFNLnBias");
     phi::DenseTensor bias_dropout_residual_out, dropout_mask_out;
@@ -290,6 +316,15 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
     int dim_ffn = ffn1_weight_dim[0];
     AttnMatmulINT8<T> ffn1_linear_compute(
         dev_ctx, token_num, dim_ffn, dim_embed, false);
+    AttnCuSparseMatmulINT8<T> ffn1_sparselt_linear_compute(
+        dev_ctx,
+        padding_token_num,
+        token_num,
+        dim_ffn,
+        dim_embed,
+        false,
+        (0.125f / FLAGS_scale_for_w_prune));
+
     phi::DenseTensor ffn1_out;
     ffn1_out.Resize({{token_num, dim_ffn}});
     auto *ffn1_out_data =
@@ -297,6 +332,9 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
 
     // 7. ffn act + bias
     DropoutParam ffn1_dropout_param(true, 0, true, true, 0.0, nullptr, 0);
+    FusedDropoutHelper<T, uint8_t, phi::dtype::float16, int8_t>
+        fused_act_dropout_helper_fp16(
+            dev_ctx, token_num, dim_ffn, ffn1_dropout_param);
     FusedDropoutHelper<T, uint8_t, int32_t, int8_t> fused_act_dropout_helper(
         dev_ctx, token_num, dim_ffn, ffn1_dropout_param);
     FusedDropoutHelper<T, uint8_t> fused_act_dropout_helper_for_post_layernorm(
@@ -305,7 +343,7 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
     ffn1_dropout_out.Resize({{token_num, dim_ffn}});
     auto *ffn1_dropout_out_data = dev_ctx.Alloc<T>(
         &ffn1_dropout_out, ffn1_dropout_out.numel() * sizeof(T));
-    uint8_t * ffn1_dropout_mask_data = nullptr;
+    uint8_t *ffn1_dropout_mask_data = nullptr;
 
     // 8. ffn2 matmul
     auto ffn2_weights = ctx.MultiInput<phi::DenseTensor>("FFN2Weight");
@@ -313,10 +351,21 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
     AttnMatmulINT8<T> ffn2_linear_compute(
         dev_ctx, token_num, dim_embed, dim_ffn, false);
 
+    AttnCuSparseMatmulINT8<T> ffn2_sparselt_linear_compute(
+        dev_ctx,
+        padding_token_num,
+        token_num,
+        dim_embed,
+        dim_ffn,
+        false,
+        (0.125f / FLAGS_scale_for_w_prune));
     // 9. ffn2 residual bias
     DropoutParam ffn2_dropout_param(true, 0, true, true, 0.0, nullptr, 0);
     FusedDropoutLayerNormHelper<T, uint8_t, int32_t, int8_t>
         ffn2_fused_dropout_helper(
+            dev_ctx, token_num, dim_embed, ffn2_dropout_param, epsilon);
+    FusedDropoutLayerNormHelper<T, uint8_t, phi::dtype::float16, T>
+        ffn2_fused_dropout_dequant_helper_fp16(
             dev_ctx, token_num, dim_embed, ffn2_dropout_param, epsilon);
     FusedDropoutLayerNormHelper<T, uint8_t, int32_t, T>
         ffn2_fused_dropout_dequant_helper(
@@ -324,21 +373,106 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
     FusedDropoutLayerNormHelper<T, uint8_t>
         ffn2_fused_dropout_helper_for_post_layernorm(
             dev_ctx, token_num, dim_embed, ffn2_dropout_param, epsilon);
+    int layers = qkv_weights.size();
+    thread_local static bool w_compress = false;
+    auto qkv_names = ctx.InputNames("QKVW");
+    auto out_linear_names = ctx.InputNames("OutLinearW");
+    auto ffn1_names = ctx.InputNames("FFN1Weight");
+    auto ffn2_names = ctx.InputNames("FFN2Weight");
+    if (FLAGS_is_w_prune && w_compress == false) {
+      auto deleted_w = memory::AllocShared(
+          dev_ctx.GetPlace(),
+          16,
+          phi::Stream(reinterpret_cast<phi::StreamId>(dev_ctx.stream())));
+      for (int i = 0; i < layers; ++i) {
+        VLOG(0) << " start compress " << qkv_names[i];
+        auto qkv_weight = const_cast<phi::DenseTensor *>(qkv_weights[i]);
+        WeightCache::Instance().create_compress_weight_int8(
+            (*qkv_weight),
+            dev_ctx.cusparselt_handle(),
+            qkv_names[i],
+            output_size,
+            input_size);
+        qkv_weight->reset_data(deleted_w);  // trick to delete the ori w
+        qkv_sparselt_compute.scale(
+            const_cast<float *>(qkv_out_scales[i]->data<float>()),
+            8.0f * FLAGS_scale_for_w_prune,
+            qkv_out_scales[i]->numel());
+
+        VLOG(0) << " start compress " << out_linear_names[i];
+        auto out_linear_weight =
+            const_cast<phi::DenseTensor *>(out_linear_weights[i]);
+        WeightCache::Instance().create_compress_weight_int8(
+            *out_linear_weight,
+            dev_ctx.cusparselt_handle(),
+            out_linear_names[i],
+            dim_embed,
+            hidden_size);
+        out_linear_weight->reset_data(deleted_w);
+
+        out_sparselt_linear_compute.scale(
+            const_cast<float *>(out_linear_out_scales[i]->data<float>()),
+            16.0f * FLAGS_scale_for_w_prune,
+            out_linear_out_scales[i]->numel());
+
+        VLOG(0) << " start compress " << ffn1_names[i];
+        auto ffn1_weight = const_cast<phi::DenseTensor *>(ffn1_weights[i]);
+        WeightCache::Instance().create_compress_weight_int8(
+            *ffn1_weight,
+            dev_ctx.cusparselt_handle(),
+            ffn1_names[i],
+            dim_ffn,
+            dim_embed);
+        ffn1_weight->reset_data(deleted_w);  // trick to delete the ori w
+        ffn1_sparselt_linear_compute.scale(
+            const_cast<float *>(ffn1_out_scales[i]->data<float>()),
+            8.0f * FLAGS_scale_for_w_prune,
+            ffn1_out_scales[i]->numel());
+
+        VLOG(0) << "start compress" << ffn2_names[i];
+        auto ffn2_weight = const_cast<phi::DenseTensor *>(ffn2_weights[i]);
+        WeightCache::Instance().create_compress_weight_int8(
+            *ffn2_weight,
+            dev_ctx.cusparselt_handle(),
+            ffn2_names[i],
+            dim_embed,
+            dim_ffn);
+        ffn2_weight->reset_data(deleted_w);  // trick to delete the ori w
+        ffn2_sparselt_linear_compute.scale(
+            const_cast<float *>(ffn2_out_scales[i]->data<float>()),
+            8.0f * FLAGS_scale_for_w_prune,
+            ffn2_out_scales[i]->numel());
+      }
+    }
+    w_compress = true;
 
     // []. init workspace for cublasLt transform
     phi::DenseTensor input_workspace, output_workspace, cublaslt_workspace;
     // for input and output transform data is CUBLASLT_ORDER_COL32 format,
-    int m_max = token_num, k_max = std::max(dim_embed, dim_ffn),
+    int m_max = padding_token_num, k_max = std::max(dim_embed, dim_ffn),
         n_max = std::max({output_size, dim_embed, dim_ffn});
-
     input_workspace.Resize({{(m_max * k_max + 31) / 32 * 32}});
     dev_ctx.Alloc<int8_t>(&input_workspace,
                           input_workspace.numel() * sizeof(int8_t));
+    /*
+    for int8 all ori value is legal, not need memset to 0 for padding data
+    if (padding_token_num != token_num) {
+      PADDLE_ENFORCE_GPU_SUCCESS(cudaMemsetAsync(input_workspace.data<int8_t>(),
+                                                 0,
+                                                 input_workspace.numel(),
+                                                 dev_ctx.stream()));
+    }
+    */
 
     output_workspace.Resize({{(n_max * m_max + 31) / 32 * 32}});
-    dev_ctx.Alloc<int32_t>(&output_workspace,
-                           output_workspace.numel() * sizeof(int32_t));
-
+    if (!FLAGS_is_w_prune) {
+      dev_ctx.Alloc<int32_t>(&output_workspace,
+                             output_workspace.numel() * sizeof(int32_t));
+    } else {
+      dev_ctx.Alloc<phi::dtype::float16>(
+          &output_workspace,
+          output_workspace.numel() * sizeof(phi::dtype::float16));
+    }
     cublaslt_workspace.Resize({{3000000}});
     dev_ctx.Alloc<int8_t>(&cublaslt_workspace,
                           cublaslt_workspace.numel() * sizeof(int8_t));
@@ -378,7 +512,6 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
     // step0:  x   --> buf1
     // step1: buf1 --> buf0
     // step2: buf0 --> buf1
-    int layers = qkv_weights.size();
     if (encoder_remove_padding) {
       // In the case of variable lengths, the padding needs to be rebuilt
       // eventually. So buf0 and buf1 do not need to be changed according to the
@@ -402,6 +535,7 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
         // TODO(wangxi): can remove mean var in inference
         // if (i == FLAGS_debug_layer_id)
         //   VLOG(2) << "fmt in " << *input_x;
+
         ln_compute.ComputeForward(x_data,
                                   ln_scale_data,
                                   ln_bias_data,
@@ -424,50 +558,99 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
           qkv_biases.size() > 0 ? qkv_biases[i] : nullptr;
       // NOTE: in decoder stage, bias is fused in fmha
       const phi::DenseTensor *bias = time_step ? nullptr : qkv_bias;
+
       if (!pre_layer_norm && i == 0) {
         const phi::DenseTensor *tmp_input_x =
             (encoder_remove_padding) ? &x_remove_padding : input_x;
-        qkv_compute.ComputeForward(qkv_weights[i],
-                                   tmp_input_x,
-                                   &input_workspace,
-                                   bias,
-                                   &qkv_out,
-                                   &output_workspace,
-                                   &qkv_out,
-                                   qkv_in_scale[i],
-                                   qkv_out_scales[i],
-                                   &cublaslt_workspace,
-                                   quant_round_type,
-                                   quant_max_bound,
-                                   quant_min_bound);
+        if (FLAGS_is_w_prune) {
+          auto qkv_weight = WeightCache::Instance().find_weight(qkv_names[i]);
+          qkv_sparselt_compute.ComputeForward(qkv_weight->data->ptr(),
+                                              tmp_input_x,
+                                              &input_workspace,
+                                              bias,
+                                              &qkv_out,
+                                              &output_workspace,
+                                              &qkv_out,
+                                              qkv_in_scale[i],
+                                              qkv_out_scales[i],
+                                              &cublaslt_workspace,
+                                              quant_round_type,
+                                              quant_max_bound,
+                                              quant_min_bound);
+        } else {
+          qkv_compute.ComputeForward(qkv_weights[i],
+                                     tmp_input_x,
+                                     &input_workspace,
+                                     bias,
+                                     &qkv_out,
+                                     &output_workspace,
+                                     &qkv_out,
+                                     qkv_in_scale[i],
+                                     qkv_out_scales[i],
+                                     &cublaslt_workspace,
+                                     quant_round_type,
+                                     quant_max_bound,
+                                     quant_min_bound);
+        }
       } else if (!pre_layer_norm) {
-        qkv_compute.ComputeForward(qkv_weights[i],
-                                   buf1,
-                                   &input_workspace,
-                                   bias,
-                                   &qkv_out,
-                                   &output_workspace,
-                                   &qkv_out,
-                                   qkv_in_scale[i],
-                                   qkv_out_scales[i],
-                                   &cublaslt_workspace,
-                                   quant_round_type,
-                                   quant_max_bound,
-                                   quant_min_bound);
+        if (FLAGS_is_w_prune) {
+          auto qkv_weight = WeightCache::Instance().find_weight(qkv_names[i]);
+          qkv_sparselt_compute.ComputeForward(qkv_weight->data->ptr(),
+                                              buf1,
+                                              &input_workspace,
+                                              bias,
+                                              &qkv_out,
+                                              &output_workspace,
+                                              &qkv_out,
+                                              qkv_in_scale[i],
+                                              qkv_out_scales[i],
+                                              &cublaslt_workspace,
+                                              quant_round_type,
+                                              quant_max_bound,
+                                              quant_min_bound);
+        } else {
+          qkv_compute.ComputeForward(qkv_weights[i],
+                                     buf1,
+                                     &input_workspace,
+                                     bias,
+                                     &qkv_out,
+                                     &output_workspace,
+                                     &qkv_out,
+                                     qkv_in_scale[i],
+                                     qkv_out_scales[i],
+                                     &cublaslt_workspace,
+                                     quant_round_type,
+                                     quant_max_bound,
+                                     quant_min_bound);
+        }
       } else {
         // if (i == FLAGS_debug_layer_id) {
         //   VLOG(2) << "qkv in " << input_workspace;
         //   VLOG(2) << "qkv weight " << *qkv_weights[i];
         // }
-        qkv_compute.ComputeForwardINT8ToT(qkv_weights[i],
-                                          qkv_in_scale[i],
-                                          &input_workspace,
-                                          bias,
-                                          &qkv_out,
-                                          &output_workspace,
-                                          &qkv_out,
-                                          qkv_out_scales[i],
-                                          &cublaslt_workspace);
+        if (FLAGS_is_w_prune) {
+          auto qkv_weight = WeightCache::Instance().find_weight(qkv_names[i]);
+          qkv_sparselt_compute.ComputeForwardINT8ToT(qkv_weight->data->ptr(),
+                                                     qkv_in_scale[i],
+                                                     &input_workspace,
+                                                     bias,
+                                                     &qkv_out,
+                                                     &output_workspace,
+                                                     &qkv_out,
+                                                     qkv_out_scales[i],
+                                                     &cublaslt_workspace);
+
+        } else {
+          qkv_compute.ComputeForwardINT8ToT(qkv_weights[i],
+                                            qkv_in_scale[i],
+                                            &input_workspace,
+                                            bias,
+                                            &qkv_out,
+                                            &output_workspace,
+                                            &qkv_out,
+                                            qkv_out_scales[i],
+                                            &cublaslt_workspace);
+        }
       }
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step2";
@@ -482,7 +665,7 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
 
       if (time_step) {  // generation decoder stage
         // [2, batch_size, num_head, max_seq_len, head_size]
-        
+
         int max_seq_len = cache_kv->dims()[3];
         fmha<T>(dev_ctx,
                 qkv_out,
@@ -511,7 +694,7 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
         phi::DenseTensor *src_mask_tmp =
             cache_offset > 0 ? &src_mask_out : nullptr;
         const int *sequence_lengths_data =
-              encoder_remove_padding ? sequence_lengths->data<int>() : nullptr;
+            encoder_remove_padding ? sequence_lengths->data<int>() : nullptr;
         qkv_bias_add_transpose_split<T>(dev_ctx,
                                         q_transpose_out_data,
                                         kv_transpose_out_data,
@@ -546,20 +729,20 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
         phi::DenseTensor *tmp_padding_offset_tensor =
             encoder_remove_padding ? &padding_offset_tensor : nullptr;
         fmha_compute.ComputeForwardWithoutTranspose(pre_cache_kv_tensor,
-                                                  src_mask,
-                                                  tmp_padding_offset_tensor,
-                                                  &q_transpose_out,
-                                                  &kv_transpose_out,
-                                                  pre_cache_kv_out_tmp,
-                                                  &qk_out,
-                                                  src_mask_tmp,
-                                                  &softmax_out,
-                                                  &attn_dropout_mask_out,
-                                                  &attn_dropout_out,
-                                                  &qktv_out,
-                                                  &fmha_out,
-                                                  token_num);
-        
+                                                    src_mask,
+                                                    tmp_padding_offset_tensor,
+                                                    &q_transpose_out,
+                                                    &kv_transpose_out,
+                                                    pre_cache_kv_out_tmp,
+                                                    &qk_out,
+                                                    src_mask_tmp,
+                                                    &softmax_out,
+                                                    &attn_dropout_mask_out,
+                                                    &attn_dropout_out,
+                                                    &qktv_out,
+                                                    &fmha_out,
+                                                    token_num);
+
         const T *k_ptr = nullptr;
         const T *v_ptr = nullptr;
 
@@ -634,60 +817,100 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
         phi::DenseTensor *tmp_padding_offset_tensor =
             encoder_remove_padding ? &padding_offset_tensor : nullptr;
         fmha_compute.ComputeForwardWithoutTranspose(cache_kv,
-                                                  src_mask,
-                                                  tmp_padding_offset_tensor,
-                                                  &q_transpose_out,
-                                                  &kv_transpose_out,
-                                                  cache_kv_out,
-                                                  &qk_out,
-                                                  nullptr,
-                                                  &softmax_out,
-                                                  &attn_dropout_mask_out,
-                                                  &attn_dropout_out,
-                                                  &qktv_out,
-                                                  &fmha_out,
-                                                  token_num);
+                                                    src_mask,
+                                                    tmp_padding_offset_tensor,
+                                                    &q_transpose_out,
+                                                    &kv_transpose_out,
+                                                    cache_kv_out,
+                                                    &qk_out,
+                                                    nullptr,
+                                                    &softmax_out,
+                                                    &attn_dropout_mask_out,
+                                                    &attn_dropout_out,
+                                                    &qktv_out,
+                                                    &fmha_out,
+                                                    token_num);
       }
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step3";
 #endif
-
       if (pre_layer_norm) {
-        out_linear_compute.ComputeForwardTToINT8(out_linear_weights[i],
-                                                 out_linear_in_scale[i],
-                                                 &fmha_out,
-                                                 &input_workspace,
-                                                 nullptr,
-                                                 &output_workspace,
-                                                 nullptr,
-                                                 &cublaslt_workspace,
-                                                 quant_round_type,
-                                                 quant_max_bound,
-                                                 quant_min_bound);
-        AllReduce<int32_t>(output_workspace,
-                           ring_id,
-                           bsz * seq_len * num_head * dim_head,
-                           dev_ctx);
+        if (FLAGS_is_w_prune) {
+          auto out_linear_weight =
+              WeightCache::Instance().find_weight(out_linear_names[i]);
+          out_sparselt_linear_compute.ComputeForwardTToINT8(
+              out_linear_weight->data->ptr(),
+              out_linear_in_scale[i],
+              &fmha_out,
+              &input_workspace,
+              nullptr,
+              &output_workspace,
+              nullptr,
+              &cublaslt_workspace,
+              quant_round_type,
+              quant_max_bound,
+              quant_min_bound);
+          AllReduce<phi::dtype::float16>(output_workspace,
+                                         ring_id,
+                                         bsz * seq_len * num_head * dim_head,
+                                         dev_ctx);
+
+        } else {
+          out_linear_compute.ComputeForwardTToINT8(out_linear_weights[i],
+                                                   out_linear_in_scale[i],
+                                                   &fmha_out,
+                                                   &input_workspace,
+                                                   nullptr,
+                                                   &output_workspace,
+                                                   nullptr,
+                                                   &cublaslt_workspace,
+                                                   quant_round_type,
+                                                   quant_max_bound,
+                                                   quant_min_bound);
+          AllReduce<int32_t>(output_workspace,
+                             ring_id,
+                             bsz * seq_len * num_head * dim_head,
+                             dev_ctx);
+        }
         // if (i == FLAGS_debug_layer_id) {
-        //   VLOG(2) << "fmha_out " << fmha_out;      
-        //   VLOG(2) << "out_linear weight " << *out_linear_weights[i];   
+        //   VLOG(2) << "fmha_out " << fmha_out;
+        //   VLOG(2) << "out_linear weight " << *out_linear_weights[i];
         //   VLOG(2) << out_linear_in_scale[i];
-        //   VLOG(2) << "out_linear_out " << output_workspace;    
-        // }              
+        //   VLOG(2) << "out_linear_out " << output_workspace;
+        // }
       } else {
-        out_linear_compute.ComputeForward(out_linear_weights[i],
-                                          &fmha_out,
-                                          &input_workspace,
-                                          nullptr,
-                                          buf0,
-                                          &output_workspace,
-                                          nullptr,
-                                          out_linear_in_scale[i],
-                                          out_linear_out_scales[i],
-                                          &cublaslt_workspace,
-                                          quant_round_type,
-                                          quant_max_bound,
-                                          quant_min_bound);
+        if (FLAGS_is_w_prune) {
+          auto out_linear_weight =
+              WeightCache::Instance().find_weight(out_linear_names[i]);
+          out_sparselt_linear_compute.ComputeForward(
+              out_linear_weight->data->ptr(),
+              &fmha_out,
+              &input_workspace,
+              nullptr,
+              buf0,
+              &output_workspace,
+              nullptr,
+              out_linear_in_scale[i],
+              out_linear_out_scales[i],
+              &cublaslt_workspace,
+              quant_round_type,
+              quant_max_bound,
+              quant_min_bound);
+        } else {
+          out_linear_compute.ComputeForward(out_linear_weights[i],
+                                            &fmha_out,
+                                            &input_workspace,
+                                            nullptr,
+                                            buf0,
+                                            &output_workspace,
+                                            nullptr,
+                                            out_linear_in_scale[i],
+                                            out_linear_out_scales[i],
+                                            &cublaslt_workspace,
+                                            quant_round_type,
+                                            quant_max_bound,
+                                            quant_min_bound);
+        }
         AllReduce<T>(*buf0, ring_id, buf0->numel(), dev_ctx);
       }
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
@@ -700,61 +923,63 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
         auto *ln_scale_data = ffn_ln_scales[i]->data<U>();
         auto *ln_bias_data = ffn_ln_biases[i]->data<U>();
         auto *out_linear_bias_data = out_linear_biases[i]->data<T>();
-
-        
-
-        // inplace
-        // non-inplace: buf1 -> input_workspace
-        // fused_dropout_layernorm_helper.LayernormResidualDropoutBias(
-        //     dev_ctx,
-        //     output_workspace.data<int32_t>(),
-        //     x_data,
-        //     out_linear_bias_data,
-        //     ln_scale_data,
-        //     ln_bias_data,
-        //     bias_dropout_residual_out_data,
-        //     dropout_mask_out_data,
-        //     input_workspace.data<int8_t>(),
-        //     ln_mean_data,
-        //     ln_var_data,
-        //     out_linear_in_scale[i],
-        //     out_linear_out_scales[i]->data<float>(),
-        //     ffn1_in_scale[i],
-        //     quant_round_type,
-        //     quant_max_bound,
-        //     quant_min_bound);
-        
-        // phi::DenseTensor ffn_ln_out;
-        // ffn_ln_out.Resize(input_x->dims());
-        // dev_ctx.Alloc<T>(&ffn_ln_out);
-
-        // fused_dropout_layernorm_helper_just_dequant.LayernormResidualDropoutBias(
-        //     dev_ctx,
-        //     output_workspace.data<int32_t>(),
-        //     x_data,
-        //     out_linear_bias_data,
-        //     ln_scale_data,
-        //     ln_bias_data,
-        //     bias_dropout_residual_out_data,
-        //     dropout_mask_out_data,
-        //     ffn_ln_out.data<T>(),
-        //     ln_mean_data,
-        //     ln_var_data,
-        //     out_linear_in_scale[i],
-        //     out_linear_out_scales[i]->data<float>(),
-        //     ffn1_in_scale[i],
-        //     quant_round_type,
-        //     quant_max_bound,
-        //     quant_min_bound);
-        //   LaunchQuantActKernel<T>(ffn_ln_out.data<T>(), bsz_seq, dim_embed, input_workspace.data<int8_t>(), ffn1_in_scale[i], quant_max_bound, quant_min_bound, dev_ctx.stream());
-
-        // VLOG(1) << "RIGHT out " << input_workspace;
-        // DequantSkipLoad<int32_t, T, T> load(output_workspace.data<int32_t>(), out_linear_bias_data, x_data, out_linear_out_scales[i]->data<float>(), 0.0f, dim_embed);
-        DequantSkipLoadAndStoreResidual<int32_t, T, T, true> load(output_workspace.data<int32_t>(), out_linear_bias_data, x_data, 
-                                                                out_linear_out_scales[i]->data<float>(), bias_dropout_residual_out_data, 0.0f, dim_embed);
-        AffineQuantStore<int8_t, LayerNormComputeType, T, true, true> store(input_workspace.data<int8_t>(), dim_embed, 
-                                                                          ln_scale_data, ln_bias_data, ffn1_in_scale[i], quant_round_type, quant_max_bound, quant_min_bound);
-        DispatchLayerNorm<decltype(load), decltype(store), LayerNormComputeType>(dev_ctx.stream(), load, store, token_num, dim_embed, epsilon, ln_mean_data, ln_var_data);
+        if (FLAGS_is_w_prune) {
+          DequantSkipLoadAndStoreResidual<phi::dtype::float16, T, T, true> load(
+              output_workspace.data<phi::dtype::float16>(),
+              out_linear_bias_data,
+              x_data,
+              out_linear_out_scales[i]->data<float>(),
+              bias_dropout_residual_out_data,
+              0.0f,
+              dim_embed);
+          AffineQuantStore<int8_t, LayerNormComputeType, T, true, true> store(
+              input_workspace.data<int8_t>(),
+              dim_embed,
+              ln_scale_data,
+              ln_bias_data,
+              ffn1_in_scale[i],
+              quant_round_type,
+              quant_max_bound,
+              quant_min_bound);
+          DispatchLayerNorm<decltype(load),
+                            decltype(store),
+                            LayerNormComputeType>(dev_ctx.stream(),
+                                                  load,
+                                                  store,
+                                                  token_num,
+                                                  dim_embed,
+                                                  epsilon,
+                                                  ln_mean_data,
+                                                  ln_var_data);
+        } else {
+          DequantSkipLoadAndStoreResidual<int32_t, T, T, true> load(
+              output_workspace.data<int32_t>(),
+              out_linear_bias_data,
+              x_data,
+              out_linear_out_scales[i]->data<float>(),
+              bias_dropout_residual_out_data,
+              0.0f,
+              dim_embed);
+          AffineQuantStore<int8_t, LayerNormComputeType, T, true, true> store(
+              input_workspace.data<int8_t>(),
+              dim_embed,
+              ln_scale_data,
+              ln_bias_data,
+              ffn1_in_scale[i],
+              quant_round_type,
+              quant_max_bound,
+              quant_min_bound);
+          DispatchLayerNorm<decltype(load),
+                            decltype(store),
+                            LayerNormComputeType>(dev_ctx.stream(),
+                                                  load,
+                                                  store,
+                                                  token_num,
+                                                  dim_embed,
+                                                  epsilon,
+                                                  ln_mean_data,
+                                                  ln_var_data);
+        }
         VLOG(1) << "WRONG out " << input_workspace;
 
       } else {
@@ -777,57 +1002,101 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
       }
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step5";
-#endif     
+#endif
       // if (i == FLAGS_debug_layer_id)
-      //   VLOG(2) << "ffn1_in " << input_workspace;    
+      //   VLOG(2) << "ffn1 in " << input_workspace;
 
       // step6. ffn matmul1
 
-      if (pre_layer_norm) {
-        ffn1_linear_compute.ComputeForwardINT8ToINT8(ffn1_weights[i],
-                                                     &input_workspace,
-                                                     nullptr,
-                                                     &output_workspace,
-                                                     nullptr,
-                                                     &cublaslt_workspace);
+      if (FLAGS_is_w_prune) {
+        auto ffn1_weight = WeightCache::Instance().find_weight(ffn1_names[i]);
+        if (pre_layer_norm) {
+          ffn1_sparselt_linear_compute.ComputeForwardINT8ToINT8(
+              ffn1_weight->data->ptr(),
+              &input_workspace,
+              nullptr,
+              &output_workspace,
+              nullptr,
+              &cublaslt_workspace);
+        } else {
+          ffn1_sparselt_linear_compute.ComputeForward(ffn1_weight->data->ptr(),
+                                                      buf1,
+                                                      &input_workspace,
+                                                      nullptr,
+                                                      &ffn1_out,
+                                                      &output_workspace,
+                                                      nullptr,
+                                                      ffn1_in_scale[i],
+                                                      ffn1_out_scales[i],
+                                                      &cublaslt_workspace,
+                                                      quant_round_type,
+                                                      quant_max_bound,
+                                                      quant_min_bound);
+        }
       } else {
-        ffn1_linear_compute.ComputeForward(ffn1_weights[i],
-                                           buf1,
-                                           &input_workspace,
-                                           nullptr,
-                                           &ffn1_out,
-                                           &output_workspace,
-                                           nullptr,
-                                           ffn1_in_scale[i],
-                                           ffn1_out_scales[i],
-                                           &cublaslt_workspace,
-                                           quant_round_type,
-                                           quant_max_bound,
-                                           quant_min_bound);
+        if (pre_layer_norm) {
+          ffn1_linear_compute.ComputeForwardINT8ToINT8(ffn1_weights[i],
+                                                       &input_workspace,
+                                                       nullptr,
+                                                       &output_workspace,
+                                                       nullptr,
+                                                       &cublaslt_workspace);
+        } else {
+          ffn1_linear_compute.ComputeForward(ffn1_weights[i],
+                                             buf1,
+                                             &input_workspace,
+                                             nullptr,
+                                             &ffn1_out,
+                                             &output_workspace,
+                                             nullptr,
+                                             ffn1_in_scale[i],
+                                             ffn1_out_scales[i],
+                                             &cublaslt_workspace,
+                                             quant_round_type,
+                                             quant_max_bound,
+                                             quant_min_bound);
+        }
       }
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step6";
 #endif
       // if (i == FLAGS_debug_layer_id)
-      //   VLOG(2) << "ffn1 out " << output_workspace;    
+      //   VLOG(2) << "ffn1 out " << output_workspace;
 
       // step7. act bias
       // TODO(wangxi): remove dropout mask in inference
       if (pre_layer_norm) {
-        fused_act_dropout_helper.DropoutActBias(
-            dev_ctx,
-            output_workspace.data<int32_t>(),
-            ffn1_biases[i]->data<T>(),
-            "gelu",
-            input_workspace.data<int8_t>(),
-            ffn1_dropout_mask_data,
-            ffn1_in_scale[i],
-            ffn1_out_scales[i]->data<float>(),
-            0,
-            ffn2_in_scale[i],
-            quant_round_type,
-            quant_max_bound,
-            quant_min_bound);
+        if (!FLAGS_is_w_prune) {
+          fused_act_dropout_helper.DropoutActBias(
+              dev_ctx,
+              output_workspace.data<int32_t>(),
+              ffn1_biases[i]->data<T>(),
+              "gelu",
+              input_workspace.data<int8_t>(),
+              ffn1_dropout_mask_data,
+              ffn1_in_scale[i],
+              ffn1_out_scales[i]->data<float>(),
+              0,
+              ffn2_in_scale[i],
+              quant_round_type,
+              quant_max_bound,
+              quant_min_bound);
+        } else {
+          fused_act_dropout_helper_fp16.DropoutActBias(
+              dev_ctx,
+              output_workspace.data<phi::dtype::float16>(),
+              ffn1_biases[i]->data<T>(),
+              "gelu",
+              input_workspace.data<int8_t>(),
+              ffn1_dropout_mask_data,
+              ffn1_in_scale[i],
+              ffn1_out_scales[i]->data<float>(),
+              0,
+              ffn2_in_scale[i],
+              quant_round_type,
+              quant_max_bound,
+              quant_min_bound);
+        }
       } else {
         fused_act_dropout_helper_for_post_layernorm.DropoutActBias(
             dev_ctx,
@@ -841,42 +1110,78 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
       VLOG(0) << "step7";
 #endif
       // if (i == FLAGS_debug_layer_id)
-      //   VLOG(2) << "ffn2 in " << input_workspace;    
+      //   VLOG(2) << "ffn2 in " << input_workspace;
 
       // step8. ffn matmul2
-      if (pre_layer_norm) {
-        ffn2_linear_compute.ComputeForwardINT8ToINT8(ffn2_weights[i],
-                                                     &input_workspace,
-                                                     nullptr,
-                                                     &output_workspace,
-                                                     nullptr,
-                                                     &cublaslt_workspace);
+      if (FLAGS_is_w_prune) {
+        auto ffn2_weight = WeightCache::Instance().find_weight(ffn2_names[i]);
+        if (pre_layer_norm) {
+          ffn2_sparselt_linear_compute.ComputeForwardINT8ToINT8(
+              ffn2_weight->data->ptr(),
+              &input_workspace,
+              nullptr,
+              &output_workspace,
+              nullptr,
+              &cublaslt_workspace);
+
+        } else {
+          ffn2_sparselt_linear_compute.ComputeForward(ffn2_weight->data->ptr(),
+                                                      &ffn1_dropout_out,
+                                                      &input_workspace,
+                                                      nullptr,
+                                                      buf0,
+                                                      &output_workspace,
+                                                      nullptr,
+                                                      ffn2_in_scale[i],
+                                                      ffn2_out_scales[i],
+                                                      &cublaslt_workspace,
+                                                      quant_round_type,
+                                                      quant_max_bound,
+                                                      quant_min_bound);
+        }
+
       } else {
-        ffn2_linear_compute.ComputeForward(ffn2_weights[i],
-                                           &ffn1_dropout_out,
-                                           &input_workspace,
-                                           nullptr,
-                                           buf0,
-                                           &output_workspace,
-                                           nullptr,
-                                           ffn2_in_scale[i],
-                                           ffn2_out_scales[i],
-                                           &cublaslt_workspace,
-                                           quant_round_type,
-                                           quant_max_bound,
-                                           quant_min_bound);
+        if (pre_layer_norm) {
+          ffn2_linear_compute.ComputeForwardINT8ToINT8(ffn2_weights[i],
+                                                       &input_workspace,
+                                                       nullptr,
+                                                       &output_workspace,
+                                                       nullptr,
+                                                       &cublaslt_workspace);
+        } else {
+          ffn2_linear_compute.ComputeForward(ffn2_weights[i],
+                                             &ffn1_dropout_out,
+                                             &input_workspace,
+                                             nullptr,
+                                             buf0,
+                                             &output_workspace,
+                                             nullptr,
+                                             ffn2_in_scale[i],
+                                             ffn2_out_scales[i],
+                                             &cublaslt_workspace,
+                                             quant_round_type,
+                                             quant_max_bound,
+                                             quant_min_bound);
+        }
       }
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step8.0";
 #endif
       // if (i == FLAGS_debug_layer_id)
-      //   VLOG(2) << "ffn2 out " << output_workspace;  
+      //   VLOG(2) << "ffn2 out " << output_workspace;
 
       if (pre_layer_norm) {
-        AllReduce<int32_t>(output_workspace,
-                           ring_id,
-                           bsz * seq_len * num_head * dim_head,
-                           dev_ctx);
+        if (FLAGS_is_w_prune) {
+          AllReduce<phi::dtype::float16>(output_workspace,
+                                         ring_id,
+                                         bsz * seq_len * num_head * dim_head,
+                                         dev_ctx);
+        } else {
+          AllReduce<int32_t>(output_workspace,
+                             ring_id,
+                             bsz * seq_len * num_head * dim_head,
+                             dev_ctx);
+        }
       } else {
         AllReduce<T>(*buf0, ring_id, buf0->numel(), dev_ctx);
       }
@@ -890,70 +1195,93 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
         if (i < layers - 1) {
           auto *ln_scale_data = ln_scales[i + 1]->data<U>();
           auto *ln_bias_data = ln_biases[i + 1]->data<U>();
-
-          // ffn2_fused_dropout_helper.LayernormResidualDropoutBias(
-          //     dev_ctx,
-          //     output_workspace.data<int32_t>(),
-          //     bias_dropout_residual_out_data,
-          //     ffn2_biases[i]->data<T>(),
-          //     ln_scale_data,
-          //     ln_bias_data,
-          //     buf1->data<T>(),
-          //     dropout_mask_out_data,
-          //     input_workspace.data<int8_t>(),
-          //     ln_mean_data,
-          //     ln_var_data,
-          //     ffn2_in_scale[i],
-          //     ffn2_out_scales[i]->data<float>(),
-          //     qkv_in_scale[i + 1],
-          //     quant_round_type,
-          //     quant_max_bound,
-          //     quant_min_bound);
-
-        phi::DenseTensor ln_out;
-        ln_out.Resize(input_x->dims());
-        dev_ctx.Alloc<T>(&ln_out);
-
-        // fused_dropout_layernorm_helper_just_dequant.LayernormResidualDropoutBias(
-        //     dev_ctx,
-        //     output_workspace.data<int32_t>(),
-        //     bias_dropout_residual_out_data,
-        //     ffn2_biases[i]->data<T>(),
-        //     ln_scale_data,
-        //     ln_bias_data,
-        //     buf1->data<T>(),
-        //     dropout_mask_out_data,
-        //     ln_out.data<T>(),
-        //     ln_mean_data,
-        //     ln_var_data,
-        //     ffn2_in_scale[i],
-        //     ffn2_out_scales[i]->data<float>(),
-        //     qkv_in_scale[i + 1],
-        //     quant_round_type,
-        //     quant_max_bound,
-        //     quant_min_bound);
-        //   LaunchQuantActKernel<T>(ln_out.data<T>(), bsz_seq, dim_embed, input_workspace.data<int8_t>(), qkv_in_scale[i + 1], quant_max_bound, quant_min_bound, dev_ctx.stream());
-        // VLOG(1) << "RIGHT out " << input_workspace;
-    
-        // DequantSkipLoad<int32_t, T, T> load(output_workspace.data<int32_t>(), ffn2_biases[i]->data<T>(), bias_dropout_residual_out_data, ffn2_out_scales[i]->data<float>(), 0.0f, dim_embed);
-        DequantSkipLoadAndStoreResidual<int32_t, T, T, true> load(output_workspace.data<int32_t>(), ffn2_biases[i]->data<T>(), bias_dropout_residual_out_data, 
-                                                                ffn2_out_scales[i]->data<float>(), buf1->data<T>(), 0.0f, dim_embed);
-        AffineQuantStore<int8_t, LayerNormComputeType, T, true, true> store(input_workspace.data<int8_t>(), dim_embed, 
-                                                                          ln_scale_data, ln_bias_data, qkv_in_scale[i + 1], quant_round_type, quant_max_bound, quant_min_bound);
-        DispatchLayerNorm<decltype(load), decltype(store), LayerNormComputeType>(dev_ctx.stream(), load, store, token_num, dim_embed, epsilon, ln_mean_data, ln_var_data);
-        VLOG(1) << "WRONG out " << input_workspace;
+          phi::DenseTensor ln_out;
+          ln_out.Resize(input_x->dims());
+          dev_ctx.Alloc<T>(&ln_out);
+          if (FLAGS_is_w_prune) {
+            DequantSkipLoadAndStoreResidual<phi::dtype::float16, T, T, true>
+                load(output_workspace.data<phi::dtype::float16>(),
+                     ffn2_biases[i]->data<T>(),
+                     bias_dropout_residual_out_data,
+                     ffn2_out_scales[i]->data<float>(),
+                     buf1->data<T>(),
+                     0.0f,
+                     dim_embed);
+            AffineQuantStore<int8_t, LayerNormComputeType, T, true, true> store(
+                input_workspace.data<int8_t>(),
+                dim_embed,
+                ln_scale_data,
+                ln_bias_data,
+                qkv_in_scale[i + 1],
+                quant_round_type,
+                quant_max_bound,
+                quant_min_bound);
+            DispatchLayerNorm<decltype(load),
+                              decltype(store),
+                              LayerNormComputeType>(dev_ctx.stream(),
+                                                    load,
+                                                    store,
+                                                    token_num,
+                                                    dim_embed,
+                                                    epsilon,
+                                                    ln_mean_data,
+                                                    ln_var_data);
+          } else {
+            DequantSkipLoadAndStoreResidual<int32_t, T, T, true> load(
+                output_workspace.data<int32_t>(),
+                ffn2_biases[i]->data<T>(),
+                bias_dropout_residual_out_data,
+                ffn2_out_scales[i]->data<float>(),
+                buf1->data<T>(),
+                0.0f,
+                dim_embed);
+            AffineQuantStore<int8_t, LayerNormComputeType, T, true, true> store(
+                input_workspace.data<int8_t>(),
+                dim_embed,
+                ln_scale_data,
+                ln_bias_data,
+                qkv_in_scale[i + 1],
+                quant_round_type,
+                quant_max_bound,
+                quant_min_bound);
+            DispatchLayerNorm<decltype(load),
+                              decltype(store),
+                              LayerNormComputeType>(dev_ctx.stream(),
+                                                    load,
+                                                    store,
+                                                    token_num,
+                                                    dim_embed,
+                                                    epsilon,
+                                                    ln_mean_data,
+                                                    ln_var_data);
+          }
+          VLOG(1) << "WRONG out " << input_workspace;
         } else {
-          ffn2_fused_dropout_dequant_helper.ResidualDropoutBias(
-              dev_ctx,
-              output_workspace.data<int32_t>(),
-              bias_dropout_residual_out_data,
-              ffn2_biases[i]->data<T>(),
-              buf1->data<T>(),
-              dropout_mask_out_data,
-              ffn2_in_scale[i],
-              ffn2_out_scales[i]->data<float>(),
-              0,
-              1.0);
+          if (FLAGS_is_w_prune) {
+            ffn2_fused_dropout_dequant_helper_fp16.ResidualDropoutBias(
+                dev_ctx,
+                output_workspace.data<phi::dtype::float16>(),
+                bias_dropout_residual_out_data,
+                ffn2_biases[i]->data<T>(),
+                buf1->data<T>(),
+                dropout_mask_out_data,
+                ffn2_in_scale[i],
+                ffn2_out_scales[i]->data<float>(),
+                0,
+                1.0);
+          } else {
+            ffn2_fused_dropout_dequant_helper.ResidualDropoutBias(
+                dev_ctx,
+                output_workspace.data<int32_t>(),
+                bias_dropout_residual_out_data,
+                ffn2_biases[i]->data<T>(),
+                buf1->data<T>(),
+                dropout_mask_out_data,
+                ffn2_in_scale[i],
+                ffn2_out_scales[i]->data<float>(),
+                0,
+                1.0);
+          }
         }
       } else {
         auto *ln_scale_data = ffn_ln_scales[i]->data<U>();

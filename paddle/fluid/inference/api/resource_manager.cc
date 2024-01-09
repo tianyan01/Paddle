@@ -168,6 +168,7 @@ void GPUContextResource::DestroyGPUResource() {
   DestroyBlasLtHandle();
   DestroySolverHandle();
   DestroySparseHandle();
+  DestroySparseLtHandle();
 }
 
 void GPUContextResource::InitGpuProperties() {
@@ -226,6 +227,20 @@ void GPUContextResource::InitSparseHandle() {
 
 void GPUContextResource::DestroySparseHandle() {
   phi::DestroySparseHandle(sparse_handle_);
+}
+
+void GPUContextResource::InitSparseLtHandle() {
+  if (sparselt_handle_ == nullptr) {
+    sparselt_handle_ = &sparselt_ori_handle_;
+    phi::InitSparseLtHandle(sparselt_handle_);
+  }
+}
+
+void GPUContextResource::DestroySparseLtHandle() {
+  if (sparselt_handle_ != nullptr) {
+    phi::DestroySparseLtHandle(sparselt_handle_);
+    sparselt_handle_ = nullptr;
+  }
 }
 
 phi::Place GPUContextResource::Place() const { return place_; }
@@ -319,6 +334,14 @@ GPUContextResource::GetSparseHandleCreator() {
   return [&]() {
     InitSparseHandle();
     return sparse_handle_;
+  };
+}
+
+std::function<cusparseLtHandle_t*()>
+GPUContextResource::GetSparseLtHandleCreator() {
+  return [&]() {
+    InitSparseLtHandle();
+    return sparselt_handle_;
   };
 }
 

@@ -63,6 +63,7 @@ class GPUContextResource {
   std::function<phi::blasLtHandle_t()> GetBlasLtHandleCreator();
   std::function<phi::solverHandle_t()> GetSolverDnHandleCreator();
   std::function<phi::sparseHandle_t()> GetSparseHandleCreator();
+  std::function<cusparseLtHandle_t*()> GetSparseLtHandleCreator();
   std::function<Eigen::GpuDevice*()> GetGpuEigenDeviceCreator();
 
   gpuStream_t GetStream() const;
@@ -106,6 +107,8 @@ class GPUContextResource {
   void DestroySolverHandle();
   void InitSparseHandle();
   void DestroySparseHandle();
+  void InitSparseLtHandle();
+  void DestroySparseLtHandle();
 
  private:
   phi::Place place_;
@@ -130,6 +133,8 @@ class GPUContextResource {
   dnnHandle_t dnn_handle_{nullptr};
   phi::solverHandle_t solver_handle_{nullptr};
   phi::sparseHandle_t sparse_handle_{nullptr};
+  cusparseLtHandle_t* sparselt_handle_{nullptr};
+  cusparseLtHandle_t sparselt_ori_handle_;
   // DnnWorkspaceHandle
 };
 #endif

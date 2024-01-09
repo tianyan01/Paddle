@@ -491,6 +491,11 @@ if(WITH_CUSPARSELT)
   list(APPEND third_party_deps extern_cusparselt)
 endif()
 
+if(WITH_CUSPARSELT4)
+  include(external/cusparselt4) # download, build, install cusparselt 0.4
+  list(APPEND third_party_deps extern_cusparselt)
+endif()
+
 if(WITH_GPU
    AND NOT WITH_ARM
    AND NOT WIN32

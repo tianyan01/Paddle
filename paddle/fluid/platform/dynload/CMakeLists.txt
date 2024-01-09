@@ -45,7 +45,7 @@ if(TENSORRT_FOUND)
   list(APPEND CUDA_SRCS tensorrt.cc)
 endif()
 
-if(CUSPARSELT_FOUND)
+if(CUSPARSELT_FOUND OR CUSPARSELT4_FOUND)
   list(APPEND CUDA_SRCS cusparseLt.cc)
 endif()
 
