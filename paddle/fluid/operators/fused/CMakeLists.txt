@@ -26,6 +26,7 @@ register_operators(
   fused_multi_transformer_int8_op
   fused_multi_transformer_moe_op
   fused_multi_transformer_moe_weight_only_op
+  fused_multi_transformer_weight_only_op
   fused_multi_transformer_moe_int8_op
   fused_bias_dropout_residual_layer_norm_op
   resnet_unit_op
@@ -126,6 +127,7 @@ if(WITH_GPU OR WITH_ROCM)
     op_library(fused_multi_transformer_int8_op)
     op_library(fused_multi_transformer_moe_op)
     op_library(fused_multi_transformer_moe_weight_only_op)
+    op_library(fused_multi_transformer_weight_only_op)
     op_library(fused_multi_transformer_moe_int8_op)
     op_library(fused_bias_dropout_residual_layer_norm_op)
   endif()
