@@ -245,7 +245,7 @@ class FusedMultiTransformerINT8OpKernel : public framework::OpKernel<T> {
     qktv_out.Resize({{bsz, num_head, seq_len, dim_head}});
     auto *qktv_out_data =
         dev_ctx.Alloc<T>(&qktv_out, qktv_out.numel() * sizeof(T));
-    fmha_out.Resize({{token_num, num_head, dim_head}});
+    fmha_out.Resize({{bsz, seq_len, num_head, dim_head}});
     auto *fmha_out_data =
         dev_ctx.Alloc<T>(&fmha_out, fmha_out.numel() * sizeof(T));
 

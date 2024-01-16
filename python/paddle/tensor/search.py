@@ -1123,6 +1123,7 @@ def beam_search_softmax(
     fuse_softmax,
     early_stop,
     length_penalty=0.0,
+    one_stage_topk=False,
 ):
     if in_dygraph_mode():
         return _C_ops.beam_search_softmax(
@@ -1139,7 +1140,8 @@ def beam_search_softmax(
             max_dec_len,
             fuse_softmax,
             early_stop,
-            length_penalty
+            length_penalty,
+            one_stage_topk
         )
 
     inputs = {
@@ -1159,6 +1161,7 @@ def beam_search_softmax(
     attrs['fuse_softmax'] = fuse_softmax
     attrs['early_stop'] = early_stop
     attrs['length_penalty'] = length_penalty
+    attrs['one_stage_topk'] = one_stage_topk
 
     helper = LayerHelper('beam_search_softmax', **locals())
     ids_this_time = helper.create_variable_for_type_inference(dtype="int32")

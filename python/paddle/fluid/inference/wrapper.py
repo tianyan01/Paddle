@@ -38,6 +38,8 @@ def tensor_copy_from_cpu(self, data):
     if isinstance(data, np.ndarray) or (isinstance(data, list) and len(data) > 0
                                         and isinstance(data[0], str)):
         self.copy_from_cpu_bind(data)
+    elif isinstance(data, paddle.Tensor):
+        self._copy_from_cpu_bind(data)
     else:
         raise TypeError(
             "In copy_from_cpu, we only support numpy ndarray and list[str] data type."
