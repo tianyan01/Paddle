@@ -1591,6 +1591,24 @@ ncclComm_t ProcessGroupNCCL::NCCLComm(const Place& place) const {
   return iter->second[0]->GetNcclComm();
 }
 
+// get nccl comm
+ncclComm_t ProcessGroupNCCL::GetNCCLComm(const Place& place) {
+  std::vector<Place> places = {place};
+  auto key = GetKeyFromPlaces(places);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (places_to_ncclcomm_.find(key) == places_to_ncclcomm_.end()) {
+      CreateNCCLManagerCache(key, places);
+    }
+  }
+  const auto& iter = places_to_ncclcomm_.find(key);
+  PADDLE_ENFORCE_NE(iter,
+                      places_to_ncclcomm_.end(),
+                      platform::errors::InvalidArgument(
+                          "Cannot find nccl comm in process group."));
+  return iter->second[0]->GetNcclComm();
+}
+
 phi::DeviceContext* ProcessGroupNCCL::GetDeviceContext(
     const Place& place) const {
   return GetDeviceContext(place, /*use_calc_stream*/ false);

@@ -19,6 +19,19 @@ limitations under the License. */
 namespace phi {
 
 template <typename T, typename Context>
+void WeightOnlyLinear2Kernel(const Context& dev_ctx,
+                             const DenseTensor& x,
+                             const DenseTensor& weight,
+                             const paddle::optional<DenseTensor>& bias,
+                             const DenseTensor& weight_scale,
+                             const int m,
+                             const int n,
+                             const int k,
+                             const std::string& weight_dtype,
+                             const std::string& act_method,  // none, gelu, relu
+                             DenseTensor* out);
+
+template <typename T, typename Context>
 void WeightOnlyLinearKernel(const Context& dev_ctx,
                             const DenseTensor& x,
                             const DenseTensor& weight,

@@ -41,6 +41,7 @@ limitations under the License. */
 #include "cutlass/gemm/threadblock/mma_base.h"
 #include "cutlass/matrix_shape.h"
 #include "cutlass/numeric_types.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/weight_only_quant_op.h"
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -85,7 +86,9 @@ template <
     typename ElementScale_,
     /// Number of stages,
     int Stages,
-    /// Used for partial specialization
+    /// The dequantizing op to be performed.
+    WeightOnlyQuantOp DequantOp,
+    /// Used for partial specialization,
     typename Enable = bool>
 class DqMmaBase {
  public:
@@ -97,6 +100,16 @@ class DqMmaBase {
 
   ///< Type of the scale to be loaded
   using ElementScale = ElementScale_;
+
+  static_assert(DequantOp != WeightOnlyQuantOp::UNDEFINED, "");
+
+  // Finegrained scales get streamed in via cp.async
+  static constexpr int ScalebiasStages = isFinegrained(DequantOp) ? Stages : 1;
+  // We always have scales.
+  static constexpr int ScaleElementsPerStage = Shape::kN;
+  // We sometimes have a bias
+  static constexpr int BiasElementsPerStage =
+      hasZero(DequantOp) ? Shape::kN : 0;
 
   //
   // Dependent types
@@ -157,6 +170,11 @@ class DqMmaBase {
     using ShapeB = MatrixShape<Shape::kK * kStages + Policy::SmemPaddingB::kRow,
                                Shape::kN + Policy::SmemPaddingB::kColumn>;
 
+    /// Shape of the shared memory buffer for the scales for the B matrix.
+    using ShapeScale = MatrixShape<ScalebiasStages, ScaleElementsPerStage>;
+    /// Shape of the shared memory buffer for the biases of the B matrix.
+    using ShapeZero = MatrixShape<ScalebiasStages, BiasElementsPerStage>;
+
    public:
     //
     // Data members
@@ -169,7 +187,7 @@ class DqMmaBase {
     AlignedBuffer<typename Operator::ElementB, ShapeB::kCount> operand_B;
 
     /// Buffer to hold scales for threadblock
-    AlignedBuffer<ElementScale, Shape::kN> operand_scale;
+    AlignedBuffer<ElementScale, ShapeScale::kCount> operand_scale;
 
    public:
     //

@@ -45,7 +45,7 @@ if(TENSORRT_FOUND)
   list(APPEND CUDA_SRCS tensorrt.cc)
 endif()
 
-if(CUSPARSELT_FOUND)
+if(CUSPARSELT_FOUND OR CUSPARSELT4_FOUND)
   list(APPEND CUDA_SRCS cusparseLt.cc)
 endif()
 
@@ -72,10 +72,17 @@ elseif(WITH_ASCEND_CL)
     SRCS warpctc.cc
     DEPS phi_dynamic_loader warpctc npu_hccl)
 else()
-  nv_library(
-    phi_dynload_cuda
-    SRCS ${CUDA_SRCS}
-    DEPS phi_dynamic_loader)
+  if(WITH_FLASHATTN)
+    nv_library(
+      phi_dynload_cuda
+      SRCS ${CUDA_SRCS}
+      DEPS phi_dynamic_loader flashattn)
+  else()
+    nv_library(
+      phi_dynload_cuda
+      SRCS ${CUDA_SRCS}
+      DEPS phi_dynamic_loader)
+  endif()
   cc_library(
     phi_dynload_warpctc
     SRCS warpctc.cc

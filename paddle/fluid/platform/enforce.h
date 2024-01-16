@@ -34,6 +34,7 @@ limitations under the License. */
 #include <cufft.h>
 #include <curand.h>
 #include <cusparse.h>
+#include <cusparseLt.h>
 #include <thrust/system/cuda/error.h>
 #include <thrust/system_error.h>
 

@@ -14,8 +14,10 @@ limitations under the License. */
 
 #pragma once
 
+#include "paddle/fluid/operators/fused/cusparseLt.h"
 #include "paddle/fluid/operators/kernel_primitives/kernel_primitives.h"
 #include "paddle/fluid/operators/reduce_ops/reduce_op.cu.h"
+#include "paddle/fluid/platform/dynload/cusparseLt.h"
 #include "paddle/fluid/platform/float16.h"
 #include "paddle/phi/kernels/funcs/blas/blas.h"
 #include "paddle/phi/kernels/funcs/broadcast_function.h"
@@ -23,7 +25,12 @@ limitations under the License. */
 #if (defined(PADDLE_WITH_CUDA) && CUDA_VERSION >= 11040)
 #include "paddle/phi/kernels/funcs/blas/blaslt_impl.cu.h"
 #endif
-
+#if defined(PADDLE_WITH_CUTLASS)
+#include "paddle/phi/common/datatype_traits.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm_template.h"
+#endif
+DECLARE_bool(is_w_prune);
+namespace dyl = paddle::platform::dynload;
 namespace paddle {
 namespace operators {
 
@@ -254,6 +261,348 @@ class AttnMatMul {
   int input_size_;
 
   int compute_bias_;
+};
+
+template <typename T>
+class AttnMatMulWeightOnly {
+#if defined(PADDLE_WITH_CUTLASS)
+  using InputType = typename phi::PDDataTypeTraits<T>::DataType;
+  using GemRunnerInt8 = phi::CutlassFpAIntBGemmRunner<InputType, uint8_t>;
+  using GemRunnerInt4 =
+      phi::CutlassFpAIntBGemmRunner<InputType, cutlass::uint4b_t>;
+#endif
+ public:
+  // (m, n, k) = bsz_seq, output_size, input_size
+  AttnMatMulWeightOnly(const phi::GPUContext& dev_ctx, bool is_uint4)
+      : dev_ctx_(dev_ctx), is_uint4_(is_uint4) {}
+
+  ~AttnMatMulWeightOnly() {}
+  // get activation
+  int GetActivation(const std::string& act_method) {
+#if defined(PADDLE_WITH_CUTLASS)
+    return static_cast<int>(phi::getActivationType(act_method));
+#else
+    return 0;
+#endif
+  }
+  void Linear(const phi::DenseTensor& x,
+              const phi::DenseTensor& weight,
+              const phi::DenseTensor* bias,
+              const phi::DenseTensor& weight_scale,
+              const int m,
+              const int n,
+              const int k,
+              const int& act_method,  // none, gelu, relu
+              phi::DenseTensor* out) {
+#if defined(PADDLE_WITH_CUTLASS)
+    const T* x_data = x.data<T>();
+    const int8_t* weight_data = weight.data<int8_t>();
+    const T* bias_data = bias ? bias->data<T>() : nullptr;
+    const T* weight_scale_data = weight_scale.data<T>();
+    T* out_data = out->data<T>();
+
+    if (is_uint4_) {
+      int mixgemm_max_size = std::max(m, k);
+
+      int64_t mixgemm_workspace_size_bytes =
+          mixed_gemm_runner_int4_.getWorkspaceSize(
+              m, mixgemm_max_size, mixgemm_max_size);
+
+      char* mixgemm_workspace_data = reinterpret_cast<char*>(
+          dev_ctx_.template GetWorkSpacePtr(mixgemm_workspace_size_bytes));
+      if (bias_data) {
+        mixed_gemm_runner_int4_.gemm_bias_act(
+            reinterpret_cast<const InputType*>(x_data),
+            reinterpret_cast<const cutlass::uint4b_t*>(weight_data),
+            reinterpret_cast<const InputType*>(weight_scale_data),
+            reinterpret_cast<const InputType*>(bias_data),
+            reinterpret_cast<InputType*>(out_data),
+            m,
+            n,
+            k,
+            static_cast<phi::ActivationType>(act_method),
+            mixgemm_workspace_data,
+            mixgemm_workspace_size_bytes,
+            dev_ctx_.stream());
+      } else {
+        mixed_gemm_runner_int4_.gemm(
+            reinterpret_cast<const InputType*>(x_data),
+            reinterpret_cast<const cutlass::uint4b_t*>(weight_data),
+            reinterpret_cast<const InputType*>(weight_scale_data),
+            reinterpret_cast<InputType*>(out_data),
+            m,
+            n,
+            k,
+            mixgemm_workspace_data,
+            mixgemm_workspace_size_bytes,
+            dev_ctx_.stream());
+      }
+    } else {
+      int mixgemm_max_size = std::max(m, k);
+      int64_t mixgemm_workspace_size_bytes =
+          mixed_gemm_runner_int8_.getWorkspaceSize(
+              m, mixgemm_max_size, mixgemm_max_size);
+      char* mixgemm_workspace_data = reinterpret_cast<char*>(
+          dev_ctx_.template GetWorkSpacePtr(mixgemm_workspace_size_bytes));
+      if (bias_data) {
+        mixed_gemm_runner_int8_.gemm_bias_act(
+            reinterpret_cast<const InputType*>(x_data),
+            reinterpret_cast<const uint8_t*>(weight_data),
+            reinterpret_cast<const InputType*>(weight_scale_data),
+            reinterpret_cast<const InputType*>(bias_data),
+            reinterpret_cast<InputType*>(out_data),
+            m,
+            n,
+            k,
+            static_cast<phi::ActivationType>(act_method),
+            mixgemm_workspace_data,
+            mixgemm_workspace_size_bytes,
+            dev_ctx_.stream());
+      } else {
+        mixed_gemm_runner_int8_.gemm(
+            reinterpret_cast<const InputType*>(x_data),
+            reinterpret_cast<const uint8_t*>(weight_data),
+            reinterpret_cast<const InputType*>(weight_scale_data),
+            reinterpret_cast<InputType*>(out_data),
+            m,
+            n,
+            k,
+            mixgemm_workspace_data,
+            mixgemm_workspace_size_bytes,
+            dev_ctx_.stream());
+      }
+    }
+#else
+    PADDLE_THROW(platform::errors::InvalidArgument(
+        "this machine not support weight only"));
+#endif
+  }
+
+ private:
+  const phi::GPUContext& dev_ctx_;
+#if defined(PADDLE_WITH_CUTLASS)
+  GemRunnerInt8 mixed_gemm_runner_int8_;
+  GemRunnerInt4 mixed_gemm_runner_int4_;
+#endif
+  bool is_uint4_ = false;
+};
+
+template <typename T>
+class AttnCuSparseMatMul {
+ public:
+  // (m, n, k) = bsz_seq, output_size, input_size
+  // A(m*k) * B(k*n) = C(m*n)
+  AttnCuSparseMatMul(const phi::GPUContext& dev_ctx,
+                     int bsz_seq,
+                     int output_size,
+                     int input_size,
+                     bool compute_bias)
+      : dev_ctx_(dev_ctx),
+        m(bsz_seq),      // m
+        n(output_size),  // n
+        k(input_size),   // k
+        compute_bias_(compute_bias) {
+    if (FLAGS_is_w_prune) {
+      handle = dev_ctx.cusparselt_handle();
+      streams[0] = dev_ctx.stream();
+      // cudaStreamCreateWithFlags(&streams[1], cudaStreamNonBlocking);
+      // cudaStreamCreateWithFlags(&streams[2], cudaStreamNonBlocking);
+
+      workspace_size = 0;
+      if (std::is_same<T, phi::dtype::float16>::value) {
+        a_type = CUDA_R_16F;
+        b_type = CUDA_R_16F;
+        c_type = CUDA_R_16F;
+        compute_type = CUSPARSE_COMPUTE_16F;
+      } else if (std::is_same<T, float>::value) {
+        a_type = CUDA_R_32F;
+        b_type = CUDA_R_32F;
+        c_type = CUDA_R_32F;
+        compute_type = CUSPARSE_COMPUTE_TF32;
+      } else {
+        PADDLE_ENFORCE_EQ(
+            1,
+            0,
+            platform::errors::Fatal(
+                "AttnCuSparseMatMul only suport CUDA_R_16F and CUDA_R_32F"));
+      }
+
+      CHECK_CUSPARSE(dyl::cusparseLtDenseDescriptorInit(
+          handle, &matA, m, k, k, alignment, a_type, CUSPARSE_ORDER_ROW));
+      CHECK_CUSPARSE(dyl::cusparseLtStructuredDescriptorInit(
+          handle,
+          &matB,
+          k,
+          n,
+          n,
+          alignment,
+          b_type,
+          CUSPARSE_ORDER_ROW,
+          CUSPARSELT_SPARSITY_50_PERCENT));
+      CHECK_CUSPARSE(dyl::cusparseLtDenseDescriptorInit(
+          handle, &matC, m, n, n, alignment, c_type, CUSPARSE_ORDER_ROW));
+      // matmul, algorithm selection, and plan initialization
+      CHECK_CUSPARSE(
+          dyl::cusparseLtMatmulDescriptorInit(handle,
+                                              &matmul,
+                                              CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                              CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                              &matA,
+                                              &matB,
+                                              &matC,
+                                              &matC,
+                                              compute_type));
+      CHECK_CUSPARSE(dyl::cusparseLtMatmulAlgSelectionInit(
+          handle, &alg_sel, &matmul, CUSPARSELT_MATMUL_ALG_DEFAULT));
+
+      CHECK_CUSPARSE(
+          dyl::cusparseLtMatmulPlanInit(handle, &plan, &matmul, &alg_sel));
+    }
+  }
+
+  void reset(int bsz_seq) {
+    if (m != bsz_seq) {
+      m = bsz_seq;
+      CHECK_CUSPARSE(dyl::cusparseLtDenseDescriptorInit(
+          handle, &matA, m, k, k, alignment, a_type, CUSPARSE_ORDER_ROW));
+      CHECK_CUSPARSE(dyl::cusparseLtDenseDescriptorInit(
+          handle, &matC, m, n, n, alignment, c_type, CUSPARSE_ORDER_ROW));
+      CHECK_CUSPARSE(
+          dyl::cusparseLtMatmulDescriptorInit(handle,
+                                              &matmul,
+                                              CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                              CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                              &matA,
+                                              &matB,
+                                              &matC,
+                                              &matC,
+                                              compute_type));
+      CHECK_CUSPARSE(dyl::cusparseLtMatmulAlgSelectionInit(
+          handle, &alg_sel, &matmul, CUSPARSELT_MATMUL_ALG_DEFAULT));
+      CHECK_CUSPARSE(
+          dyl::cusparseLtMatmulPlanInit(handle, &plan, &matmul, &alg_sel));
+      algid_param = nullptr;
+    }
+  }
+
+  ~AttnCuSparseMatMul() {
+    if (FLAGS_is_w_prune) {
+      CHECK_CUSPARSE(dyl::cusparseLtMatDescriptorDestroy(&matA));
+      CHECK_CUSPARSE(dyl::cusparseLtMatDescriptorDestroy(&matB));
+      CHECK_CUSPARSE(dyl::cusparseLtMatDescriptorDestroy(&matC));
+      CHECK_CUSPARSE(dyl::cusparseLtMatmulPlanDestroy(&plan));
+      // cudaStreamDestroy(streams[1]);
+      // cudaStreamDestroy(streams[2]);
+    }
+  }
+
+  void ComputeForward(const void* weight,
+                      const framework::Tensor* input,
+                      const framework::Tensor* bias,
+                      framework::Tensor* output,
+                      framework::Tensor* bias_out) {
+    // Note: for blas.GEMM API in Paddle, it treats all inputs as row-major.
+    // here: (transa, transb): nt, input * weight.
+
+    float alpha = 1.0;
+    float beta = 0.0;
+    if (algid_param == nullptr) {
+      algid_param = CuSparseLtAlgoCache::Instance().CuSparseLtAlgoSelect(
+          handle,
+          &plan,
+          &alg_sel,
+          m,
+          n,
+          k,
+          b_type,
+          &alpha,
+          input->data<T>(),
+          weight,
+          &beta,
+          output->data<T>(),
+          output->data<T>(),
+          streams,
+          1);
+      CHECK_CUSPARSE(
+          dyl::cusparseLtMatmulAlgSetAttribute(handle,
+                                               &alg_sel,
+                                               CUSPARSELT_MATMUL_ALG_CONFIG_ID,
+                                               &(algid_param->id),
+                                               sizeof(algid_param->id)));
+      if (algid_param->is_split_k > 1) {
+        CHECK_CUSPARSE(dyl::cusparseLtMatmulAlgSetAttribute(
+            handle,
+            &alg_sel,
+            CUSPARSELT_MATMUL_SPLIT_K,
+            &(algid_param->is_split_k),
+            sizeof(algid_param->is_split_k)));
+        CHECK_CUSPARSE(dyl::cusparseLtMatmulAlgSetAttribute(
+            handle,
+            &alg_sel,
+            CUSPARSELT_MATMUL_SPLIT_K_MODE,
+            &(algid_param->split_k_mode),
+            sizeof(algid_param->split_k_mode)));
+        CHECK_CUSPARSE(dyl::cusparseLtMatmulAlgSetAttribute(
+            handle,
+            &alg_sel,
+            CUSPARSELT_MATMUL_SPLIT_K_BUFFERS,
+            &(algid_param->split_k_buffer),
+            sizeof(algid_param->split_k_buffer)));
+      }
+      CHECK_CUSPARSE(
+          dyl::cusparseLtMatmulPlanInit(handle, &plan, &matmul, &alg_sel));
+      CHECK_CUSPARSE(
+          dyl::cusparseLtMatmulGetWorkspace(handle, &plan, &workspace_size));
+      workspace_size = (workspace_size / 8) + 1;  // to int8
+      // VLOG(0) << " workspace_size  is " << workspace_size;
+      work_place_tensor.Resize({{(int64_t)workspace_size}});
+      dev_ctx_.Alloc<int8_t>(&work_place_tensor,
+                             work_place_tensor.numel() * sizeof(int8_t));
+    }
+    // cusparseLtMatmulAlgSetAttribute and cusparseLtMatmulPlanInit
+    // cusparseLtMatmulGetWorkspace before this
+    CHECK_CUSPARSE(dyl::cusparseLtMatmul(
+        handle,
+        &plan,
+        &alpha,
+        input->data<T>(),
+        weight,
+        &beta,
+        output->data<T>(),
+        output->data<T>(),
+        reinterpret_cast<void*>(work_place_tensor.data<int8_t>()),
+        streams,
+        1));
+    if (compute_bias_) {
+      // bias_out = output + bias
+      std::vector<const Tensor*> ins = {output, bias};
+      std::vector<Tensor*> outs = {bias_out};
+      phi::funcs::BroadcastKernel<phi::ElementwiseType::kBinary, T, T>(
+          dev_ctx_, ins, &outs, -1, phi::funcs::AddFunctor<T>());
+    }
+  }
+
+ private:
+  cusparseLtMatDescriptor_t matA;
+  cusparseLtMatDescriptor_t matB;
+  cusparseLtMatDescriptor_t matC;
+  cusparseLtMatmulDescriptor_t matmul;
+  cusparseLtMatmulAlgSelection_t alg_sel;
+  cusparseLtMatmulPlan_t plan;
+  const phi::GPUContext& dev_ctx_;
+  int m;
+  int n;
+  int k;
+  gpuStream_t streams[1];
+  cusparseLtHandle_t* handle = nullptr;
+  CuSparseLtAlgoParam* algid_param = nullptr;
+  size_t workspace_size;
+  int compute_bias_;
+  cudaDataType a_type;
+  cudaDataType b_type;
+  cudaDataType c_type;
+  cusparseComputeType compute_type;
+  phi::DenseTensor work_place_tensor;
 };
 
 }  // namespace operators

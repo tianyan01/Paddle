@@ -107,6 +107,7 @@ class PADDLE_API GPUContext : public DeviceContext {
   /*! \brief  Return cusolver handle in the device context. */
   solverHandle_t cusolver_dn_handle() const;
 
+  cusparseLtHandle_t* cusparselt_handle() const;
   /*! \brief  Return cusparse handle in the device context. */
   sparseHandle_t cusparse_handle() const;
 
@@ -199,6 +200,9 @@ class PADDLE_API GPUContext : public DeviceContext {
   // clear: whether clear the original CUDAStream or not
   void SetCUDAStream(CUDAStream*, bool clear = true);
 
+  // Get Work Space
+  void* GetWorkSpacePtr(const size_t& len) const;
+
  protected:
   // NOTE: External users manage resources. Used in inference scenarios.
   // The Set interface is for inference only, DeviceContext will mark the
@@ -228,6 +232,9 @@ class PADDLE_API GPUContext : public DeviceContext {
 
   void SetSparseHandle(sparseHandle_t);
   void SetSparseHandle(std::function<sparseHandle_t()>&&);
+
+  void SetSparseLtHandle(cusparseLtHandle_t*);
+  void SetSparseLtHandle(std::function<cusparseLtHandle_t*()>&&);
 
   void SetDnnWorkspaceHandle(DnnWorkspaceHandle*);
 

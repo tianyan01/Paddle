@@ -13,6 +13,7 @@
 # limitations under the License.
 import argparse
 import re
+import os
 
 # this is a file's header part
 CommonHead = '''
@@ -38,7 +39,7 @@ void generic_mixed_gemm_kernelLauncher_template<{T},
                                                 {Stages}>(
     const {T}* A,
     const {WeightType}* B,
-    const float* weight_scales,
+    const {T}* weight_scales,
     const {T}* biases,
     {T}* C,
     int m,
@@ -77,7 +78,7 @@ DefineHeader = """
 
 """
 
-DefaultArch = [70, 75, 80]
+DefaultArch = [70, 80]
 epilogue_tags = ["bias", "biasFtGelu", "biasReLU", "noBias"]
 
 WeightTypes = ["uint8_t", "cutlass::uint4b_t"]
@@ -85,29 +86,33 @@ ThreadblockShapes = [
     "cutlass::gemm::GemmShape<32, 128, 64>",
     "cutlass::gemm::GemmShape<64, 128, 64>",
     "cutlass::gemm::GemmShape<128, 128, 64>",
-    "cutlass::gemm::GemmShape<256, 128, 64>",
-    "cutlass::gemm::GemmShape<128, 256, 64>",
 ]
 WarpShapes = [
     "cutlass::gemm::GemmShape<32, 32, 64>",
     "cutlass::gemm::GemmShape<64, 32, 64>",
     "cutlass::gemm::GemmShape<128, 32, 64>",
-    "cutlass::gemm::GemmShape<64, 64, 64>",
-    "cutlass::gemm::GemmShape<64, 64, 64>",
 ]
-StagesList = {70: [2], 75: [2], 80: [2, 3, 4]}
+ThreadblockShapes_sm70 = [
+    "cutlass::gemm::GemmShape<32, 128, 64>",
+    "cutlass::gemm::GemmShape<64, 128, 64>",
+]
+WarpShapes_sm70 = [
+    "cutlass::gemm::GemmShape<32, 32, 64>",
+    "cutlass::gemm::GemmShape<64, 32, 64>",
+]
+StagesList = {70: [2], 80: [2, 3, 4]}
 
 ElementTypes = {"fp16": "half", "bf16": "__nv_bfloat16"}
 Archs = {
     70: "cutlass::arch::Sm70",
-    75: "cutlass::arch::Sm75",
+    #75: "cutlass::arch::Sm75",
     80: "cutlass::arch::Sm80",
 }
 EpilogueTags = {
     "bias": "EpilogueOpBias",
     "biasFtGelu": "EpilogueOpBiasFtGelu",
     "biasReLU": "EpilogueOpBiasReLU",
-    "noBias": "EpilogueOpNoBias",
+    "noBias": "EpilogueOpDefault",
 }
 
 
@@ -162,35 +167,47 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-
 # generate source cu
 def generate_source_cu(
-    element_type: str, arch: int, epilogue_tag: str, stages: int
+    element_type: str, weight_type: str, arch: int, epilogue_tag: str, stages: int
 ):
     all_code = CommonHead
-    for WeightType in WeightTypes:
-        for i in range(len(ThreadblockShapes)):
-            value_dict = {
-                "T": ElementTypes[element_type],
-                "WeightType": WeightType,
-                "arch": Archs[arch],
-                "EpilogueTag": EpilogueTags[epilogue_tag],
-                "ThreadblockShape": ThreadblockShapes[i],
-                "WarpShape": WarpShapes[i],
-                "Stages": str(stages),
-            }
-            all_code += SubstituteTemplate(
-                DispatchGemmConfigInstanceDeclare, value_dict
-            )
+    ThreadblockShapes_arch = ThreadblockShapes
+    WarpShapes_arch = WarpShapes
+    if arch < 80:
+        ThreadblockShapes_arch = ThreadblockShapes_sm70
+        WarpShapes_arch = WarpShapes_sm70
+    for i in range(len(ThreadblockShapes_arch)):
+        value_dict = {
+            "T": ElementTypes[element_type],
+            "WeightType": weight_type,
+            "arch": Archs[arch],
+            "EpilogueTag": EpilogueTags[epilogue_tag],
+            "ThreadblockShape": ThreadblockShapes_arch[i],
+            "WarpShape": WarpShapes_arch[i],
+            "Stages": str(stages),
+        }
+        all_code += SubstituteTemplate(
+            DispatchGemmConfigInstanceDeclare, value_dict
+        )
     all_code += CommonTail
     return all_code
 
+def clean_autogen(
+        path: str):
+    if not os.path.isdir(path):
+        return
+    dirs = os.listdir(path)
+    for name in dirs:
+        full_path = os.path.join(path, name)
+        os.remove(full_path)
 
 if __name__ == "__main__":
     args = parse_args()
     archs = args.cuda_arch
     header_all = DefineHeader
     header_name = "autogen/arch_define.h"
+    clean_autogen("./autogen")
     if archs:
         for arch in archs:
             define_line = "#define USE_FPAINTB_GEMM_WITH_SM%s\n" % str(arch)
@@ -200,15 +217,17 @@ if __name__ == "__main__":
         f.close()
     if archs:
         for element_type in ElementTypes.keys():
-            for arch in archs:
-                for epilogue_tag in EpilogueTags.keys():
-                    for stages in StagesList[arch]:
-                        file_name = "autogen/generic_mixed_gemm_kernelLauncher_{}_sm{}_stages{}_{}.cu".format(
-                            element_type, arch, stages, epilogue_tag
-                        )
-                        all_code = generate_source_cu(
-                            element_type, arch, epilogue_tag, stages
-                        )
-                        with open(file_name, "w") as f:
-                            f.write(all_code)
-                            f.close()
+            for weight_type in WeightTypes:
+                for arch in archs:
+                    for epilogue_tag in EpilogueTags.keys():
+                        for stages in StagesList[arch]:
+                            new_type = weight_type.replace("cutlass::", "")
+                            file_name = "autogen/generic_mixed_gemm_kernelLauncher_{}_{}_sm{}_stages{}_{}.cu".format(
+                                element_type, new_type, arch, stages, epilogue_tag
+                            )
+                            all_code = generate_source_cu(
+                                element_type, weight_type, arch, epilogue_tag, stages
+                            )
+                            with open(file_name, "w") as f:
+                                f.write(all_code)
+                                f.close()

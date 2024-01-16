@@ -63,6 +63,9 @@ extern void *cusparselt_dso_handle;
   __macro(cusparseLtMatDescriptorDestroy);     \
   __macro(cusparseLtSpMMACompressedSize2);     \
   __macro(cusparseLtSpMMACompress2);           \
+  __macro(cusparseLtSpMMAPruneCheck2);         \
+  __macro(cusparseLtSpMMACompress);            \
+  __macro(cusparseLtSpMMACompressedSize);      \
   __macro(cusparseLtMatmulSearch);             \
   __macro(cusparseLtMatmulAlgGetAttribute);    \
   __macro(cusparseLtMatmulPlanDestroy);        \

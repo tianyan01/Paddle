@@ -77,6 +77,12 @@ class DenseTensor : public TensorBase,
   /// \return The name of the class.
   static const char* name() { return "DenseTensor"; }
 
+  // trick to free data
+  void reset_data(std::shared_ptr<phi::Allocation> new_holder) {
+    holder_.reset();
+    holder_ = new_holder;
+  }
+
   /// \brief Returns the number of elements contained in tensor.
   /// \return The number of elements contained in tensor.
   int64_t numel() const override;
@@ -216,8 +222,8 @@ class DenseTensor : public TensorBase,
   };
 
  protected:
-  std::shared_ptr<InplaceVersion> inplace_version_counter_{
-      std::make_shared<InplaceVersion>()};
+  std::shared_ptr<InplaceVersion> inplace_version_counter_ =
+      std::make_shared<InplaceVersion>();
 
 /* @jim19930609: This is a hack
 In general, it is badly designed to fuse MKLDNN-specific objects into a

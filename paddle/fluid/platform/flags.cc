@@ -165,6 +165,11 @@ PADDLE_DEFINE_EXPORTED_int64(
     0,
     "The times of exhaustive search for cuBlasLt matmul with/without "
     " epilogue algorithms, default is 0, means disabling exhaustive search.");
+
+PADDLE_DEFINE_EXPORTED_bool(is_w_prune, false, " is to use 2:4 w");
+PADDLE_DEFINE_EXPORTED_double(scale_for_w_prune,
+                              1.0,
+                              "scale for w prune  default 1");
 #endif
 
 #if defined(PADDLE_WITH_ASCEND_CL)

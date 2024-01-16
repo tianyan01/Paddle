@@ -23,9 +23,9 @@ limitations under the License. */
 #include "paddle/phi/backends/dynload/cublasLt.h"
 #include "paddle/phi/backends/gpu/cuda/cuda_helper.h"
 
-#include "paddle/phi/common/amp_type_traits.h"
 #include "paddle/fluid/memory/malloc.h"
 #include "paddle/fluid/platform/flags.h"
+#include "paddle/phi/common/amp_type_traits.h"
 #include "paddle/phi/kernels/autotune/cache.h"
 #include "paddle/phi/kernels/autotune/gpu_timer.h"
 #include "paddle/phi/kernels/autotune/switch_autotune.h"
@@ -63,23 +63,23 @@ enum MatmulFusedType {
 
 static cublasLtEpilogue_t ConvertFusedType(MatmulFusedType fused_type) {
   static std::map<MatmulFusedType, cublasLtEpilogue_t> fused_type_map = {
-      {MatmulFusedType::kMatmul, CUBLASLT_EPILOGUE_DEFAULT},
-      {MatmulFusedType::kMatmulGrad, CUBLASLT_EPILOGUE_DEFAULT},
-      {MatmulFusedType::kMatmulGradWithoutBias, CUBLASLT_EPILOGUE_DEFAULT},
-      {MatmulFusedType::kMatmulBias, CUBLASLT_EPILOGUE_BIAS},
-      {MatmulFusedType::kMatmulRelu, CUBLASLT_EPILOGUE_RELU},
-	  {MatmulFusedType::kMatmulGelu, CUBLASLT_EPILOGUE_GELU},
-      {MatmulFusedType::kMatmulBiasRelu, CUBLASLT_EPILOGUE_RELU_BIAS},
-      {MatmulFusedType::kMatmulBiasGelu, CUBLASLT_EPILOGUE_GELU_BIAS},
-      {MatmulFusedType::kMatmulBiasReluWithReservedData,
-       CUBLASLT_EPILOGUE_RELU_AUX_BIAS},
-      {MatmulFusedType::kMatmulBiasGeluWithReservedData,
-       CUBLASLT_EPILOGUE_GELU_AUX_BIAS},
+    {MatmulFusedType::kMatmul, CUBLASLT_EPILOGUE_DEFAULT},
+    {MatmulFusedType::kMatmulGrad, CUBLASLT_EPILOGUE_DEFAULT},
+    {MatmulFusedType::kMatmulGradWithoutBias, CUBLASLT_EPILOGUE_DEFAULT},
+    {MatmulFusedType::kMatmulBias, CUBLASLT_EPILOGUE_BIAS},
+    {MatmulFusedType::kMatmulRelu, CUBLASLT_EPILOGUE_RELU},
+    {MatmulFusedType::kMatmulGelu, CUBLASLT_EPILOGUE_GELU},
+    {MatmulFusedType::kMatmulBiasRelu, CUBLASLT_EPILOGUE_RELU_BIAS},
+    {MatmulFusedType::kMatmulBiasGelu, CUBLASLT_EPILOGUE_GELU_BIAS},
+    {MatmulFusedType::kMatmulBiasReluWithReservedData,
+     CUBLASLT_EPILOGUE_RELU_AUX_BIAS},
+    {MatmulFusedType::kMatmulBiasGeluWithReservedData,
+     CUBLASLT_EPILOGUE_GELU_AUX_BIAS},
 #if CUDA_VERSION >= 11060
-      {MatmulFusedType::kMatmulReluGrad, CUBLASLT_EPILOGUE_DRELU},
-      {MatmulFusedType::kMatmulGeluGrad, CUBLASLT_EPILOGUE_DGELU},
-      {MatmulFusedType::kMatmulBiasGradToA, CUBLASLT_EPILOGUE_BGRADA},
-      {MatmulFusedType::kMatmulBiasGradToB, CUBLASLT_EPILOGUE_BGRADB}
+    {MatmulFusedType::kMatmulReluGrad, CUBLASLT_EPILOGUE_DRELU},
+    {MatmulFusedType::kMatmulGeluGrad, CUBLASLT_EPILOGUE_DGELU},
+    {MatmulFusedType::kMatmulBiasGradToA, CUBLASLT_EPILOGUE_BGRADA},
+    {MatmulFusedType::kMatmulBiasGradToB, CUBLASLT_EPILOGUE_BGRADB}
 #endif
   };
 
@@ -230,7 +230,8 @@ struct MatmulDescriptor {
       PADDLE_ENFORCE_GPU_SUCCESS(dynload::cublasLtMatmulDescDestroy(op_desc));
       PADDLE_ENFORCE_GPU_SUCCESS(dynload::cublasLtMatrixLayoutDestroy(y_desc));
       PADDLE_ENFORCE_GPU_SUCCESS(dynload::cublasLtMatrixLayoutDestroy(x_desc));
-      PADDLE_ENFORCE_GPU_SUCCESS(dynload::cublasLtMatrixLayoutDestroy(out_desc));
+      PADDLE_ENFORCE_GPU_SUCCESS(
+          dynload::cublasLtMatrixLayoutDestroy(out_desc));
       delete algo;
 
       op_desc = nullptr;
@@ -483,7 +484,9 @@ struct CublasLtBase {
     // I wonder is there any smarter idea for workspace setting, currently I
     // just followed the settings from the NVIDIA colleague`s setting.
     size_t workspace_size = static_cast<size_t>(4) * 1024 * 1024;
-    phi::Allocator::AllocationPtr workspace = GetWorkspace(ctx, workspace_size);
+    //    phi::Allocator::AllocationPtr workspace = GetWorkspace(ctx,
+    //    workspace_size);
+    void* workspace_ptr = ctx.GetWorkSpacePtr(workspace_size);
 
     if (planner != nullptr) {
       if (phi::autotune::AutoTuneStatus::Instance().UseAutoTune() &&
@@ -496,7 +499,7 @@ struct CublasLtBase {
                        y_ptr,
                        x_ptr,
                        out_ptr,
-                       workspace->ptr(),
+                       workspace_ptr,
                        workspace_size);
         MatmulDescT* best_desc = new MatmulDescT(*desc);
         VLOG(6) << best_desc->GetDescResultString(
@@ -522,7 +525,7 @@ struct CublasLtBase {
                                 out_ptr,
                                 desc->out_desc,
                                 desc->algo,
-                                workspace->ptr(),
+                                workspace_ptr,
                                 workspace_size,
                                 ctx.stream()));
   }
@@ -674,7 +677,9 @@ struct CublasLtBase<int8_t, int32_t, MatmulDescriptor> {
     cublasLtHandle_t cublaslt_handle = ctx.cublaslt_handle();
 
     size_t workspace_size = static_cast<size_t>(4) * 1024 * 1024;
-    phi::Allocator::AllocationPtr workspace = GetWorkspace(ctx, workspace_size);
+    //    phi::Allocator::AllocationPtr workspace = GetWorkspace(ctx,
+    //    workspace_size);
+    void* workspace_ptr = ctx.GetWorkSpacePtr(workspace_size);
 
     if (planner != nullptr) {
       if (phi::autotune::AutoTuneStatus::Instance().UseAutoTune() &&
@@ -687,7 +692,7 @@ struct CublasLtBase<int8_t, int32_t, MatmulDescriptor> {
                        y_ptr,
                        x_ptr,
                        out_ptr,
-                       workspace->ptr(),
+                       workspace_ptr,
                        workspace_size);
         MatmulDescriptor* best_desc = new MatmulDescriptor(*desc);
         VLOG(6) << best_desc->GetDescResultString(
@@ -713,7 +718,7 @@ struct CublasLtBase<int8_t, int32_t, MatmulDescriptor> {
                                 out_ptr,
                                 desc->out_desc,
                                 desc->algo,
-                                workspace->ptr(),
+                                workspace_ptr,
                                 workspace_size,
                                 ctx.stream()));
   }
@@ -1048,14 +1053,15 @@ struct LinearWithCublasLt : public CublasLtBase<T> {
                   const bool trans_x,
                   const bool trans_y,
                   const MatmulFusedType fused_type) {
-    auto planner = phi::funcs::MatmulPlanner(vectorize(x->dims()),
-                                             vectorize(y->dims()),
-                                             trans_x,
-                                             trans_y,
-											 paddle::experimental::CppTypeToDataType<T>::Type(),
-                                             fused_type,
-                                             bias_data,
-                                             reserve_data);
+    auto planner = phi::funcs::MatmulPlanner(
+        vectorize(x->dims()),
+        vectorize(y->dims()),
+        trans_x,
+        trans_y,
+        paddle::experimental::CppTypeToDataType<T>::Type(),
+        fused_type,
+        bias_data,
+        reserve_data);
     auto setter = DescriptorSetter<MatmulDescriptor, T>(
         &planner, M, N, K, trans_x, trans_y);
     CublasLtBase<T>::RunImpl(ctx,
@@ -1086,16 +1092,17 @@ struct LinearGradWithCublasLt : public CublasLtBase<T> {
       const bool use_addto,
       const bool no_exchange,  // exchange x_desc and y_desc for grad.
       bool grad_for_dx = true) {
-    auto planner = phi::funcs::MatmulPlanner(vectorize(x->dims()),
-                                             vectorize(y->dims()),
-                                             trans_x,
-                                             trans_y,
-											 paddle::experimental::CppTypeToDataType<T>::Type(),
-                                             fused_type,
-                                             bias_data,
-                                             reserve_data,
-                                             use_addto,
-                                             no_exchange);
+    auto planner = phi::funcs::MatmulPlanner(
+        vectorize(x->dims()),
+        vectorize(y->dims()),
+        trans_x,
+        trans_y,
+        paddle::experimental::CppTypeToDataType<T>::Type(),
+        fused_type,
+        bias_data,
+        reserve_data,
+        use_addto,
+        no_exchange);
     auto setter =
         DescriptorSetter<MatmulGradDescriptor, T, DXT, DYT, TransX, TransY>(
             &planner,

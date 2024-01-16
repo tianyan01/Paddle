@@ -79,15 +79,6 @@ static void AllReduce(framework::Tensor &tensor,  // NOLINT
 #endif
 }
 
-inline bool CheckFlashAttn(const phi::GPUContext &dev_ctx,
-                           const phi::DenseTensor &x) {
-  int dev = dev_ctx.GetPlace().GetDeviceId();
-  if (!paddle::platform::IsSupportFlashAttn(dev)) {
-    return false;
-  }
-  return (x.dtype() == DataType::FLOAT16);
-}
-
 template <typename T>
 class FusedAttentionOpKernel : public framework::OpKernel<T> {
  public:
@@ -146,8 +137,6 @@ class FusedAttentionOpKernel : public framework::OpKernel<T> {
     int seed_val_1 = ctx.Attr<int>("attn_dropout_seed");
     int ring_id = ctx.Attr<int>("ring_id");
 
-    // check support flash attn
-    bool is_support_flash_attn = CheckFlashAttn(dev_ctx, *input_x);
     // final output.
     auto *out = ctx.Output<Tensor>("Y");
 
@@ -160,9 +149,11 @@ class FusedAttentionOpKernel : public framework::OpKernel<T> {
     auto *qkv_bias_data = (qkv_bias == nullptr) ? nullptr : qkv_bias->data<T>();
     auto *qkv_out_data =
         dev_ctx.template Alloc<T>(qkv_out, qkv_out->numel() * sizeof(T));
-    if (qkv_bias != nullptr) {
-      qkv_bias_out = qkv_out;
-    }
+    auto *qkv_bias_out_data =
+        (qkv_bias == nullptr)
+            ? nullptr
+            : dev_ctx.template Alloc<T>(qkv_bias_out,
+                                        qkv_bias_out->numel() * sizeof(T));
 
     // get data ptr for FMHA.
     auto *transpose_out_2_data = dev_ctx.template Alloc<T>(
@@ -172,25 +163,22 @@ class FusedAttentionOpKernel : public framework::OpKernel<T> {
             ? nullptr
             : dev_ctx.template Alloc<T>(cache_kv_out,
                                         cache_kv_out->numel() * sizeof(T));
-    if (!is_support_flash_attn) {
-      auto *qk_out_data =
-          dev_ctx.template Alloc<T>(qk_out, qk_out->numel() * sizeof(T));
-
-      auto *qktv_out_data =
-          dev_ctx.template Alloc<T>(qktv_out, qktv_out->numel() * sizeof(T));
-      auto *src_mask_out_data =
-          (src_mask == nullptr)
-              ? nullptr
-              : dev_ctx.template Alloc<T>(src_mask_out,
-                                          src_mask_out->numel() * sizeof(T));
-      auto *softmax_out_data = dev_ctx.template Alloc<T>(
-          softmax_out, softmax_out->numel() * sizeof(T));
-      auto *attn_dropout_mask_out_data = dev_ctx.template Alloc<uint8_t>(
-          attn_dropout_mask_out,
-          attn_dropout_mask_out->numel() * sizeof(uint8_t));
-      auto *attn_dropout_out_data = dev_ctx.template Alloc<T>(
-          attn_dropout_out, attn_dropout_out->numel() * sizeof(T));
-    }
+    auto *qk_out_data =
+        dev_ctx.template Alloc<T>(qk_out, qk_out->numel() * sizeof(T));
+    auto *qktv_out_data =
+        dev_ctx.template Alloc<T>(qktv_out, qktv_out->numel() * sizeof(T));
+    auto *src_mask_out_data =
+        (src_mask == nullptr)
+            ? nullptr
+            : dev_ctx.template Alloc<T>(src_mask_out,
+                                        src_mask_out->numel() * sizeof(T));
+    auto *softmax_out_data = dev_ctx.template Alloc<T>(
+        softmax_out, softmax_out->numel() * sizeof(T));
+    auto *attn_dropout_mask_out_data = dev_ctx.template Alloc<uint8_t>(
+        attn_dropout_mask_out,
+        attn_dropout_mask_out->numel() * sizeof(uint8_t));
+    auto *attn_dropout_out_data = dev_ctx.template Alloc<T>(
+        attn_dropout_out, attn_dropout_out->numel() * sizeof(T));
     auto *fmha_out_data =
         dev_ctx.template Alloc<T>(fmha_out, fmha_out->numel() * sizeof(T));
 
@@ -242,6 +230,12 @@ class FusedAttentionOpKernel : public framework::OpKernel<T> {
                                         is_fix_seed_1,
                                         seed_val_1,
                                         seed_1);
+    auto fmha_ref_compute = FMHARef<T>(ctx.cuda_device_context(),
+                                       batch_size,
+                                       max_seq_len,
+                                       num_head,
+                                       dim_head,
+                                       attn_dropout_param);
 
     output_size = hidden_size;
     // (transA, transB, compute_bias) = (false, false, false)
@@ -283,36 +277,26 @@ class FusedAttentionOpKernel : public framework::OpKernel<T> {
                                         ln_mean_data,
                                         ln_var_data);
       qkv_compute.ComputeForward(
-          qkv_weight, ln_out, qkv_bias, qkv_out, qkv_out);
+          qkv_weight, ln_out, qkv_bias, qkv_out, qkv_bias_out);
     } else {
       qkv_compute.ComputeForward(
-          qkv_weight, input_x, qkv_bias, qkv_out, qkv_out);
+          qkv_weight, input_x, qkv_bias, qkv_out, qkv_bias_out);
     }
-    if (is_support_flash_attn) {
-      auto fmha_ref_compute =
-          FlashAttnFMHARef<plat::float16>(ctx.cuda_device_context(),
-                                          batch_size,
-                                          max_seq_len,
-                                          num_head,
-                                          dim_head,
-                                          attn_dropout_param);
+    if (qkv_bias == nullptr) {
       fmha_ref_compute.ComputeForward(*qkv_out,
                                       cache_kv,
                                       src_mask,
                                       transpose_out_2,
                                       cache_kv_out,
-                                      softmax_out,            // softmax_lse_out
-                                      attn_dropout_mask_out,  // seek_offset
-                                      attn_dropout_out,       // softmax_out
+                                      qk_out,
+                                      src_mask_out,
+                                      softmax_out,
+                                      attn_dropout_mask_out,
+                                      attn_dropout_out,
+                                      qktv_out,
                                       fmha_out);
     } else {
-      auto fmha_ref_compute = FMHARef<T>(ctx.cuda_device_context(),
-                                         batch_size,
-                                         max_seq_len,
-                                         num_head,
-                                         dim_head,
-                                         attn_dropout_param);
-      fmha_ref_compute.ComputeForward(*qkv_out,
+      fmha_ref_compute.ComputeForward(*qkv_bias_out,
                                       cache_kv,
                                       src_mask,
                                       transpose_out_2,
@@ -466,32 +450,33 @@ class FusedAttentionGradKernel : public framework::OpKernel<T> {
         ctx.Output<Tensor>(framework::GradVarName("OutLinearOut"));
     auto *d_bias_dropout_residual_out =
         ctx.Output<Tensor>(framework::GradVarName("BiasDropoutResidualOut"));
-
-    // flash attention
-    bool is_support_flash_attn = CheckFlashAttn(dev_ctx, *input_x);
-
     auto *d_x_data = dev_ctx.template Alloc<T>(d_x, d_x->numel() * sizeof(T));
     // when qkv_bias is not nullptr, d_qkv_out is equals to d_qkv_bias_out, the
     // space can be reused.
-    auto *d_qkv_out_data =
-        dev_ctx.template Alloc<T>(d_qkv_out, d_qkv_out->numel() * sizeof(T));
+    auto *d_qkv_out_data = (d_qkv_bias_out != nullptr)
+                               ? nullptr
+                               : dev_ctx.template Alloc<T>(
+                                     d_qkv_out, d_qkv_out->numel() * sizeof(T));
+    auto *d_qkv_bias_out_data =
+        (d_qkv_bias_out == nullptr)
+            ? nullptr
+            : dev_ctx.template Alloc<T>(d_qkv_bias_out,
+                                        d_qkv_bias_out->numel() * sizeof(T));
+    auto *d_qktv_out_data =
+        dev_ctx.template Alloc<T>(d_qktv_out, d_qktv_out->numel() * sizeof(T));
     auto *d_transpose_out_2_data = dev_ctx.template Alloc<T>(
         d_transpose_out_2, d_transpose_out_2->numel() * sizeof(T));
-    if (!is_support_flash_attn) {
-      auto *d_qktv_out_data = dev_ctx.template Alloc<T>(
-          d_qktv_out, d_qktv_out->numel() * sizeof(T));
-      auto *d_qk_out_data =
-          dev_ctx.template Alloc<T>(d_qk_out, d_qk_out->numel() * sizeof(T));
-      auto *d_softmax_out_data = dev_ctx.template Alloc<T>(
-          d_softmax_out, d_softmax_out->numel() * sizeof(T));
-      auto *d_attn_dropout_out_data = dev_ctx.template Alloc<T>(
-          d_attn_dropout_out, d_attn_dropout_out->numel() * sizeof(T));
-      auto *d_src_mask_out_data =
-          (src_mask == nullptr)
-              ? nullptr
-              : dev_ctx.template Alloc<T>(d_src_mask_out,
-                                          d_src_mask_out->numel() * sizeof(T));
-    }
+    auto *d_qk_out_data =
+        dev_ctx.template Alloc<T>(d_qk_out, d_qk_out->numel() * sizeof(T));
+    auto *d_softmax_out_data = dev_ctx.template Alloc<T>(
+        d_softmax_out, d_softmax_out->numel() * sizeof(T));
+    auto *d_attn_dropout_out_data = dev_ctx.template Alloc<T>(
+        d_attn_dropout_out, d_attn_dropout_out->numel() * sizeof(T));
+    auto *d_src_mask_out_data =
+        (src_mask == nullptr)
+            ? nullptr
+            : dev_ctx.template Alloc<T>(d_src_mask_out,
+                                        d_src_mask_out->numel() * sizeof(T));
     auto *d_fmha_out_data =
         dev_ctx.template Alloc<T>(d_fmha_out, d_fmha_out->numel() * sizeof(T));
     auto *d_out_linear_out_data = dev_ctx.template Alloc<T>(
@@ -564,6 +549,12 @@ class FusedAttentionGradKernel : public framework::OpKernel<T> {
                                         is_fix_seed_1,
                                         seed_val_1,
                                         seed_1);
+    auto fmha_ref_compute = FMHARef<T>(ctx.cuda_device_context(),
+                                       batch_size,
+                                       max_seq_len,
+                                       num_head,
+                                       dim_head,
+                                       attn_dropout_param);
     output_size = hidden_size;
     transA = false;
     transB = false;
@@ -633,29 +624,25 @@ class FusedAttentionGradKernel : public framework::OpKernel<T> {
                                        d_fmha_out,
                                        d_out_linear_weight,
                                        nullptr);
-    if (is_support_flash_attn) {
-      auto fmha_ref_compute =
-          FlashAttnFMHARef<plat::float16>(ctx.cuda_device_context(),
-                                          batch_size,
-                                          max_seq_len,
-                                          num_head,
-                                          dim_head,
-                                          attn_dropout_param);
+
+    if (qkv_bias != nullptr) {
       fmha_ref_compute.ComputeBackward(*transpose_out_2,
                                        src_mask,
                                        *softmax_out,
-                                       *attn_dropout_mask_out,  // seek_offset
-                                       *fmha_out,
+                                       *attn_dropout_mask_out,
+                                       *attn_dropout_out,
+                                       *qk_out,
+                                       *src_mask_out,
                                        *d_fmha_out,
+                                       d_qktv_out,
+                                       d_attn_dropout_out,
+                                       d_softmax_out,
+                                       d_src_mask_out,
+                                       d_qk_out,
                                        d_transpose_out_2,
-                                       d_qkv_out);
+                                       nullptr,
+                                       d_qkv_bias_out);
     } else {
-      auto fmha_ref_compute = FMHARef<T>(ctx.cuda_device_context(),
-                                         batch_size,
-                                         max_seq_len,
-                                         num_head,
-                                         dim_head,
-                                         attn_dropout_param);
       fmha_ref_compute.ComputeBackward(*transpose_out_2,
                                        src_mask,
                                        *softmax_out,
@@ -697,9 +684,17 @@ class FusedAttentionGradKernel : public framework::OpKernel<T> {
                ? nullptr
                : dev_ctx.template Alloc<U>(d_ln_bias,
                                            d_ln_bias->numel() * sizeof(U)));
-
-      qkv_compute.ComputeBackward(
-          ln_out, qkv_weight, d_qkv_out, d_ln_out, d_qkv_weight, d_qkv_bias);
+      if (qkv_bias != nullptr) {
+        qkv_compute.ComputeBackward(ln_out,
+                                    qkv_weight,
+                                    d_qkv_bias_out,
+                                    d_ln_out,
+                                    d_qkv_weight,
+                                    d_qkv_bias);
+      } else {
+        qkv_compute.ComputeBackward(
+            ln_out, qkv_weight, d_qkv_out, d_ln_out, d_qkv_weight, d_qkv_bias);
+      }
       // tensor model parallel
       AllReduce<T>(*d_ln_out, ring_id, ctx.cuda_device_context());
       layer_norm_compute.ComputeBackward(x_data,
@@ -711,8 +706,13 @@ class FusedAttentionGradKernel : public framework::OpKernel<T> {
                                          d_ln_scale_data,
                                          d_ln_bias_data);
     } else {
-      qkv_compute.ComputeBackward(
-          input_x, qkv_weight, d_qkv_out, d_x, d_qkv_weight, d_qkv_bias);
+      if (qkv_bias != nullptr) {
+        qkv_compute.ComputeBackward(
+            input_x, qkv_weight, d_qkv_bias_out, d_x, d_qkv_weight, d_qkv_bias);
+      } else {
+        qkv_compute.ComputeBackward(
+            input_x, qkv_weight, d_qkv_out, d_x, d_qkv_weight, d_qkv_bias);
+      }
       // tensor model parallel
       AllReduce<T>(*d_x, ring_id, ctx.cuda_device_context());
     }
