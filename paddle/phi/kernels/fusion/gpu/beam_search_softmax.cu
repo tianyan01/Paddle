@@ -775,6 +775,88 @@ void invokeOneStageTopK(const Context &dev_ctx,
   }
 }
 
+template <typename T, int K>
+void invokeBatchTopK(int *tmp_ids,
+                     T *tmp_vals,
+                     const float *cum_log_probs,
+                     const int *step_ids,
+                     const bool *stop_flags, // bs * beam_size
+                     const int *sequence_lengths,
+                     const int *end_ids,
+                     int *ids,
+                     T *out_cum_log_probs,
+                     int *parent_idx,
+                     bool *stop_flags_out,
+                     int *seq_lens_out,
+                     int *step_ids_out,
+                     const int batch_size,
+                     const bool early_stop,
+                     cudaStream_t stream) {
+  if (early_stop) {
+    if (K > 10) {
+      reduced_batch_topk<T, K, 32><<<batch_size, 32, 0, stream>>>(
+        tmp_ids,
+        tmp_vals,
+        cum_log_probs,
+        step_ids,
+        stop_flags,
+        sequence_lengths,
+        end_ids,
+        ids,
+        out_cum_log_probs,
+        parent_idx,
+        stop_flags_out,
+        seq_lens_out,
+        step_ids_out);
+    } else {
+      batch_topk<T, K, 32><<<batch_size, 32, 0, stream>>>(
+        tmp_ids,
+        tmp_vals,
+        cum_log_probs,
+        step_ids,
+        stop_flags,
+        sequence_lengths,
+        end_ids,
+        ids,
+        out_cum_log_probs,
+        parent_idx,
+        stop_flags_out,
+        seq_lens_out,
+        step_ids_out);
+    }
+  } else {
+    if (K > 10) {
+      reduced_batch_topk<T, K, 32><<<batch_size, 32, 0, stream>>>(
+        tmp_ids,
+        tmp_vals,
+        step_ids,
+        stop_flags,
+        sequence_lengths,
+        end_ids,
+        ids,
+        out_cum_log_probs,
+        parent_idx,
+        stop_flags_out,
+        seq_lens_out,
+        step_ids_out);
+    } else {
+      batch_topk<T, K, 32><<<batch_size, 32, 0, stream>>>(
+        tmp_ids,
+        tmp_vals,
+        step_ids,
+        stop_flags,
+        sequence_lengths,
+        end_ids,
+        ids,
+        out_cum_log_probs,
+        parent_idx,
+        stop_flags_out,
+        seq_lens_out,
+        step_ids_out);
+    }
+  }
+}
+
 template <typename T, int K, typename Context>
 void invokeTopKSoftMaxLauncher(const Context &dev_ctx,
                                const T *log_probs,
@@ -838,37 +920,22 @@ void invokeTopKSoftMaxLauncher(const Context &dev_ctx,
                                       length_penalty);
   }
 
-  // (bs, bm)
-  if (early_stop) {
-    batch_topk<T, K, 32><<<batch_size, 32, 0, stream>>>(
-      tmp_ids, 
-      tmp_vals, 
-      cum_log_probs,
-      step_ids, 
-      stop_flags,
-      sequence_lengths,
-      end_ids,
-      ids, 
-      out_cum_log_probs, 
-      parent_idx,
-      stop_flags_out,
-      seq_lens_out,
-      step_ids_out);
-  } else {
-    batch_topk<T, K, 32><<<batch_size, 32, 0, stream>>>(
-      tmp_ids, 
-      tmp_vals, 
-      step_ids, 
-      stop_flags,
-      sequence_lengths,
-      end_ids,
-      ids, 
-      out_cum_log_probs, 
-      parent_idx,
-      stop_flags_out,
-      seq_lens_out,
-      step_ids_out);
-  }
+  invokeBatchTopK<T, K>(tmp_ids,
+                        tmp_vals,
+                        cum_log_probs,
+                        step_ids,
+                        stop_flags,
+                        sequence_lengths,
+                        end_ids,
+                        ids,
+                        out_cum_log_probs,
+                        parent_idx,
+                        stop_flags_out,
+                        seq_lens_out,
+                        step_ids_out,
+                        batch_size,
+                        early_stop,
+                        stream);
   invokeUpdateBeamOffset(last_beam_offsets,
                          parent_idx,
                          sequence_lengths,

@@ -311,6 +311,159 @@ __global__ void BeamSearchTopK(T* output,
   }
 }
 
+template<typename T>
+struct BatchTopK {
+  int id  = -1;
+  int tid = -1; // token id
+  int pid = -1; // parent beam id
+  T   val = -FLT_MAX; // score value
+
+  __device__ __forceinline__ void insert(int id, T val, int tid, int pid) {
+    if (val > this->val) {
+      this->id = id;
+      this->tid = tid;
+      this->pid = pid;
+      this->val = val;
+    }
+  }
+
+  __device__ __forceinline__ void init() {
+    id = -1;
+    tid = -1;
+    pid = -1;
+    val = -FLT_MAX;
+  }
+};
+
+template<typename T>
+__device__ __forceinline__ BatchTopK<T> reduce_topk_beam_op(const BatchTopK<T>& a,
+                                                            const BatchTopK<T>& b) {
+  if (a.val > b.val || (a.val == b.val && a.tid < b.tid)) {
+      return a;
+  } else {
+      return b;
+  }
+}
+
+template <typename T, int K, int THREADBLOCK_SIZE>
+__global__ void reduced_batch_topk(int *topk_tmp_id_buf, // batch_size * K * K
+                                   T *topk_tmp_val_buf,
+                                   const int *step_ids,
+                                   const bool *stop_flags,
+                                   const int *seq_lens,
+                                   const int *end_ids,
+                                   int *id_buf, // batch_size * K
+                                   T *val_buf,
+                                   int *parent_idx,
+                                   bool *stop_flags_out,
+                                   int *seq_lens_out,
+                                   int *step_ids_out) {
+  const int tid         = threadIdx.x; // 0 - BlockSize
+  const int bid         = blockIdx.x;  // 0 - BatchSize
+  const int tmp_buf_idx = bid * K * K;
+  const int tmp_buf_len = step_ids[0] == 0 ? K : K * K;
+  const int buf_idx     = bid * K;
+
+  typedef cub::BlockReduce<BatchTopK<T>, THREADBLOCK_SIZE> BlockReduce;
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+  BatchTopK<T> partial;
+
+  for (int k = 0; k < K; ++k) {
+    partial.init();
+    for (int i = tid; i < tmp_buf_len; i += THREADBLOCK_SIZE) {
+      const int idx = tmp_buf_idx + i;
+      partial.insert(idx, topk_tmp_val_buf[idx], topk_tmp_id_buf[idx], i / K);
+    }
+
+    BatchTopK<T> total = BlockReduce(temp_storage).Reduce(partial, reduce_topk_beam_op<T>);
+
+    if (tid == 0) {
+      const int idx = buf_idx + k;
+      id_buf[idx]  = total.tid;
+      val_buf[idx] = total.val;
+      parent_idx[idx] = total.pid;
+      stop_flags_out[idx] = stop_flags[buf_idx + total.pid];
+      seq_lens_out[idx] = seq_lens[buf_idx + total.pid];
+      step_ids_out[idx] = step_ids[buf_idx + total.pid];
+
+      topk_tmp_val_buf[total.id]  = -FLT_MAX;
+    }
+    __syncthreads();
+  }
+}
+
+// early stop
+template <typename T, int K, int THREADBLOCK_SIZE>
+__global__ void reduced_batch_topk(int* topk_tmp_id_buf,
+                                   T* topk_tmp_val_buf,
+                                   const float* cum_log_probs,
+                                   const int* step_ids,
+                                   const bool* stop_flags, // bs * beam_size
+                                   const int* seq_lens,
+                                   const int* end_ids,
+                                   int* id_buf,
+                                   T* val_buf,
+                                   int* parent_idx,
+                                   bool* stop_flags_out,
+                                   int* seq_lens_out,
+                                   int* step_ids_out) {
+  const int tid         = threadIdx.x; // 0 - BlockSize
+  const int bid         = blockIdx.x;  // 0 - BatchSize
+  const int tmp_buf_idx = bid * K * K;
+  const int buf_idx     = bid * K;
+
+  typedef cub::BlockReduce<BatchTopK<T>, THREADBLOCK_SIZE> BlockReduce;
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+  BatchTopK<T> partial;
+
+  for (int k = 0; k < K; ++k) {
+    const int idx = buf_idx + k;
+    if (stop_flags[idx]) {
+      if (tid == 0) {
+        id_buf[idx] = end_ids[0];
+        val_buf[idx] = cum_log_probs[idx];
+        parent_idx[idx] = k;
+        stop_flags_out[idx] = stop_flags[idx];
+        seq_lens_out[idx] = seq_lens[idx];
+        step_ids_out[idx] = step_ids[idx];
+      }
+
+      continue;
+    }
+
+    partial.init();
+
+    if (step_ids[0] == 0) {
+      for (int i = tid; i < K; i += THREADBLOCK_SIZE) {
+        const int idx = tmp_buf_idx + i;
+        partial.insert(idx, topk_tmp_val_buf[idx], topk_tmp_id_buf[idx], i / K);
+      }
+    } else {
+      for (int i = tid; i < K * K; i += THREADBLOCK_SIZE) {
+        // if stop, this branch end, no longer update.
+        if (!stop_flags[buf_idx + i / K]) {
+          const int idx = tmp_buf_idx + i;
+          partial.insert(idx, topk_tmp_val_buf[idx], topk_tmp_id_buf[idx], i / K);
+        }
+      }
+    }
+
+    BatchTopK<T> total = BlockReduce(temp_storage).Reduce(partial, reduce_topk_beam_op<T>);
+
+    if (tid == 0) {
+      id_buf[idx]  = total.tid;
+      val_buf[idx] = total.val;
+      parent_idx[idx] = total.pid;
+      stop_flags_out[idx] = stop_flags[buf_idx + total.pid];
+      seq_lens_out[idx] = seq_lens[buf_idx + total.pid];
+      step_ids_out[idx] = step_ids[buf_idx + total.pid];
+
+      topk_tmp_val_buf[total.id] = -FLT_MAX;
+    }
+    __syncthreads();
+  }
+}
+
 #undef FLT_MAX
 }  // namespace fusion
 }  // namespace phi
