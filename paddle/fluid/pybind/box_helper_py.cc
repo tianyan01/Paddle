@@ -142,7 +142,10 @@ void BindTrieManager(py::module* m) {
           py::arg("thr_num")=20u,
           py::call_guard<py::gil_scoped_release>())
       .def("reset",
-          &framework::TrieManager::reset,
+          py::overload_cast<>(&framework::TrieManager::reset),
+          py::call_guard<py::gil_scoped_release>())
+      .def("reset",
+          py::overload_cast<const std::vector<int>&>(&framework::TrieManager::reset),
           py::call_guard<py::gil_scoped_release>());
 }  // end TrieManager
 

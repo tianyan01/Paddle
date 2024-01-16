@@ -228,6 +228,35 @@ void PaddleInferTensorCreate(
   tensor.CopyFromCpu(static_cast<const T *>(data.data()));
 }
 
+void CopyFromCpuPaddleTensor(paddle_infer::Tensor &tensor,
+                             paddle::experimental::Tensor &&paddle_tensor) {
+  std::vector<int> shape;
+  for (int i = 0; i < paddle_tensor.dims().size(); ++i) {
+    shape.push_back(paddle_tensor.dims()[i]);
+  }
+  tensor.Reshape(std::move(shape));
+
+  switch (paddle_tensor.dtype()) {
+    case paddle::experimental::DataType::FLOAT16:
+      tensor.CopyFromCpu(static_cast<const paddle::platform::float16 *>(
+          paddle_tensor.data<paddle::platform::float16>()));
+      break;
+    case paddle::experimental::DataType::FLOAT32:
+      tensor.CopyFromCpu(static_cast<const float *>(paddle_tensor.data<float>()));
+      break;
+    case paddle::experimental::DataType::INT32:
+      tensor.CopyFromCpu(static_cast<const int32_t *>(paddle_tensor.data<int32_t>()));
+      break;
+    case paddle::experimental::DataType::INT64:
+      tensor.CopyFromCpu(static_cast<const int64_t *>(paddle_tensor.data<int64_t>()));
+      break;
+    default:
+      PADDLE_THROW(platform::errors::Unimplemented(
+        "Unsupported data type. Now copy_from_cpu only supports FLOAT16, FLOAT32, "
+        "INT32, and INT64."));
+  }
+}
+
 paddle_infer::PlaceType ToPaddleInferPlace(
     phi::AllocationType allocation_type) {
   if (allocation_type == phi::AllocationType::CPU) {
@@ -585,7 +614,8 @@ void BindPaddlePredictor(py::module *m) {
              std::vector<PaddleTensor> outputs;
              self.Run(inputs, &outputs);
              return outputs;
-           })
+           },
+           py::call_guard<py::gil_scoped_release>())
       .def("get_input_tensor", &PaddlePredictor::GetInputTensor)
       .def("get_output_tensor", &PaddlePredictor::GetOutputTensor)
       .def("get_input_names", &PaddlePredictor::GetInputNames)
@@ -634,7 +664,8 @@ void BindNativePredictor(py::module *m) {
              std::vector<PaddleTensor> outputs;
              self.Run(inputs, &outputs);
              return outputs;
-           })
+           },
+           py::call_guard<py::gil_scoped_release>())
       .def("get_input_tensor", &NativePaddlePredictor::GetInputTensor)
       .def("get_output_tensor", &NativePaddlePredictor::GetOutputTensor)
       .def("zero_copy_run", &NativePaddlePredictor::ZeroCopyRun)
@@ -926,7 +957,8 @@ void BindAnalysisPredictor(py::module *m) {
             std::vector<PaddleTensor> outputs;
             self.Run(inputs, &outputs);
             return outputs;
-          })
+          },
+          py::call_guard<py::gil_scoped_release>())
       .def("get_input_tensor", &AnalysisPredictor::GetInputTensor)
       .def("get_output_tensor", &AnalysisPredictor::GetOutputTensor)
       .def("get_input_names", &AnalysisPredictor::GetInputNames)
@@ -972,11 +1004,9 @@ void BindPaddleInferPredictor(py::module *m) {
       .def("get_output_handle", &paddle_infer::Predictor::GetOutputHandle)
       .def("run",
            [](paddle_infer::Predictor &self) {
-#ifdef PADDLE_WITH_ASCEND_CL
-             pybind11::gil_scoped_release release;
-#endif
              self.Run();
-           })
+           },
+           py::call_guard<py::gil_scoped_release>())
       .def("clone",
            [](paddle_infer::Predictor &self) { return self.Clone(nullptr); })
 #if defined(PADDLE_WITH_CUDA) || defined(PADDLE_WITH_HIP)
@@ -1024,6 +1054,11 @@ void BindPaddleInferTensor(py::module *m) {
       .def("copy_from_cpu_bind",
            &PaddleInferTensorCreate<paddle_infer::float16>)
       .def("copy_from_cpu_bind", &PaddleInferStringTensorCreate)
+      .def("_copy_from_cpu_bind",
+           [](paddle_infer::Tensor &self, const py::handle &input) {
+             PyObject *obj = input.ptr();
+             CopyFromCpuPaddleTensor(self, std::move(CastPyArg2Tensor(obj, 0)));
+           })
       .def("share_external_data_bind", &PaddleInferShareExternalData)
       .def("_share_external_data_paddle_tensor_bind",
            [](paddle_infer::Tensor &self, const py::handle &input) {
