@@ -541,9 +541,7 @@ __global__ __launch_bounds__(THREADS_PER_CTA) void fused_fast_ln_fwd_kernel(
 #pragma unroll
         for (int jt = 0; jt < VecSize; jt++) {
           // dropout(x) + residual
-          if (std::is_same<InType, int32_t>::value ||
-              (std::is_same<OutType, int8_t>::value &&
-               std::is_same<InType, phi::dtype::float16>::value)) {
+          if (std::is_same<InType, int32_t>::value) {
             T tmp = (static_cast<T>(static_cast<float>(x_input[it][jt]) *
                                     quant_last_in_scale /
                                     dequant_out_scale[it][jt]) +
@@ -566,9 +564,7 @@ __global__ __launch_bounds__(THREADS_PER_CTA) void fused_fast_ln_fwd_kernel(
 #pragma unroll
         for (int jt = 0; jt < VecSize; jt++) {
           // dropout(x) + residual
-          if (std::is_same<InType, int32_t>::value ||
-              (std::is_same<OutType, int8_t>::value &&
-               std::is_same<InType, phi::dtype::float16>::value)) {
+          if (std::is_same<InType, int32_t>::value) {
             // for int32 input, we need to dequantize.
             T tmp = static_cast<T>(static_cast<float>(x_input[it][jt]) *
                                    quant_last_in_scale /

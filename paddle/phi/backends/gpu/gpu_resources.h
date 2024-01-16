@@ -17,7 +17,6 @@
 
 #include "paddle/phi/backends/gpu/gpu_decls.h"
 #include "paddle/phi/common/place.h"
-#include <cusparseLt.h>
 
 namespace phi {
 
@@ -48,8 +47,6 @@ void DestroySolverHandle(solverHandle_t solver_handle);
 void InitSparseHandle(sparseHandle_t* handle, gpuStream_t stream);
 void DestroySparseHandle(sparseHandle_t handle);
 
-void InitSparseLtHandle(cusparseLtHandle_t* handle);
-void DestroySparseLtHandle(cusparseLtHandle_t* handle);
 // void InitDnnWorkspace();
 
 }  // namespace phi

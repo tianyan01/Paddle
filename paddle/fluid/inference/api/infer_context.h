@@ -34,7 +34,6 @@ class InferGPUContext : public phi::GPUContext {
   using phi::GPUContext::SetEigenDevice;
   using phi::GPUContext::SetSolverHandle;
   using phi::GPUContext::SetSparseHandle;
-  using phi::GPUContext::SetSparseLtHandle;
   using phi::GPUContext::SetStream;
   // using phi::GPUContext::SetDnnWorkspaceHandle;
   using phi::GPUContext::SetComputeCapability;
