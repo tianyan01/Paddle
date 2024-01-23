@@ -21,9 +21,8 @@ limitations under the License. */
 #include "paddle/phi/kernels/gpu/fused_moe_kernel.cu.h"
 #include "paddle/phi/kernels/weight_only_linear_kernel.h"
 
-PADDLE_DEFINE_EXPORTED_bool(enable_moe_gemm_cutlass,
-                            false,
-                            "enable moe gemm cutlass ,default false");
+DECLARE_bool(enable_moe_gemm_cutlass);
+
 namespace paddle {
 namespace operators {
 using Tensor = phi::DenseTensor;

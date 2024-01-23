@@ -17,6 +17,7 @@ limitations under the License. */
 #if defined(PADDLE_WITH_CUTLASS)
 #include "paddle/phi/common/datatype_traits.h"
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/moe_gemm/moe_gemm_kernels_template.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/ptq_moe_gemm/ptq_moe_gemm.h"
 #endif
 namespace paddle {
 namespace operators {
@@ -133,6 +134,79 @@ class MoeExpertGemmWeightOnly {
 #endif
   bool is_uint4_ = false;
 };
+
+// for ptq
+template <typename T>
+void FusedGroupedMatMul(const phi::GPUContext& dev_ctx,
+                        const int8_t* weight, // int8
+                        const T* input, // fp16, shape is [fwd_bsz, k]
+                        Tensor* input_tmp, // int8
+                        const float* quant_in_scale,
+                        const T* bias, // fp16
+                        T* output_deq,
+                        const float* dequant_out_scale, // fp32
+                        const int64_t* fwd_expert_count_cumsum, // int64
+                        const int64_t* fwd_expert_count_cumsum_cpu, // cpu
+                        int fwd_bsz,
+                        int num_expert,
+                        int m,
+                        int n,
+                        int k,
+                        const bool do_activation,
+                        const int quant_round_type = 1,
+                        const float quant_max_bound = 127.0,
+                        const float quant_min_bound = -127.0) {
+#if defined(PADDLE_WITH_CUTLASS)
+  int64_t offset = 0;
+  for (int i = 0; i < num_expert; ++i) {
+    int64_t cur_m = *(fwd_expert_count_cumsum_cpu + i + 1) - *(fwd_expert_count_cumsum_cpu + i);
+    if (cur_m == 0) {
+      continue;
+    }
+    quantize_kernel_launcher<T>(input + offset,
+                                input_tmp->data<int8_t>() + offset,
+                                *(quant_in_scale + i),
+                                cur_m, // cur m
+                                k,
+                                quant_round_type,
+                                quant_max_bound,
+                                quant_min_bound,
+                                dev_ctx.stream());
+    offset += cur_m * k;
+  };
+
+  // group_quantize_kernel_launcher(input,
+  //                               input_tmp->data<int8_t>(),
+  //                               quant_in_scale,
+  //                               fwd_expert_count,
+  //                               num_expert,
+  //                               m,
+  //                               k,
+  //                               quant_round_type,
+  //                               quant_max_bound,
+  //                               quant_min_bound,
+  //                               dev_ctx.stream());
+
+  using half_dtype = typename phi::PDDataTypeTraits<paddle::platform::float16>::DataType;
+  auto moe_gemm_runner = phi::PTQMoeGemmRunner<half_dtype>();
+  // int8 gemm & dequant & add biad & act(optional)
+  moe_gemm_runner.moe_gemm_bias_act(input_tmp->data<int8_t>(),
+                                    weight,
+                                    dequant_out_scale,
+                                    reinterpret_cast<const half_dtype*>(bias), // bias
+                                    reinterpret_cast<half_dtype*>(output_deq),
+                                    fwd_expert_count_cumsum,
+                                    fwd_bsz,
+                                    n,
+                                    k,
+                                    num_expert,
+                                    do_activation,
+                                    dev_ctx.stream());
+#else
+  PADDLE_THROW(platform::errors::InvalidArgument(
+      "this machine not support FusedGroupedMatMul use cutlass"));
+#endif
+}
 
 }  // namespace operators
 }  // namespace paddle

@@ -1461,6 +1461,7 @@ class FusedMultiTransformer(Layer):
         trans_to_fp16(self.ffn2_biases)
         self._dtype = dtype
 
+
 class FusedMultiTransformerWeightOnly(Layer):
     """
     FusedMultiTransfor on weight quant
@@ -1802,7 +1803,6 @@ class FusedMultiTransformerWeightOnly(Layer):
         trans_to_int8(self.ffn1_weights)
         trans_to_int8(self.ffn2_weights)
         self._dtype = "int8"
-
 
 
 class FusedMultiTransformerINT8(Layer):
@@ -2350,7 +2350,7 @@ class FusedMultiTransformerMoe(Layer):
 
         # origin fmt config
         self.normalize_before = normalize_before
-        self._dtype = self._helper.get_default_dtype()
+        self._dtype = "float16"
         self._epsilon = epsilon
         self._trans_qkvw = trans_qkvw
         self._ring_id = ring_id
@@ -2895,7 +2895,6 @@ class FusedMultiTransformerMoeINT8(Layer):
                 expert_bias2_attr = get_attr(expert_bias2_attrs, i * num_expert + j)
 
                 expert_weight1 = self.create_parameter(
-                    # shape=[d_model, dim_feedforward],
                     shape=[dim_feedforward, d_model],
                     attr=expert_weight1_attr,
                     dtype=self._dtype,
@@ -2910,7 +2909,6 @@ class FusedMultiTransformerMoeINT8(Layer):
                     default_initializer=nn.initializer.Constant(value=0.0)
                 )
                 expert_weight2 = self.create_parameter(
-                    # shape=[dim_feedforward, d_model],
                     shape=[d_model, dim_feedforward],
                     attr=expert_weight2_attr,
                     dtype=self._dtype,
@@ -2940,6 +2938,8 @@ class FusedMultiTransformerMoeINT8(Layer):
                 expert_bias1.name = "expert_" + expert_bias1.name
                 expert_weight2.name = "expert_" + expert_weight2.name
                 expert_bias2.name = "expert_" + expert_bias2.name
+                expert_weight1_out_scale.name = "expert_" + expert_weight1_out_scale.name
+                expert_weight2_out_scale.name = "expert_" + expert_weight2_out_scale.name
                 self.expert_weights1.append(expert_weight1)
                 self.expert_biases1.append(expert_bias1)
                 self.expert_weights2.append(expert_weight2)
@@ -2951,6 +2951,8 @@ class FusedMultiTransformerMoeINT8(Layer):
         self.name = name
         # int8
         self._int8_decorate()
+        self._share_expert_param(num_layers, num_expert, dim_feedforward, d_model)
+        self._dtype = "int8"
 
     def forward(self, src, attn_mask=None, caches=None, seq_lens=None, beam_offset=None, time_step=None):
         """
@@ -3036,8 +3038,71 @@ class FusedMultiTransformerMoeINT8(Layer):
         trans_to_int8(self.linear_weights)
         trans_to_int8(self.expert_weights1)
         trans_to_int8(self.expert_weights2)
-        self._dtype = "int8"
+        # self._dtype = "int8"
 
+    def _share_expert_param(self, num_layers, num_expert, dim_feedforward, d_model):
+        """
+        share_param
+        """
+        def shard_tensor(dst_tensor, parent_tensor, pos):
+            tmp = parent_tensor.value().get_tensor()._slice(pos, pos + 1)
+            dst_tensor.value().get_tensor()._share_data_buffer(tmp, False)
+
+        self.shared_weights1, self.shared_scales1, self.shared_biases1 = ParameterList(), ParameterList(), ParameterList()
+        self.shared_weights2, self.shared_scales2, self.shared_biases2 = ParameterList(), ParameterList(), ParameterList()
+
+        for i in range(num_layers):
+            shared_weight1 = paddle.create_parameter(
+                # name=f"moe.expert.layer{i}.shared_weight1",
+                shape=[num_expert, dim_feedforward, d_model],
+                dtype="uint8",
+                default_initializer=nn.initializer.Constant(value=0))
+            shared_scale1 = paddle.create_parameter(
+                # name=f"moe.expert.layer{i}.shared_scale1",
+                shape=[num_expert, dim_feedforward],
+                dtype="float32",
+                default_initializer=nn.initializer.Constant(value=0.0))
+            shared_bias1 = paddle.create_parameter(
+                # name=f"moe.expert.layer{i}.shared_bias1",
+                shape=[num_expert, dim_feedforward],
+                dtype=self._dtype,
+                default_initializer=nn.initializer.Constant(value=0.0))
+            
+            shared_weight2 = paddle.create_parameter(
+                # name=f"moe.expert.layer{i}.shared_weight2",
+                shape=[num_expert, d_model, dim_feedforward],
+                dtype="uint8",
+                default_initializer=nn.initializer.Constant(value=0))
+            shared_scale2 = paddle.create_parameter(
+                # name=f"moe.expert.layer{i}.shared_scale2",
+                shape=[num_expert, d_model],
+                dtype="float32",
+                default_initializer=nn.initializer.Constant(value=0.0))
+            shared_bias2 = paddle.create_parameter(
+                # name=f"moe.expert.layer{i}.shared_bias2",
+                shape=[num_expert, d_model],
+                dtype=self._dtype,
+                default_initializer=nn.initializer.Constant(value=0.0))
+
+            _to_dtype(shared_weight1, "int8")
+            _to_dtype(shared_weight2, "int8")
+
+            for j in range(self.num_expert):
+                expert_idx = j + i * self.num_expert
+                shard_tensor(self.expert_weights1[expert_idx], shared_weight1, j)
+                shard_tensor(self.expert_weight1_out_scales[expert_idx], shared_scale1, j)
+                shard_tensor(self.expert_biases1[expert_idx], shared_bias1, j)
+                shard_tensor(self.expert_weights2[expert_idx], shared_weight2, j)
+                shard_tensor(self.expert_weight2_out_scales[expert_idx], shared_scale2, j)
+                shard_tensor(self.expert_biases2[expert_idx], shared_bias2, j)
+
+            self.shared_weights1.append(shared_weight1)
+            self.shared_scales1.append(shared_scale1) 
+            self.shared_biases1.append(shared_bias1)
+
+            self.shared_weights2.append(shared_weight2)
+            self.shared_scales2.append(shared_scale2) 
+            self.shared_biases2.append(shared_bias2)
 
 class FusedMultiTransformerMoeWeightOnly(Layer):
     """

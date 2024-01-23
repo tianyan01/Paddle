@@ -1020,3 +1020,9 @@ PADDLE_DEFINE_EXPORTED_bool(
 PADDLE_DEFINE_EXPORTED_string(jit_engine_type,
                               "Predictor",
                               "Choose default funciton type in JitLayer.");
+/**
+ * CUTLASS related FLAG
+ */
+PADDLE_DEFINE_EXPORTED_bool(enable_moe_gemm_cutlass,
+                            false,
+                            "enable moe gemm cutlass ,default false");

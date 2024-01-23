@@ -133,27 +133,26 @@ class AttnMatmulINT8 {
                   (void*)workspace->data<int8_t>(),
                   workspace->numel());
 
-    dequantize_kernel_launcher<T>(output_tmp->data<int32_t>(),
-                                  output->data<T>(),
-                                  m_,
-                                  n_,
-                                  dev_ctx_.stream(),
-                                  gpu_config_.get(),
-                                  quant_in_scale,
-                                  dequant_out_scale->data<float>());
-
     if (compute_bias_) {
-      // bias_out = output + bias
-      std::vector<const phi::DenseTensor*> ins = {output, bias};
-      std::vector<phi::DenseTensor*> outs = {bias_out};
-      phi::funcs::BroadcastKernel<phi::ElementwiseType::kBinary, T, T>(
-          dev_ctx_, ins, &outs, -1, phi::funcs::AddFunctor<T>());
-    //   PADDLE_ENFORCE_EQ(cudaGetLastError(),
-    //                     cudaSuccess,
-    //                     platform::errors::Fatal(
-    //                         "cuda error occured after computing bias. "
-    //                         "But it does not mean this error is caused by "
-    //                         "bias computing"));
+      dequantize_addbias_kernel_launcher<T, true>(output_tmp->data<int32_t>(),
+                                                  bias->data<T>(),
+                                                  output->data<T>(),
+                                                  m_,
+                                                  n_,
+                                                  dev_ctx_.stream(),
+                                                  gpu_config_.get(),
+                                                  quant_in_scale,
+                                                  dequant_out_scale->data<float>());
+    } else {
+      dequantize_addbias_kernel_launcher<T, false>(output_tmp->data<int32_t>(),
+                                                   nullptr,
+                                                   output->data<T>(),
+                                                   m_,
+                                                   n_,
+                                                   dev_ctx_.stream(),
+                                                   gpu_config_.get(),
+                                                   quant_in_scale,
+                                                   dequant_out_scale->data<float>());
     }
   }
 

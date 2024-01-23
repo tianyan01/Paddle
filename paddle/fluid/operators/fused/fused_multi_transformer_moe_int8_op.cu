@@ -13,14 +13,18 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 // #define DEBUG_MOE_TMPROFILE_INT8
 #include "paddle/fluid/operators/fused/fused_multi_transformer_moe_op.h"
+#include "paddle/fluid/operators/fused/fused_multi_transformer_op.h"
 #include "paddle/fluid/operators/fused/layernorm_quant_dequant.h"
 #include "paddle/phi/kernels/funcs/scatter.cu.h"
+#include "paddle/fluid/operators/fused/moe_expert_gemm.h"
 #ifdef DEBUG_MOE_TMPROFILE_INT8
 #include "paddle/fluid/platform/timer.h"
 #endif
+
+DECLARE_bool(enable_moe_gemm_cutlass);
+
 namespace paddle {
 namespace operators {
-
 using Tensor = phi::DenseTensor;
 // #define _DEBUG_FUSED_MULTI_TRANSFORMER
 
@@ -66,6 +70,11 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     all_tm.Start();
     other_tm.Start();
 #endif
+#ifndef PADDLE_WITH_CUTLASS
+    PADDLE_ENFORCE_EQ(FLAGS_enable_moe_gemm_cutlass, false,
+                      "not support cutlass fused moe gemm please disable "
+                      "FLAGS_enable_moe_gemm_cutlass");
+#endif
     auto *time_step = ctx.Input<Tensor>("TimeStep");
     // 0. input
     auto *input_x = ctx.Input<Tensor>("X");
@@ -105,11 +114,15 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
         ctx.MultiInput<Tensor>("ExpertWeight2OutScale");
 
     auto *sequence_lengths = ctx.Input<Tensor>("SeqLengths");
+
     auto *beam_cache_offset = ctx.Input<Tensor>("BeamCacheOffset");
     int beam_size = 1;
     if (beam_cache_offset) {
       beam_size = beam_cache_offset->dims()[1];
     }
+
+    auto *out = ctx.Output<Tensor>("Out");
+    auto *from_data = dev_ctx.Alloc<T>(out, out->numel() * sizeof(T));
 
     // 1. layer norm
     const auto pre_layer_norm = ctx.Attr<bool>("pre_layer_norm");
@@ -184,6 +197,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     if (!is_support_flash_attn) {
       qk_out.Resize({{bsz, num_head, seq_len, out_seq_len}});
       auto *qk_out_data = dev_ctx.Alloc<T>(&qk_out, qk_out.numel() * sizeof(T));
+
       softmax_out.Resize({{bsz, num_head, seq_len, out_seq_len}});
       auto *softmax_out_data =
           dev_ctx.Alloc<T>(&softmax_out, softmax_out.numel() * sizeof(T));
@@ -216,7 +230,6 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     bias_dropout_residual_out_data =
         dev_ctx.Alloc<T>(&bias_dropout_residual_out,
                          bias_dropout_residual_out.numel() * sizeof(T));
-    uint8_t *dropout_mask_out_data = nullptr;
 
     // 6. moe layer: gate / expert_w & b / some attrs
     auto gate_weights = ctx.MultiInput<Tensor>("GateWeight");
@@ -269,21 +282,25 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
                            local_expert_count.numel() * sizeof(int64_t));
     dev_ctx.Alloc<int64_t>(&global_expert_count,
                            global_expert_count.numel() * sizeof(int64_t));
-    // fwd_expert_count, fwd_batch_size
-    Tensor fwd_expert_count, fwd_batch_size;
-    Tensor fwd_expert_count_cpu, fwd_batch_size_cpu;
+    // fwd_expert_count
+    Tensor fwd_expert_count, fwd_expert_count_cumsum;
+    Tensor fwd_expert_count_cumsum_cpu;
     fwd_expert_count.Resize({{num_expert}});
-    fwd_batch_size.Resize({{1}});
+    fwd_expert_count_cumsum.Resize({{num_expert + 1}});
     dev_ctx.Alloc<int64_t>(&fwd_expert_count,
                            fwd_expert_count.numel() * sizeof(int64_t));
-    dev_ctx.Alloc<int64_t>(&fwd_batch_size,
-                           fwd_batch_size.numel() * sizeof(int64_t));
+    auto fwd_expert_count_cumsum_data = dev_ctx.Alloc<int64_t>(&fwd_expert_count_cumsum,
+                                            fwd_expert_count_cumsum.numel() * sizeof(int64_t));
+    phi::funcs::set_constant<int64_t>(
+        dev_ctx, &fwd_expert_count_cumsum, static_cast<int64_t>(0));
     // pos, temp pos
     Tensor pos, temp_pos;
     pos.Resize({{out_batch_size}});
     temp_pos.Resize({{out_batch_size}});
     dev_ctx.Alloc<int64_t>(&pos, pos.numel() * sizeof(int64_t));
-    dev_ctx.Alloc<int64_t>(&temp_pos, temp_pos.numel() * sizeof(int64_t));
+    if (topk > 1) {
+      dev_ctx.Alloc<int64_t>(&temp_pos, temp_pos.numel() * sizeof(int64_t));
+    }
     // cumsum
     Tensor lec_cum;
     lec_cum.Resize({{tot_expert}});
@@ -304,12 +321,6 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     Tensor all_gather_out;
     all_gather_out.Resize({{bsz_seq, dim_embed}});
     dev_ctx.Alloc<T>(&all_gather_out, all_gather_out.numel() * sizeof(T));
-    // topk tensor
-    Tensor topk_tensor;
-    topk_tensor.Resize({{1}});
-    dev_ctx.Alloc<int64_t>(&topk_tensor, topk_tensor.numel() * sizeof(int64_t));
-    phi::FullKernel<int64_t, phi::GPUContext>(
-        dev_ctx, {1}, topk, pos.dtype(), &topk_tensor);
 
     // moe nccl
     phi::NCCLMoECollective moe_pg(dev_ctx, moe_ring_id, num_expert);
@@ -334,16 +345,13 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
                           cublaslt_workspace.numel() * sizeof(int8_t));
 
     // calc
-    auto *out = ctx.Output<Tensor>("Out");
-    auto *from_data = dev_ctx.Alloc<T>(out, out->numel() * sizeof(T));
-
     Tensor buf0, moe_out;
     buf0.Resize({{bsz_seq, dim_embed}});
     dev_ctx.Alloc<T>(&buf0, buf0.numel() * sizeof(T));
     moe_out.ShareDataWith(*out);
     moe_out.Resize({{bsz_seq, dim_embed}});
-
     const T *x_data = input_x->data<T>();
+    
 #ifdef DEBUG_MOE_TMPROFILE_INT8
     dev_ctx.Wait();
     other_tm.Pause();
@@ -632,52 +640,36 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
                                                global_expert_count.dtype(),
                                                false,
                                                &fwd_expert_count);
-      // fwd batch size
-      phi::SumKernel<int64_t, phi::GPUContext>(
-          dev_ctx,
-          fwd_expert_count,
-          phi::IntArray({}),  // axis is None
-          fwd_expert_count.dtype(),
-          false,
-          &fwd_batch_size);
+      // fwd batch size, we dont compute this
+      phi::CumsumTensorValue<int64_t>(
+          dev_ctx, fwd_expert_count, &fwd_expert_count_cumsum, 1);
       // step4.3 cumsum & assign pos
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, cumsum";
 #endif
-      phi::CumsumKernel<int64_t, phi::GPUContext>(
-          dev_ctx, local_expert_count, 0, false, false, false, &lec_cum);
+      phi::CumsumTensorValue<int64_t>(dev_ctx, local_expert_count, &lec_cum);
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, assign pos";
 #endif
-      phi::AssignPosCompute<int64_t>(
-          dev_ctx, &lec_cum, &topk_idx, &pos, out_batch_size);
-#ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
-      VLOG(0) << "moe, floor divide";
-#endif
-      if (topk > 1) {
-        phi::FloorDivideKernel<int64_t, phi::GPUContext>(
-            dev_ctx, pos, topk_tensor, &temp_pos);
-      } else {
-        temp_pos = pos;
-      }
+      phi::AssignInsAndPosCompute<int64_t>(
+          dev_ctx, &lec_cum, &topk_idx, &pos, out_batch_size, topk, &temp_pos);
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, tensor copy";
 #endif
       framework::TensorCopy(
-          fwd_expert_count, platform::CPUPlace(), &fwd_expert_count_cpu);
-      framework::TensorCopy(
-          fwd_batch_size, platform::CPUPlace(), &fwd_batch_size_cpu);
+          fwd_expert_count_cumsum, platform::CPUPlace(), &fwd_expert_count_cumsum_cpu);
       dev_ctx.Wait();
-      int fwd_bsz = fwd_batch_size_cpu.data<int64_t>()[0];
+      int fwd_bsz = fwd_expert_count_cumsum_cpu.data<int64_t>()[num_expert];
 
       Tensor global_scatter_out;
       global_scatter_out.Resize({{fwd_bsz, dim_embed}});
-      dev_ctx.Alloc<T>(&global_scatter_out,
-                       global_scatter_out.numel() * sizeof(T));
+      auto global_scatter_out_data = dev_ctx.Alloc<T>(&global_scatter_out,
+                                        global_scatter_out.numel() * sizeof(T));
 
       Tensor all_expert_out;
       all_expert_out.Resize({{fwd_bsz, dim_embed}});
-      dev_ctx.Alloc<T>(&all_expert_out, all_expert_out.numel() * sizeof(T));
+      auto all_expert_out_data = dev_ctx.Alloc<T>(&all_expert_out, 
+                                    all_expert_out.numel() * sizeof(T));
 
       // step 5, MOEScatter
       // step 5.1, index select
@@ -714,81 +706,130 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       VLOG(0) << "moe, Expert Computation";
 #endif
       if (fwd_bsz != 0) {
-        int last_index = 0;
-        for (int idx = 0; idx < num_expert; idx++) {
-          int cur_expert_count = fwd_expert_count_cpu.data<int64_t>()[idx];
-          if (cur_expert_count <= 0) {
-            continue;
+        if (FLAGS_enable_moe_gemm_cutlass) {
+          // grouped gemm
+          int expert_idx = i * num_expert;
+          // expert
+          Tensor expert_in_tmp, expert_out1;  // int8_t, int32_t
+          expert_in_tmp.Resize({{fwd_bsz, dim_feedforward}});
+          auto expert_in_tmp_data = dev_ctx.Alloc<int8_t>(&expert_in_tmp,
+                                        expert_in_tmp.numel() * sizeof(int8_t));
+
+          expert_out1.Resize({{fwd_bsz, dim_feedforward}});
+          auto expert_out1_data = dev_ctx.Alloc<T>(&expert_out1,
+                                      expert_out1.numel() * sizeof(T)); // dequant 输出, fp16
+          // gemm1, do act
+          FusedGroupedMatMul(dev_ctx,
+                             expert_weights1[expert_idx]->data<int8_t>(),
+                             global_scatter_out_data,
+                             &expert_in_tmp,
+                             &expert_weight1_in_scale[expert_idx],
+                             expert_biases1[expert_idx]->data<T>(),
+                             expert_out1_data, // dequant & bias & gelu output
+                             expert_weight1_out_scales[expert_idx]->data<float>(),
+                             fwd_expert_count_cumsum_data,
+                             fwd_expert_count_cumsum_cpu.data<int64_t>(),
+                             fwd_bsz,
+                             num_expert,
+                             fwd_bsz,
+                             dim_feedforward,
+                             dim_embed,
+                             true);
+          // gemm2, no act
+          FusedGroupedMatMul(dev_ctx,
+                             expert_weights2[expert_idx]->data<int8_t>(),
+                             expert_out1_data,
+                             &expert_in_tmp,
+                             &expert_weight2_in_scale[expert_idx],
+                             expert_biases2[expert_idx]->data<T>(),
+                             all_expert_out_data, // dequant output
+                             expert_weight2_out_scales[expert_idx]->data<float>(),
+                             fwd_expert_count_cumsum_data,
+                             fwd_expert_count_cumsum_cpu.data<int64_t>(),
+                             fwd_bsz,
+                             num_expert,
+                             fwd_bsz,
+                             dim_embed,
+                             dim_feedforward,
+                             false);
+        } else {
+          int last_index = 0;
+          int64_t *csum_len = fwd_expert_count_cumsum_cpu.data<int64_t>();
+          for (int idx = 0; idx < num_expert; idx++) {
+            int end = csum_len[idx + 1];
+            int cur_expert_count = end - last_index;
+            if (cur_expert_count <= 0) {
+              continue;
+            }
+
+            Tensor expert_in_tmp;  // int8_t
+            expert_in_tmp.Resize({{cur_expert_count, dim_feedforward}});
+            dev_ctx.Alloc<int8_t>(&expert_in_tmp,
+                                  expert_in_tmp.numel() * sizeof(int8_t));
+
+            Tensor expert_out1;  // int32_t
+            expert_out1.Resize({{cur_expert_count, dim_feedforward}});
+            dev_ctx.Alloc<int32_t>(&expert_out1,
+                                  expert_out1.numel() * sizeof(int32_t));
+
+            // input is int32_t, output is int8_t
+            FusedDropoutHelper<T, uint8_t, int32_t, int8_t>
+                fused_act_dropout_helper(
+                    dev_ctx, cur_expert_count, dim_feedforward, dropout_param);
+
+            Tensor tmp_inp =
+                global_scatter_out.Slice(last_index, end);  // fp16, T
+            int expert_idx = i * num_expert + idx;
+            // T to int8_t, matmul, dont compute bias
+            MatMulTToINT8<T>(dev_ctx,
+                            expert_weights1[expert_idx],
+                            expert_weight1_in_scale[expert_idx],
+                            &tmp_inp,
+                            &expert_in_tmp,
+                            &expert_out1,
+                            cur_expert_count,
+                            dim_feedforward,
+                            dim_embed,
+                            &cublaslt_workspace,  // maybe space not enough
+                            quant_round_type,
+                            quant_max_bound,
+                            quant_min_bound);
+            // act bias, input is int32_t, output is int8_t
+            fused_act_dropout_helper.DropoutActBias(
+                dev_ctx,
+                expert_out1.data<int32_t>(),
+                expert_biases1[expert_idx]->data<T>(),
+                "gelu",
+                expert_in_tmp.data<int8_t>(),  // output
+                nullptr,
+                expert_weight1_in_scale[expert_idx],
+                expert_weight1_out_scales[expert_idx]->data<float>(),
+                0,  // data offset
+                expert_weight2_in_scale[expert_idx],
+                quant_round_type,
+                quant_max_bound,
+                quant_min_bound,
+                approximate);
+
+            // T(fp16)
+            Tensor expert_out2 = all_expert_out.Slice(last_index, end);
+            // linear2, int8_t to T
+            MatMulINT8ToT<T>(dev_ctx,
+                            expert_weights2[expert_idx],
+                            expert_weight2_in_scale[expert_idx],
+                            &expert_in_tmp,  // input
+                            expert_biases2[expert_idx],
+                            &expert_out2,
+                            &expert_out1,  // output_tmp
+                            &expert_out2,
+                            expert_weight2_out_scales[expert_idx],
+                            cur_expert_count,
+                            dim_embed,
+                            dim_feedforward,
+                            true,
+                            &cublaslt_workspace);
+            last_index = end;
           }
-          int end = cur_expert_count + last_index;
-
-          Tensor expert_in_tmp;  // int8_t
-          expert_in_tmp.Resize({{cur_expert_count, dim_feedforward}});
-          dev_ctx.Alloc<int8_t>(&expert_in_tmp,
-                                expert_in_tmp.numel() * sizeof(int8_t));
-
-          Tensor expert_out1;  // int32_t
-          expert_out1.Resize({{cur_expert_count, dim_feedforward}});
-          dev_ctx.Alloc<int32_t>(&expert_out1,
-                                 expert_out1.numel() * sizeof(int32_t));
-
-          // input is int32_t, output is int8_t
-          FusedDropoutHelper<T, uint8_t, int32_t, int8_t>
-              fused_act_dropout_helper(
-                  dev_ctx, cur_expert_count, dim_feedforward, dropout_param);
-
-          Tensor tmp_inp =
-              global_scatter_out.Slice(last_index, end);  // fp16, T
-          int expert_idx = i * num_expert + idx;
-          // T to int8_t, matmul, dont compute bias
-          MatMulTToINT8<T>(dev_ctx,
-                           expert_weights1[expert_idx],
-                           expert_weight1_in_scale[expert_idx],
-                           &tmp_inp,
-                           &expert_in_tmp,
-                           &expert_out1,
-                           cur_expert_count,
-                           dim_feedforward,
-                           dim_embed,
-                           &cublaslt_workspace,  // maybe space not enough
-                           quant_round_type,
-                           quant_max_bound,
-                           quant_min_bound);
-          // act bias, input is int32_t, output is int8_t
-          fused_act_dropout_helper.DropoutActBias(
-              dev_ctx,
-              expert_out1.data<int32_t>(),
-              expert_biases1[expert_idx]->data<T>(),
-              "gelu",
-              expert_in_tmp.data<int8_t>(),  // output
-              nullptr,
-              expert_weight1_in_scale[expert_idx],
-              expert_weight1_out_scales[expert_idx]->data<float>(),
-              0,  // data offset
-              expert_weight2_in_scale[expert_idx],
-              quant_round_type,
-              quant_max_bound,
-              quant_min_bound,
-              approximate);
-
-          // T(fp16)
-          Tensor expert_out2 = all_expert_out.Slice(last_index, end);
-          // linear2, int8_t to T
-          MatMulINT8ToT<T>(dev_ctx,
-                           expert_weights2[expert_idx],
-                           expert_weight2_in_scale[expert_idx],
-                           &expert_in_tmp,  // input
-                           expert_biases2[expert_idx],
-                           &expert_out2,
-                           &expert_out1,  // output_tmp
-                           &expert_out2,
-                           expert_weight2_out_scales[expert_idx],
-                           cur_expert_count,
-                           dim_embed,
-                           dim_feedforward,
-                           true,
-                           &cublaslt_workspace);
-          last_index = end;
         }
       } else {
         all_expert_out = global_scatter_out;
@@ -924,5 +965,4 @@ namespace ops = paddle::operators;
 namespace plat = paddle::platform;
 REGISTER_OP_CUDA_KERNEL(
     fused_multi_transformer_moe_int8,
-    ops::FusedMultiTransformerMoeINT8OpKernel<plat::float16>,
-    ops::FusedMultiTransformerMoeINT8OpKernel<float>);
+    ops::FusedMultiTransformerMoeINT8OpKernel<plat::float16>);

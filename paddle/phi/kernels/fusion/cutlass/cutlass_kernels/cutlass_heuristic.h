@@ -39,6 +39,8 @@ struct TileShape {
   int n;
 };
 
+enum class CutlassGemmType : char { Default, WeightOnly, PTQ, Simt, Int8 };
+
 inline TileShape get_cta_shape_for_config(CutlassTileConfig tile_config) {
   switch (tile_config) {
     case CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
@@ -107,19 +109,7 @@ inline bool is_valid_split_k_factor(const int64_t m,
 
 inline std::vector<CutlassTileConfig> get_candidate_tiles(
     const int sm,
-    const bool is_weight_only,
-    const bool simt_configs_only,
-    const bool int8_configs_only) {
-  enum class CutlassGemmType : char { Default, WeightOnly, Simt, Int8 };
-
-  CutlassGemmType gemm_type = CutlassGemmType::Default;
-  if (simt_configs_only) {
-    gemm_type = CutlassGemmType::Simt;
-  } else if (is_weight_only) {
-    gemm_type = CutlassGemmType::WeightOnly;
-  } else if (int8_configs_only) {
-    gemm_type = CutlassGemmType::Int8;
-  }
+    CutlassGemmType gemm_type=CutlassGemmType::Default) {
 
   std::vector<CutlassTileConfig> base_configs{
       CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
@@ -148,6 +138,8 @@ inline std::vector<CutlassTileConfig> get_candidate_tiles(
               CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
               CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
               CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64};
+    case CutlassGemmType::PTQ:
+      return {CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64};
     default:
       return base_configs;
   }
@@ -155,16 +147,13 @@ inline std::vector<CutlassTileConfig> get_candidate_tiles(
 
 inline std::vector<CutlassGemmConfig> get_candidate_configs(
     int sm,
-    const bool is_weight_only,
-    const bool simt_configs_only,
-    const bool int8_configs_only,
+    CutlassGemmType gemm_type,
     const int max_split_k) {
-  std::vector<CutlassTileConfig> tiles = get_candidate_tiles(
-      sm, is_weight_only, simt_configs_only, int8_configs_only);
+  std::vector<CutlassTileConfig> tiles = get_candidate_tiles(sm, gemm_type);
 
   std::vector<CutlassGemmConfig> candidate_configs;
-  const int min_stages = int8_configs_only ? 3 : 2;
-  const int max_stages = int8_configs_only ? 6 : (sm >= 80 ? 4 : 2);
+  const int min_stages = gemm_type == CutlassGemmType::Int8 ? 3 : 2;
+  const int max_stages = gemm_type == CutlassGemmType::Int8 ? 6 : (sm >= 80 ? 4 : 2);
   for (const auto& tile_config : tiles) {
     for (int stages = min_stages; stages <= max_stages; ++stages) {
       CutlassGemmConfig config{tile_config, SplitKStyle::NO_SPLIT_K, 1, stages};

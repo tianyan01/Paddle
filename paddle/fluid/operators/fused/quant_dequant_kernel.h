@@ -158,9 +158,10 @@ void quantize_kernel_launcher(const T* input,
                                               min_bound);
 }
 
-template <typename T, int VecSize>
+template <typename T, int VecSize, bool ComputeBias=false>
 __global__ void dequantize_kernel(T* output,
                                   const int32_t* input,
+                                  const T* bias,
                                   const int m,  // batch size
                                   const int n,  // hidden
                                   const float quant_in_scale,
@@ -172,16 +173,23 @@ __global__ void dequantize_kernel(T* output,
 
   phi::AlignedVector<int32_t, VecSize> in_vec;
   phi::AlignedVector<float, VecSize> out_scale_vec;
+  phi::AlignedVector<T, VecSize> bias_vec;
   phi::AlignedVector<T, VecSize> out_vec;
 
   for (; idx < numel; idx += stride) {
     phi::Load<int32_t, VecSize>(input + idx, &in_vec);
     phi::Load<float, VecSize>(dequant_out_scale_data + col_id, &out_scale_vec);
+    if (ComputeBias) {
+      phi::Load<T, VecSize>(bias + col_id, &bias_vec);
+    }
 
 #pragma unroll
     for (int i = 0; i < VecSize; ++i) {
       out_vec[i] =
           static_cast<T>(static_cast<float>(in_vec[i]) * out_scale_vec[i]);
+      if (ComputeBias) {
+        out_vec[i] += bias_vec[i];
+      }
     }
 
     phi::Store<T, VecSize>(out_vec, output + idx);
@@ -199,7 +207,22 @@ void dequantize_kernel_launcher(const int32_t* input,
                                 const float* dequant_out_scale_data) {
   dequantize_kernel<T, DequantKernelVecSize>
       <<<gpu_config->block_per_grid, gpu_config->thread_per_block, 0, stream>>>(
-          output, input, m, n, quant_in_scale, dequant_out_scale_data);
+          output, input, nullptr, m, n, quant_in_scale, dequant_out_scale_data);
+}
+
+template <typename T, bool ComputeBias>
+void dequantize_addbias_kernel_launcher(const int32_t* input,
+                                        const T* bias,
+                                        T* output,
+                                        const int m,  // m
+                                        const int n,  // n
+                                        gpuStream_t stream,
+                                        GpuLaunchConfig* gpu_config,
+                                        const float quant_in_scale,
+                                        const float* dequant_out_scale_data) {
+  dequantize_kernel<T, DequantKernelVecSize, ComputeBias>
+      <<<gpu_config->block_per_grid, gpu_config->thread_per_block, 0, stream>>>(
+          output, input, bias, m, n, quant_in_scale, dequant_out_scale_data);
 }
 
 }  // namespace operators

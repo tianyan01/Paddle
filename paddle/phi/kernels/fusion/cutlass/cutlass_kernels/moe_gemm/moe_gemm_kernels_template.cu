@@ -527,8 +527,14 @@ void MoeGemmRunner<T, WeightType>::run_gemm<EpilogueTag>(
     static constexpr int workspace_bytes = 0;  // No workspace for MoE GEMMs.
     static constexpr int split_k_limit =
         1;  // MoE GEMM does not support split-k.
+    CutlassGemmType gemm_type = CutlassGemmType::Default;
+    if (is_weight_only) {
+      gemm_type = CutlassGemmType::WeightOnly;
+    } else if (only_simt_configs) {
+      gemm_type = CutlassGemmType::Simt;
+    }
     std::vector<CutlassGemmConfig> candidate_configs = get_candidate_configs(
-        sm_, is_weight_only, only_simt_configs, false, split_k_limit);
+        sm_, gemm_type, split_k_limit);
     std::vector<int> occupancies(candidate_configs.size());
 
     for (size_t ii = 0; ii < candidate_configs.size(); ++ii) {

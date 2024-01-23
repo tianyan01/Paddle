@@ -189,7 +189,8 @@ if(WITH_CUTLASS)
     "fusion/cutlass/cutlass_kernels/fpA_intB_gemm/autogen/*.cu"
     "fusion/cutlass/cutlass_kernels/fpA_intB_gemm/*.cu"
     "fusion/cutlass/cutlass_kernels/moe_gemm/autogen/*.cu"
-    "fusion/cutlass/cutlass_kernels/moe_gemm/*.cu")
+    "fusion/cutlass/cutlass_kernels/moe_gemm/*.cu"
+    "fusion/cutlass/cutlass_kernels/ptq_moe_gemm/*.cu")
   list(APPEND kernel_cu ${cutlass_cu})
 endif()
 
