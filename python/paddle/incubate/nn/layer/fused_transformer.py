@@ -2350,7 +2350,7 @@ class FusedMultiTransformerMoe(Layer):
 
         # origin fmt config
         self.normalize_before = normalize_before
-        self._dtype = "float16"
+        self._dtype = self._helper.get_default_dtype()
         self._epsilon = epsilon
         self._trans_qkvw = trans_qkvw
         self._ring_id = ring_id
