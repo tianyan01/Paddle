@@ -1461,6 +1461,7 @@ class FusedMultiTransformer(Layer):
         trans_to_fp16(self.ffn2_biases)
         self._dtype = dtype
 
+
 class FusedMultiTransformerWeightOnly(Layer):
     """
     FusedMultiTransfor on weight quant
@@ -1804,7 +1805,6 @@ class FusedMultiTransformerWeightOnly(Layer):
         self._dtype = "int8"
 
 
-
 class FusedMultiTransformerINT8(Layer):
     def __init__(self,
                  embed_dim,
@@ -2107,308 +2107,6 @@ class FusedMultiTransformerINT8(Layer):
         self._dtype = "int8"
 
 
-class FusedMultiTransformerINT8(Layer):
-    def __init__(self,
-                 embed_dim,
-                 num_heads,
-                 dim_feedforward,
-                 dropout_rate=0.0,
-                 activation="gelu",
-                 normalize_before=True,
-                 ln_scale_attrs=None,
-                 ln_bias_attrs=None,
-                 qkv_weight_attrs=None,
-                 qkv_bias_attrs=None,
-                 linear_weight_attrs=None,
-                 linear_bias_attrs=None,
-                 ffn_ln_scale_attrs=None,
-                 ffn_ln_bias_attrs=None,
-                 ffn1_weight_attrs=None,
-                 ffn1_bias_attrs=None,
-                 ffn2_weight_attrs=None,
-                 ffn2_bias_attrs=None,
-                 qkv_out_scales_attrs=None,
-                 out_linear_out_scales_attrs=None,
-                 ffn1_out_scales_attrs=None,
-                 ffn2_out_scales_attrs=None,
-                 qkv_in_scale=None,
-                 out_linear_in_scale=None,
-                 ffn1_in_scale=None,
-                 ffn2_in_scale=None,
-                 epsilon=1e-5,
-                 num_layers=-1,
-                 nranks=1,
-                 trans_qkvw=True,
-                 ring_id=-1,
-                 name=None):
-        super(FusedMultiTransformerINT8, self).__init__()
-
-        assert embed_dim > 0, ("Expected embed_dim to be greater than 0, "
-                               "but received {}".format(embed_dim))
-        assert num_heads > 0, ("Expected nhead to be greater than 0, "
-                               "but received {}".format(num_heads))
-        assert dim_feedforward > 0, (
-            "Expected dim_feedforward to be greater than 0, but received {}".
-            format(dim_feedforward))
-
-        self.normalize_before = normalize_before
-        # self._dtype = self._helper.get_default_dtype()
-        self._dtype = "float16" # fix, default is fp16
-        self._epsilon = epsilon
-        self._trans_qkvw = trans_qkvw
-        self._ring_id = ring_id
-
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-
-        self.qkv_in_scale = qkv_in_scale
-        self.out_linear_in_scale = out_linear_in_scale
-        self.ffn1_in_scale = ffn1_in_scale
-        self.ffn2_in_scale = ffn2_in_scale
-
-        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
-
-        # tensor model parallel
-        if nranks > 1:
-            assert ring_id != -1
-        assert num_heads % nranks == 0
-        assert dim_feedforward % nranks == 0
-        num_heads = num_heads // nranks
-        dim_feedforward = dim_feedforward // nranks
-        self._dim_feedforward = dim_feedforward
-
-        if isinstance(qkv_weight_attrs, (list, tuple)):
-            num_layers = len(qkv_weight_attrs)
-        assert num_layers > 0
-
-        self.ln_scales, self.ln_biases = ParameterList(), ParameterList()
-        self.qkv_weights, self.qkv_biases = ParameterList(), ParameterList()
-        self.linear_weights, self.linear_biases = ParameterList(), ParameterList()
-        self.ffn_ln_scales, self.ffn_ln_biases = ParameterList(), ParameterList()
-        self.ffn1_weights, self.ffn1_biases = ParameterList(), ParameterList()
-        self.ffn2_weights, self.ffn2_biases = ParameterList(), ParameterList()
-
-        self.qkv_out_scales = ParameterList()
-        self.out_linear_out_scales = ParameterList()
-        self.ffn1_out_scales = ParameterList()
-        self.ffn2_out_scales = ParameterList()
-
-        def get_attr(attrs, idx):
-            if isinstance(attrs, (list, tuple)):
-                assert len(attrs) == num_layers
-                return attrs[idx]
-            return attrs
-
-        for i in range(num_layers):
-            ln_scale_attr = get_attr(ln_scale_attrs, i)
-            ln_bias_attr = get_attr(ln_bias_attrs, i)
-            qkv_weight_attr = get_attr(qkv_weight_attrs, i)
-            qkv_bias_attr = get_attr(qkv_bias_attrs, i)
-            linear_weight_attr = get_attr(linear_weight_attrs, i)
-            linear_bias_attr = get_attr(linear_bias_attrs, i)
-
-            ffn_ln_scale_attr = get_attr(ffn_ln_scale_attrs, i)
-            ffn_ln_bias_attr = get_attr(ffn_ln_bias_attrs, i)
-            ffn1_weight_attr = get_attr(ffn1_weight_attrs, i)
-            ffn1_bias_attr = get_attr(ffn1_bias_attrs, i)
-            ffn2_weight_attr = get_attr(ffn2_weight_attrs, i)
-            ffn2_bias_attr = get_attr(ffn2_bias_attrs, i)
-
-            qkv_out_scales_attr = get_attr(qkv_out_scales_attrs, i)
-            out_linear_out_scales_attr = get_attr(out_linear_out_scales_attrs, i)
-            ffn1_out_scales_attr = get_attr(ffn1_out_scales_attrs, i)
-            ffn2_out_scales_attr = get_attr(ffn2_out_scales_attrs, i)
-
-            ln_scale = self.create_parameter(
-                attr=ln_scale_attr,
-                shape=[embed_dim],
-                default_initializer=Constant(value=1.0),
-                dtype="float32")
-            ln_bias = self.create_parameter(attr=ln_bias_attr,
-                                            shape=[embed_dim],
-                                            is_bias=True,
-                                            dtype="float32")
-            qkv_weight = self.create_parameter(
-                shape=[3, num_heads, self.head_dim, embed_dim]
-                if trans_qkvw else [embed_dim, 3, num_heads, self.head_dim],
-                attr=qkv_weight_attr,
-                dtype=self._dtype,
-                is_bias=False)
-            qkv_bias = self.create_parameter(
-                shape=[3, num_heads, self.head_dim],
-                attr=qkv_bias_attr,
-                dtype=self._dtype,
-                is_bias=True)
-            linear_weight = self.create_parameter(
-                shape=[num_heads * self.head_dim, embed_dim],
-                attr=linear_weight_attr,
-                dtype=self._dtype,
-                is_bias=False)
-            linear_bias = self.create_parameter(shape=[embed_dim],
-                                                attr=linear_bias_attr,
-                                                dtype=self._dtype,
-                                                is_bias=True)
-
-            ffn_ln_scale = self.create_parameter(
-                shape=[embed_dim],
-                attr=ffn_ln_scale_attr,
-                is_bias=False,
-                default_initializer=Constant(1.0),
-                dtype="float32")
-            ffn_ln_bias = self.create_parameter(shape=[embed_dim],
-                                                attr=ffn_ln_bias_attr,
-                                                is_bias=True,
-                                                dtype="float32")
-            ffn1_weight = self.create_parameter(
-                # shape=[embed_dim, dim_feedforward],
-                shape=[dim_feedforward, embed_dim],
-                attr=ffn1_weight_attr,
-                dtype=self._dtype,
-                is_bias=False)
-            ffn1_bias = self.create_parameter(shape=[dim_feedforward],
-                                              attr=ffn1_bias_attr,
-                                              dtype=self._dtype,
-                                              is_bias=True)
-            ffn2_weight = self.create_parameter(
-                # shape=[dim_feedforward, embed_dim],
-                shape=[embed_dim, dim_feedforward],
-                attr=ffn2_weight_attr,
-                dtype=self._dtype,
-                is_bias=False)
-            ffn2_bias = self.create_parameter(shape=[embed_dim],
-                                              attr=ffn2_bias_attr,
-                                              dtype=self._dtype,
-                                              is_bias=True)
-
-            qkv_out_scale = self.create_parameter(
-                shape=[3 * embed_dim],
-                attr=qkv_out_scales_attr,
-                dtype="float32",
-                is_bias=False)
-            out_linear_out_scale = self.create_parameter(
-                shape=[embed_dim],
-                attr=out_linear_out_scales_attr,
-                dtype="float32",
-                is_bias=False)
-            ffn1_out_scale = self.create_parameter(
-                shape=[4 * embed_dim],
-                attr=ffn1_out_scales_attr,
-                dtype="float32",
-                is_bias=False)
-            ffn2_out_scale = self.create_parameter(
-                shape=[embed_dim],
-                attr=ffn2_out_scales_attr,
-                dtype="float32",
-                is_bias=False)                            
-
-            # tensor model parallel
-            if nranks > 1:
-                # column parallel
-                _set_var_distributed(qkv_weight)
-                _set_var_distributed(qkv_bias)
-                _set_var_distributed(ffn1_weight)
-                _set_var_distributed(ffn1_bias)
-                # row parallel
-                _set_var_distributed(linear_weight)
-                _set_var_distributed(ffn2_weight)
-
-            self.ln_scales.append(ln_scale)
-            self.ln_biases.append(ln_bias)
-            self.qkv_weights.append(qkv_weight)
-            self.qkv_biases.append(qkv_bias)
-            self.linear_weights.append(linear_weight)
-            self.linear_biases.append(linear_bias)
-
-            self.ffn_ln_scales.append(ffn_ln_scale)
-            self.ffn_ln_biases.append(ffn_ln_bias)
-            self.ffn1_weights.append(ffn1_weight)
-            self.ffn1_biases.append(ffn1_bias)
-            self.ffn2_weights.append(ffn2_weight)
-            self.ffn2_biases.append(ffn2_bias)
-
-            self.qkv_out_scales.append(qkv_out_scale)
-            self.out_linear_out_scales.append(out_linear_out_scale)
-            self.ffn1_out_scales.append(ffn1_out_scale)
-            self.ffn2_out_scales.append(ffn2_out_scale)
-
-        self.dropout_rate = dropout_rate
-        self.activation = activation
-        self.name = name
-        # int8 decorate
-        self._int8_decorate()
-
-    def forward(self, src, attn_mask=None, caches=None, seq_lens=None, beam_offset=None, time_step=None):
-        """
-        forward
-        """
-        cache_kv_out, final_out = _legacy_C_ops.fused_multi_transformer_int8(
-            src, 
-            list(self.ln_scales), 
-            list(self.ln_biases), 
-            list(self.qkv_weights), 
-            list(self.qkv_biases), 
-            caches,
-            beam_offset,
-            time_step, 
-            seq_lens, 
-            attn_mask, 
-            list(self.linear_weights), 
-            list(self.linear_biases), 
-            list(self.ffn_ln_scales),
-            list(self.ffn_ln_biases), 
-            list(self.ffn1_weights), 
-            list(self.ffn1_biases), 
-            list(self.ffn2_weights), 
-            list(self.ffn2_biases),
-            list(self.qkv_out_scales), 
-            list(self.out_linear_out_scales), 
-            list(self.ffn1_out_scales),
-            list(self.ffn2_out_scales), 
-            caches, 
-            'qkv_in_scale', 
-            self.qkv_in_scale,
-            'out_linear_in_scale', 
-            self.out_linear_in_scale, 
-            'ffn1_in_scale',
-            self.ffn1_in_scale, 
-            'ffn2_in_scale',
-            self.ffn2_in_scale, 
-            'pre_layer_norm',
-            self.normalize_before, 
-            'epsilon', 
-            self._epsilon, 
-            'dropout_rate', 
-            self.dropout_rate,
-            'is_test', 
-            not self.training, 
-            'dropout_implementation', 
-            'upscale_in_train',
-            'act_method', 
-            self.activation, 
-            'trans_qkvw', 
-            self._trans_qkvw, 
-            'ring_id',
-            self._ring_id)
-
-        if caches is not None:
-            return final_out, cache_kv_out
-        return final_out
-
-    def _int8_decorate(self, dtype="int8"):
-        # tmp fix for INT8
-        def trans_to_int8(l):
-            for param in l:
-                if param is not None:
-                    with no_grad():
-                        param_applied = _to_dtype(param, dtype)
-        trans_to_int8(self.qkv_weights)
-        trans_to_int8(self.linear_weights)
-        trans_to_int8(self.ffn1_weights)
-        trans_to_int8(self.ffn2_weights)
-        self._dtype = "int8"
-
-
 class FusedMoELayer(Layer):
     """FusedMoE Layer
     Args:
@@ -2652,7 +2350,7 @@ class FusedMultiTransformerMoe(Layer):
 
         # origin fmt config
         self.normalize_before = normalize_before
-        self._dtype = self._helper.get_default_dtype()
+        self._dtype = "float16"
         self._epsilon = epsilon
         self._trans_qkvw = trans_qkvw
         self._ring_id = ring_id
@@ -3197,7 +2895,6 @@ class FusedMultiTransformerMoeINT8(Layer):
                 expert_bias2_attr = get_attr(expert_bias2_attrs, i * num_expert + j)
 
                 expert_weight1 = self.create_parameter(
-                    # shape=[d_model, dim_feedforward],
                     shape=[dim_feedforward, d_model],
                     attr=expert_weight1_attr,
                     dtype=self._dtype,
@@ -3212,7 +2909,6 @@ class FusedMultiTransformerMoeINT8(Layer):
                     default_initializer=nn.initializer.Constant(value=0.0)
                 )
                 expert_weight2 = self.create_parameter(
-                    # shape=[dim_feedforward, d_model],
                     shape=[d_model, dim_feedforward],
                     attr=expert_weight2_attr,
                     dtype=self._dtype,
@@ -3242,6 +2938,8 @@ class FusedMultiTransformerMoeINT8(Layer):
                 expert_bias1.name = "expert_" + expert_bias1.name
                 expert_weight2.name = "expert_" + expert_weight2.name
                 expert_bias2.name = "expert_" + expert_bias2.name
+                expert_weight1_out_scale.name = "expert_" + expert_weight1_out_scale.name
+                expert_weight2_out_scale.name = "expert_" + expert_weight2_out_scale.name
                 self.expert_weights1.append(expert_weight1)
                 self.expert_biases1.append(expert_bias1)
                 self.expert_weights2.append(expert_weight2)
@@ -3253,6 +2951,8 @@ class FusedMultiTransformerMoeINT8(Layer):
         self.name = name
         # int8
         self._int8_decorate()
+        self._share_expert_param(num_layers, num_expert, dim_feedforward, d_model)
+        self._dtype = "int8"
 
     def forward(self, src, attn_mask=None, caches=None, seq_lens=None, beam_offset=None, time_step=None):
         """
@@ -3338,8 +3038,71 @@ class FusedMultiTransformerMoeINT8(Layer):
         trans_to_int8(self.linear_weights)
         trans_to_int8(self.expert_weights1)
         trans_to_int8(self.expert_weights2)
-        self._dtype = "int8"
+        # self._dtype = "int8"
 
+    def _share_expert_param(self, num_layers, num_expert, dim_feedforward, d_model):
+        """
+        share_param
+        """
+        def shard_tensor(dst_tensor, parent_tensor, pos):
+            tmp = parent_tensor.value().get_tensor()._slice(pos, pos + 1)
+            dst_tensor.value().get_tensor()._share_data_buffer(tmp, False)
+
+        self.shared_weights1, self.shared_scales1, self.shared_biases1 = ParameterList(), ParameterList(), ParameterList()
+        self.shared_weights2, self.shared_scales2, self.shared_biases2 = ParameterList(), ParameterList(), ParameterList()
+
+        for i in range(num_layers):
+            shared_weight1 = paddle.create_parameter(
+                # name=f"moe.expert.layer{i}.shared_weight1",
+                shape=[num_expert, dim_feedforward, d_model],
+                dtype="uint8",
+                default_initializer=nn.initializer.Constant(value=0))
+            shared_scale1 = paddle.create_parameter(
+                # name=f"moe.expert.layer{i}.shared_scale1",
+                shape=[num_expert, dim_feedforward],
+                dtype="float32",
+                default_initializer=nn.initializer.Constant(value=0.0))
+            shared_bias1 = paddle.create_parameter(
+                # name=f"moe.expert.layer{i}.shared_bias1",
+                shape=[num_expert, dim_feedforward],
+                dtype=self._dtype,
+                default_initializer=nn.initializer.Constant(value=0.0))
+            
+            shared_weight2 = paddle.create_parameter(
+                # name=f"moe.expert.layer{i}.shared_weight2",
+                shape=[num_expert, d_model, dim_feedforward],
+                dtype="uint8",
+                default_initializer=nn.initializer.Constant(value=0))
+            shared_scale2 = paddle.create_parameter(
+                # name=f"moe.expert.layer{i}.shared_scale2",
+                shape=[num_expert, d_model],
+                dtype="float32",
+                default_initializer=nn.initializer.Constant(value=0.0))
+            shared_bias2 = paddle.create_parameter(
+                # name=f"moe.expert.layer{i}.shared_bias2",
+                shape=[num_expert, d_model],
+                dtype=self._dtype,
+                default_initializer=nn.initializer.Constant(value=0.0))
+
+            _to_dtype(shared_weight1, "int8")
+            _to_dtype(shared_weight2, "int8")
+
+            for j in range(self.num_expert):
+                expert_idx = j + i * self.num_expert
+                shard_tensor(self.expert_weights1[expert_idx], shared_weight1, j)
+                shard_tensor(self.expert_weight1_out_scales[expert_idx], shared_scale1, j)
+                shard_tensor(self.expert_biases1[expert_idx], shared_bias1, j)
+                shard_tensor(self.expert_weights2[expert_idx], shared_weight2, j)
+                shard_tensor(self.expert_weight2_out_scales[expert_idx], shared_scale2, j)
+                shard_tensor(self.expert_biases2[expert_idx], shared_bias2, j)
+
+            self.shared_weights1.append(shared_weight1)
+            self.shared_scales1.append(shared_scale1) 
+            self.shared_biases1.append(shared_bias1)
+
+            self.shared_weights2.append(shared_weight2)
+            self.shared_scales2.append(shared_scale2) 
+            self.shared_biases2.append(shared_bias2)
 
 class FusedMultiTransformerMoeWeightOnly(Layer):
     """
@@ -3779,4 +3542,3 @@ class FusedMultiTransformerMoeWeightOnly(Layer):
             self.shared_weights2.append(shared_weight2)
             self.shared_scales2.append(shared_scale2) 
             self.shared_biases2.append(shared_bias2)
->>>>>>> a20e3e2b8f005231cba07dae1cf03aba8a451115

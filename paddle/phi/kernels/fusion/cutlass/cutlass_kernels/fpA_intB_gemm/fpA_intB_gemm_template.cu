@@ -431,8 +431,12 @@ void CutlassFpAIntBGemmRunner<T, WeightType>::run_gemm<EpilogueTag>(
   if (it == config_cache_.end()) {
     static constexpr bool is_weight_only = !std::is_same<T, WeightType>::value;
     const bool is_weight_only_encoder = m >= 512 ? true : false;
+    CutlassGemmType gemm_type = CutlassGemmType::Default;
+    if (is_weight_only) {
+      gemm_type = CutlassGemmType::WeightOnly;
+    }
     std::vector<CutlassGemmConfig> candidate_configs = get_candidate_configs(
-        sm_, is_weight_only, false, false, split_k_limit);
+        sm_, gemm_type, split_k_limit);
     std::vector<int> occupancies(candidate_configs.size());
 
     for (size_t ii = 0; ii < candidate_configs.size(); ++ii) {

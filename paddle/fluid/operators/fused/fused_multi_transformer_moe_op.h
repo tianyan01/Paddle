@@ -88,21 +88,26 @@ void MatMulINT8ToT(const phi::GPUContext& dev_ctx,
                (void*)workspace->data<int8_t>(),
                workspace->numel());
 
-  dequantize_kernel_launcher<T>(output_tmp->data<int32_t>(),
-                                output->data<T>(),
-                                m,
-                                n,
-                                dev_ctx.stream(),
-                                gpu_config.get(),
-                                quant_in_scale,
-                                dequant_out_scale->data<float>());
-
   if (compute_bias) {
-    // bias_out = output + bias
-    std::vector<const Tensor*> ins = {output, bias};
-    std::vector<Tensor*> outs = {bias_out};
-    phi::funcs::BroadcastKernel<phi::ElementwiseType::kBinary, T, T>(
-        dev_ctx, ins, &outs, -1, phi::funcs::AddFunctor<T>());
+    dequantize_addbias_kernel_launcher<T, true>(output_tmp->data<int32_t>(),
+                                                bias->data<T>(),
+                                                output->data<T>(),
+                                                m,
+                                                n,
+                                                dev_ctx.stream(),
+                                                gpu_config.get(),
+                                                quant_in_scale,
+                                                dequant_out_scale->data<float>());
+  } else {
+    dequantize_addbias_kernel_launcher<T, false>(output_tmp->data<int32_t>(),
+                                                 nullptr,
+                                                 output->data<T>(),
+                                                 m,
+                                                 n,
+                                                 dev_ctx.stream(),
+                                                 gpu_config.get(),
+                                                 quant_in_scale,
+                                                 dequant_out_scale->data<float>());
   }
 }
 
