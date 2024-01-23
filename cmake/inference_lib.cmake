@@ -109,7 +109,7 @@ function(copy_part_of_thrid_party TARGET DST)
         DSTS ${dst_dir} ${dst_dir})
     endif()
 
-    if(WITH_SPARSELT OR WITH_SPARSELT4)
+    if(WITH_SPARSELT)
       set(dst_dir "${DST}/third_party/install/cusparselt")
       copy(
         ${TARGET}

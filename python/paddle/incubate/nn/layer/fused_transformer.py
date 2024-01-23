@@ -1544,14 +1544,11 @@ class FusedMultiTransformerWeightOnly(Layer):
 
         self.ln_scales, self.ln_biases = ParameterList(), ParameterList()
         self.qkv_weights, self.qkv_scales, self.qkv_biases = ParameterList(), ParameterList(), ParameterList()
-        #self.qkv_weights, self.qkv_biases = ParameterList(), ParameterList()
         self.linear_weights, self.linear_scales, self.linear_biases = ParameterList(), ParameterList(), ParameterList()
-        #self.linear_weights, self.linear_biases = ParameterList(), ParameterList()
         self.ffn_ln_scales, self.ffn_ln_biases = ParameterList(), ParameterList()
         self.ffn1_weights, self.ffn1_scales, self.ffn1_biases = ParameterList(), ParameterList(), ParameterList()
-        #self.ffn1_weights, self.ffn1_biases = ParameterList(), ParameterList()
         self.ffn2_weights, self.ffn2_scales, self.ffn2_biases = ParameterList(), ParameterList(), ParameterList()
-        #self.ffn2_weights, self.ffn2_biases = ParameterList(), ParameterList()
+        
         def get_attr(attrs, idx):
             if isinstance(attrs, (list, tuple, ParameterList)):
                 assert len(attrs) == num_layers
@@ -1589,10 +1586,14 @@ class FusedMultiTransformerWeightOnly(Layer):
                 attr=ln_bias_attr, shape=[embed_dim], is_bias=True, dtype="float32"
             )
             qkv_weight = self.create_parameter(
-                shape=[3, num_heads, self.head_dim, embed_dim],
+                shape=[3, 
+                       num_heads, 
+                       self.head_dim if weight_int8 else int(self.head_dim / 2), 
+                       embed_dim],
                 attr=qkv_weight_attr,
-                dtype=self._dtype,
+                dtype="uint8",
                 is_bias=False,
+                default_initializer=Constant(value=0),
             )
             qkv_scale = self.create_parameter(
                 shape=[int(3 * num_heads * self.head_dim)],
@@ -1617,10 +1618,11 @@ class FusedMultiTransformerWeightOnly(Layer):
             '''
             linear_weight = self.create_parameter(
                 shape=[embed_dim if weight_int8 else int(embed_dim / 2),
-                        int(num_heads * self.head_dim)],
+                       int(num_heads * self.head_dim)],
                 attr=linear_weight_attr,
-                dtype=self._dtype,
+                dtype="uint8",
                 is_bias=False,
+                default_initializer=Constant(value=0),
             )
             linear_scale = self.create_parameter(
                 shape=[embed_dim],
@@ -1654,10 +1656,12 @@ class FusedMultiTransformerWeightOnly(Layer):
             )
             '''
             ffn1_weight = self.create_parameter(
-                shape=[dim_feedforward, embed_dim],
+                shape=[dim_feedforward if weight_int8 else int(dim_feedforward / 2), 
+                       embed_dim],
                 attr=ffn1_weight_attr,
-                dtype=self._dtype,
+                dtype="uint8",
                 is_bias=False,
+                default_initializer=Constant(value=0),
             )
             ffn1_scale = self.create_parameter(
                 shape=[dim_feedforward],
@@ -1681,10 +1685,12 @@ class FusedMultiTransformerWeightOnly(Layer):
             )
             '''
             ffn2_weight = self.create_parameter(
-                shape=[embed_dim, dim_feedforward],
+                shape=[embed_dim if weight_int8 else int(embed_dim / 2), 
+                       dim_feedforward],
                 attr=ffn2_weight_attr,
-                dtype=self._dtype,
+                dtype="uint8",
                 is_bias=False,
+                default_initializer=Constant(value=0),
             )
             ffn2_scale = self.create_parameter(
                 shape=[embed_dim],

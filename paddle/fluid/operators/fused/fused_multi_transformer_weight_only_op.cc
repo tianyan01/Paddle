@@ -58,6 +58,11 @@ class FusedMultiTransformerWeightOnlyOp : public framework::OperatorWithKernel {
 
     CHECK_OUTPUT(Out);
 
+    const std::string weight_dtype =
+        ctx->Attrs().Get<std::string>("weight_dtype");
+    PADDLE_ENFORCE(weight_dtype == "int8" || weight_dtype == "int4",
+                   platform::errors::InvalidArgument(
+                       "quant_method must be 'int8' or 'int4'."));
     // x: qkv's input [batch_size, seq_len, dim_embed]
     // y: qkv's weight: [3, num_head, dim_head, dim_embed]
     auto x_dim = ctx->GetInputDim("X");
@@ -112,8 +117,9 @@ class FusedMultiTransformerWeightOnlyOp : public framework::OperatorWithKernel {
                             "head %d, but got %d",
                             y_dim[1],
                             c_dim[2]));  // num_head
+      int64_t head_size = (weight_dtype == "int4") ? y_dim[2] * 2 : y_dim[2];
       PADDLE_ENFORCE_EQ(c_dim[4],
-                        y_dim[2],
+                        head_size,
                         paddle::platform::errors::InvalidArgument(
                             "The fifth dim of CacheKV must be equal with head "
                             "size %d, but got %d",
