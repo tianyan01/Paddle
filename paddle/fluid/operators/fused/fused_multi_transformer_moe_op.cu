@@ -8,10 +8,16 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
-
+// #define DEBUG_MOE_TMPROFILE
 #include "paddle/fluid/operators/fused/fused_multi_transformer_moe_op.h"
 #include "paddle/phi/kernels/funcs/scatter.cu.h"
-
+#ifdef DEBUG_MOE_TMPROFILE
+#include "paddle/fluid/platform/timer.h"
+#endif
+#if defined(PADDLE_WITH_CUTLASS)
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/moe_gemm/moe_gemm_kernels_template.h"
+#endif
+DECLARE_bool(enable_moe_gemm_cutlass);
 namespace paddle {
 namespace operators {
 
@@ -31,7 +37,14 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
   void Compute(const framework::ExecutionContext &ctx) const override {
     using U = LayerNormParamType<T>;
     auto &dev_ctx = ctx.cuda_device_context();
-
+#ifdef DEBUG_MOE_TMPROFILE
+    platform::Timer all_tm, other_tm, trans_tm;
+    platform::Timer qkv_tm, fmha_tm, out_linear_tm;
+    platform::Timer expert_tm, ln_tm, gate_tm;
+    platform::Timer gate_nccl_tm, gather_tm, scatter_tm;
+    all_tm.Start();
+    other_tm.Start();
+#endif
     auto *time_step = ctx.Input<Tensor>("TimeStep");
     // 0. input
     auto *input_x = ctx.Input<Tensor>("X");
@@ -97,6 +110,16 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
                                      output_size,
                                      input_size,
                                      compute_bias);
+#if defined(PADDLE_WITH_CUTLASS)
+    using InputType = typename phi::PDDataTypeTraits<T>::DataType;
+    phi::MoeGemmRunner<InputType, InputType> gemm_runner;
+    auto default_act = phi::getActivationType("none");
+    auto expert_act = phi::getActivationType(act_method);
+#else
+    PADDLE_ENFORCE_EQ(FLAGS_enable_moe_gemm_cutlass, false, 
+                      "not support cutlass fused moe gemm please disable "
+                      "FLAGS_enable_moe_gemm_cutlass");
+#endif
     Tensor qkv_out;
     qkv_out.Resize({{bsz, seq_len, 3, num_head, dim_head}});
     auto *qkv_out_data =
@@ -162,7 +185,7 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
     fmha_out.Resize({{bsz, seq_len, num_head, dim_head}});
     auto *fmha_out_data =
         dev_ctx.Alloc<T>(&fmha_out, fmha_out.numel() * sizeof(T));
-    
+
     // 4. out_linear
     auto out_linear_weights = ctx.MultiInput<Tensor>("OutLinearW");
     auto out_linear_biases = ctx.MultiInput<Tensor>("OutLinearBias");
@@ -193,7 +216,10 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
     auto expert_weights2 = ctx.MultiInput<Tensor>("ExpertWeight2");
     auto expert_biases2 = ctx.MultiInput<Tensor>("ExpertBias2");
     int dim_feedforward = expert_weights1[0]->dims()[1];
-    // int dim_feedforward = expert_weights1[0]->dims()[2]; // batched gemm
+    // gemm cutlass used ColumnMajor store
+    if (FLAGS_enable_moe_gemm_cutlass) {
+      dim_feedforward = expert_weights1[0]->dims()[0];  // batched gemm
+    }
     int topk = ctx.Attr<int>("topk");
     int mp_size = ctx.Attr<int>("mp_size");
     int mp_rank = ctx.Attr<int>("mp_rank");
@@ -235,15 +261,19 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
                            local_expert_count.numel() * sizeof(int64_t));
     dev_ctx.Alloc<int64_t>(&global_expert_count,
                            global_expert_count.numel() * sizeof(int64_t));
+
     // fwd_expert_count, fwd_batch_size
-    Tensor fwd_expert_count, fwd_batch_size;
-    Tensor fwd_expert_count_cpu, fwd_batch_size_cpu;
+    Tensor fwd_expert_count, fwd_expert_csum_len;
+    Tensor fwd_expert_csum_len_cpu;
     fwd_expert_count.Resize({{num_expert}});
-    fwd_batch_size.Resize({{1}});
+    fwd_expert_csum_len.Resize({{num_expert + 1}});
     dev_ctx.Alloc<int64_t>(&fwd_expert_count,
                            fwd_expert_count.numel() * sizeof(int64_t));
-    dev_ctx.Alloc<int64_t>(&fwd_batch_size,
-                           fwd_batch_size.numel() * sizeof(int64_t));
+    dev_ctx.Alloc<int64_t>(&fwd_expert_csum_len,
+                           fwd_expert_csum_len.numel() * sizeof(int64_t));
+    phi::funcs::set_constant<int64_t>(
+        dev_ctx, &fwd_expert_csum_len, static_cast<int64_t>(0));
+
     // pos, temp pos
     Tensor pos, temp_pos;
     pos.Resize({{out_batch_size}});
@@ -276,8 +306,8 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
     dev_ctx.Alloc<int64_t>(&topk_tensor, topk_tensor.numel() * sizeof(int64_t));
     phi::FullKernel<int64_t, phi::GPUContext>(
         dev_ctx, {1}, topk, pos.dtype(), &topk_tensor);
-    // for nccl comm
-    auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
+    // moe nccl
+    phi::NCCLMoECollective moe_pg(dev_ctx, moe_ring_id, num_expert);
 
     Tensor buf0, moe_out;
     buf0.Resize({{bsz_seq, dim_embed}});
@@ -286,14 +316,23 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
     moe_out.Resize({{bsz_seq, dim_embed}});
 
     const T *x_data = input_x->data<T>();
-
+#ifdef DEBUG_MOE_TMPROFILE
+    dev_ctx.Wait();
+    other_tm.Pause();
+#endif
     int layers = qkv_weights.size();
     for (int i = 0; i < layers; ++i) {
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step1, pre layernorm";
 #endif
+#ifdef DEBUG_MOE_TMPROFILE
+      trans_tm.Resume();
+#endif
       // step1. layer_norm, only layer 0
       if (i == 0) {
+#ifdef DEBUG_MOE_TMPROFILE
+        ln_tm.Resume();
+#endif
         auto *ln_scale_data = ln_scales[i]->data<U>();
         auto *ln_bias_data = ln_biases[i]->data<U>();
         // TODO(wangxi): can remove mean var in inference
@@ -303,27 +342,29 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
                                   buf0.data<T>(),
                                   ln_mean_data,
                                   ln_var_data);
+#ifdef DEBUG_MOE_TMPROFILE
+        dev_ctx.Wait();
+        ln_tm.Pause();
+#endif
       }
-      // auto *ln_scale_data = ln_scales[i]->data<U>();
-      // auto *ln_bias_data = ln_biases[i]->data<U>();
-      // // TODO(wangxi): can remove mean var in inference
-      // ln_compute.ComputeForward(x_data,
-      //                           ln_scale_data,
-      //                           ln_bias_data,
-      //                           buf0.data<T>(),
-      //                           ln_mean_data,
-      //                           ln_var_data);
-
       // step2. qkv
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step2, qkv";
 #endif
       const Tensor *qkv_bias = qkv_biases.size() > 0 ? qkv_biases[i] : nullptr;
       // NOTE: in decoder stage, bias is fused in fmha
+#ifdef DEBUG_MOE_TMPROFILE
+      dev_ctx.Wait();
+      qkv_tm.Resume();
+#endif
       const Tensor *bias = time_step ? nullptr : qkv_bias;
       qkv_compute.ComputeForward(
           qkv_weights[i], &buf0, bias, &qkv_out, &qkv_out);
-
+#ifdef DEBUG_MOE_TMPROFILE
+      dev_ctx.Wait();
+      qkv_tm.Pause();
+      fmha_tm.Resume();
+#endif
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step3.1 fmha";
 #endif
@@ -414,10 +455,21 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step3.2 out linear";
 #endif
+#ifdef DEBUG_MOE_TMPROFILE
+      dev_ctx.Wait();
+      fmha_tm.Pause();
+      out_linear_tm.Resume();
+#endif
       // 输出到buf0
       out_linear_compute.ComputeForward(
           out_linear_weights[i], &fmha_out, nullptr, &buf0, nullptr);
-      AllReduce<T>(buf0, ring_id, buf0.numel(), dev_ctx);
+#ifdef DEBUG_MOE_TMPROFILE
+      dev_ctx.Wait();
+      out_linear_tm.Pause();
+#endif
+      if (mp_size > 1) {
+        phi::AllReduce<T>(buf0, ring_id, buf0.numel(), dev_ctx);
+      }
 
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step4";
@@ -427,22 +479,28 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
       auto *ln_scale_data = ffn_ln_scales[i]->data<U>();
       auto *ln_bias_data = ffn_ln_biases[i]->data<U>();
       auto *out_linear_bias_data = out_linear_biases[i]->data<T>();
-
+#ifdef DEBUG_MOE_TMPROFILE
+      ln_tm.Resume();
+#endif
       // pre layer norm : bias_dropout_residual_out is residual
       fused_dropout_layernorm_helper.LayernormResidualDropoutBias(
           dev_ctx,
           buf0.data<T>(),
-          x_data, // residual, moe out
+          x_data,  // residual, moe out
           out_linear_bias_data,
           ln_scale_data,
           ln_bias_data,
           bias_dropout_residual_out_data,
           dropout_mask_out_data,
-          buf0.data<T>(), // output to buf0
+          buf0.data<T>(),  // output to buf0
           ln_mean_data,
           ln_var_data);
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "step5";
+#endif
+#ifdef DEBUG_MOE_TMPROFILE
+      dev_ctx.Wait();
+      ln_tm.Pause();
 #endif
       // moe
       // step2 resize and slice ln_out
@@ -453,6 +511,9 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
       }
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, gate & topk";
+#endif
+#ifdef DEBUG_MOE_TMPROFILE
+      gate_tm.Resume();
 #endif
       // step3 gate & topk
       phi::MatMulAndAdd<T>(dev_ctx,
@@ -483,13 +544,19 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, all_to_all";
 #endif
+#ifdef DEBUG_MOE_TMPROFILE
+      dev_ctx.Wait();
+      gate_nccl_tm.Resume();
+#endif
       if (world_size > 1) {
-        phi::AllToAll<int64_t>(
-            local_expert_count, global_expert_count, moe_ring_id, dev_ctx);
+        moe_pg.AllToAll<int64_t>(local_expert_count, global_expert_count);
       } else {
         global_expert_count = local_expert_count;
       }
-
+#ifdef DEBUG_MOE_TMPROFILE
+      dev_ctx.Wait();
+      gate_nccl_tm.Pause();
+#endif
       // global expert count resize
       global_expert_count.Resize({{world_size, num_expert}});
       // fwd expert count
@@ -503,42 +570,26 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
                                                false,
                                                &fwd_expert_count);
       // fwd batch size
-      phi::SumKernel<int64_t, phi::GPUContext>(
-          dev_ctx,
-          fwd_expert_count,
-          phi::IntArray({}),  // axis is None
-          fwd_expert_count.dtype(),
-          false,
-          &fwd_batch_size);
+      phi::CumsumTensorValue<int64_t>(
+          dev_ctx, fwd_expert_count, &fwd_expert_csum_len, 1);
       // step4.3 cumsum & assign pos
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, cumsum";
 #endif
-      phi::CumsumKernel<int64_t, phi::GPUContext>(
-          dev_ctx, local_expert_count, 0, false, false, false, &lec_cum);
+      phi::CumsumTensorValue<int64_t>(dev_ctx, local_expert_count, &lec_cum);
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, assign pos";
 #endif
-      phi::AssignPosCompute<int64_t>(
-          dev_ctx, &lec_cum, &topk_idx, &pos, out_batch_size);
-#ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
-      VLOG(0) << "moe, floor divide";
-#endif
-      if (topk > 1) {
-        phi::FloorDivideKernel<int64_t, phi::GPUContext>(
-            dev_ctx, pos, topk_tensor, &temp_pos);
-      } else {
-        temp_pos = pos;
-      }
+      phi::AssignInsAndPosCompute<int64_t>(
+          dev_ctx, &lec_cum, &topk_idx, &pos, out_batch_size, topk, &temp_pos);
+
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, tensor copy";
 #endif
       framework::TensorCopy(
-          fwd_expert_count, platform::CPUPlace(), &fwd_expert_count_cpu);
-      framework::TensorCopy(
-          fwd_batch_size, platform::CPUPlace(), &fwd_batch_size_cpu);
+          fwd_expert_csum_len, platform::CPUPlace(), &fwd_expert_csum_len_cpu);
       dev_ctx.Wait();
-      int fwd_bsz = fwd_batch_size_cpu.data<int64_t>()[0];
+      int fwd_bsz = fwd_expert_csum_len_cpu.data<int64_t>()[num_expert];
 
       Tensor global_scatter_out;
       global_scatter_out.Resize({{fwd_bsz, dim_embed}});
@@ -549,9 +600,6 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
       all_expert_out.Resize({{fwd_bsz, dim_embed}});
       dev_ctx.Alloc<T>(&all_expert_out, all_expert_out.numel() * sizeof(T));
 
-      // global_scatter_out.Resize({{fwd_bsz, dim_embed}});
-      // all_expert_out.Resize({{fwd_bsz, dim_embed}});
-
       // step 5, MOEScatter
       // step 5.1, index select
       // suppose tmp_pos->shape != [0]
@@ -560,141 +608,199 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
 #endif
       phi::IndexSelectKernel<T, phi::GPUContext>(
           dev_ctx, sliced_inp, temp_pos, 0, &index_select_out);
+#ifdef DEBUG_MOE_TMPROFILE
+      dev_ctx.Wait();
+      gate_tm.Pause();
+
+      dev_ctx.Wait();
+      scatter_tm.Resume();
+#endif
       if (world_size > 1) {
-        // auto map =
-        // paddle::distributed::ProcessGroupMapFromGid::getInstance(); step 5.2,
-        // global_scatter
-        if (map->has(moe_ring_id)) {
-          phi::GlobalScatterProcessGroupFunctor<T>(dev_ctx,
-                                                   &index_select_out,
-                                                   &local_expert_count,
-                                                   &global_expert_count,
-                                                   moe_ring_id,
-                                                   true,
-                                                   &global_scatter_out);
-        } else {
-          phi::GlobalScatterFunctor<T>(dev_ctx,
-                                       &index_select_out,
-                                       &local_expert_count,
-                                       &global_expert_count,
-                                       moe_ring_id,
-                                       false,
-                                       &global_scatter_out);
-        }
+        moe_pg.Scatter<T>(&index_select_out,
+                          local_expert_count,
+                          global_expert_count,
+                          &global_scatter_out);
       } else {
         global_scatter_out = index_select_out;
       }
+#ifdef DEBUG_MOE_TMPROFILE
+      dev_ctx.Wait();
+      scatter_tm.Pause();
 
+      dev_ctx.Wait();
+      expert_tm.Resume();
+#endif
       // step 6, Expert Computation
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, Expert Computation";
 #endif
       if (fwd_bsz != 0) {
         // encoder, use matmul
-        int last_index = 0;
-        for (int idx = 0; idx < num_expert; idx++) {
-          int cur_expert_count = fwd_expert_count_cpu.data<int64_t>()[idx];
-          if (cur_expert_count <= 0) {
-            continue;
-          }
-          int end = cur_expert_count + last_index;
+        Tensor expert_out1;
+        if (FLAGS_enable_moe_gemm_cutlass) {
+#if defined(PADDLE_WITH_CUTLASS)
+          int expert_idx = i * num_expert;
+          // csum length
+          int64_t *total_rows_before_expert =
+              fwd_expert_csum_len.data<int64_t>();
+          const T *permuted_data = global_scatter_out.data<T>();
+          const T *fc1_expert_weights = expert_weights1[expert_idx]->data<T>();
+          const T *fc_scales = nullptr;
+          const T *fc1_expert_biases = expert_biases1[expert_idx]->data<T>();
 
-          Tensor expert_out1;
-          expert_out1.Resize({{cur_expert_count, dim_feedforward}});
+#ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
+          std::ostringstream ostr;
+          int64_t *pnum = fwd_expert_csum_len_cpu.data<int64_t>();
+          for (int j = 0; j <= num_expert; ++j) {
+            ostr << pnum[j] << ",";
+          }
+          VLOG(0)
+              << "layer id=" << i << ", expert_idx=" << expert_idx
+              << ", numel=" << fwd_expert_count.numel()
+              << ", dim_feedforward=" << dim_feedforward
+              << ", dim_embed=" << dim_embed << ", num_expert=" << num_expert
+              << ", global_scatter_out=" << global_scatter_out.dims()
+              << ", expert_weights1=" << expert_weights1[expert_idx]->dims()
+              << ", start ptr="
+              << (int64_t)(expert_weights1[expert_idx]->data()) << ", end ptr="
+              << (int64_t)(expert_weights1[expert_idx + num_expert - 1]->data())
+              << ", numel=" << expert_weights1[expert_idx]->numel()
+              << ", expert_weights2=" << expert_weights2[expert_idx]->dims()
+              << ", expert nums=" << ostr.str();
+#endif
+
+          expert_out1.Resize({{ fwd_bsz, dim_feedforward }});
           dev_ctx.Alloc<T>(&expert_out1, expert_out1.numel() * sizeof(T));
 
-          Tensor tmp_inp = global_scatter_out.Slice(last_index, end);
-          int expert_idx = i * num_expert + idx;
-          // cuda 11.4
-#if (CUDA_VERSION >= 11040)
-          phi::MatMulAndAddGelu<T>(dev_ctx,
-                                   expert_weights1[expert_idx],
-                                   &tmp_inp,
-                                   expert_biases1[expert_idx],
-                                   false,
-                                   false,
-                                   false,  // dont compute bias
-                                   &expert_out1);
-#else
-          // linear1 matmul
-          // VLOG(0) << "moe, Expert Computation, linear1 mul";
-          phi::MatMulAndAdd<T>(dev_ctx,
-                               expert_weights1[expert_idx],
-                               &tmp_inp,
-                               nullptr,
-                               false,
-                               false,
-                               false,  // dont compute bias
-                               &expert_out1,
-                               nullptr);
-          // bias gelu
-          FusedDropoutHelper<T, uint8_t> fused_act_dropout_helper(
-              dev_ctx, cur_expert_count, dim_feedforward, dropout_param);
-          // VLOG(0) << "moe, Expert Computation, add bias & gelu";
-          // inplace
-          fused_act_dropout_helper.DropoutActBias(
-              dev_ctx,
-              expert_out1.data<T>(),
-              expert_biases1[expert_idx]->data<T>(),
-              "gelu",
-              expert_out1.data<T>(),
-              nullptr,
-              1.0,
-              nullptr,
-              0,
-              1.0,
-              1,
-              127.0,
-              -127.0,
-              approximate);
+          T *fc1_result = expert_out1.data<T>();
+
+          gemm_runner.moe_gemm_bias_act(
+              reinterpret_cast<const InputType *>(permuted_data),
+              reinterpret_cast<const InputType *>(fc1_expert_weights),
+              reinterpret_cast<const InputType *>(fc_scales),
+              reinterpret_cast<const InputType *>(fc1_expert_biases),
+              reinterpret_cast<InputType *>(fc1_result),
+              total_rows_before_expert,
+              fwd_bsz,
+              dim_feedforward,
+              dim_embed,
+              num_expert,
+              static_cast<phi::ActivationType>(expert_act),
+              dev_ctx.stream());
+
+          const T *fc2_expert_weights = expert_weights2[expert_idx]->data<T>();
+          const T *fc2_expert_biases = expert_biases2[expert_idx]->data<T>();
+          T *fc2_result = all_expert_out.data<T>();
+
+          gemm_runner.moe_gemm_bias_act(
+              reinterpret_cast<const InputType *>(fc1_result),
+              reinterpret_cast<const InputType *>(fc2_expert_weights),
+              reinterpret_cast<const InputType *>(fc_scales),
+              reinterpret_cast<const InputType *>(fc2_expert_biases),
+              reinterpret_cast<InputType *>(fc2_result),
+              total_rows_before_expert,
+              fwd_bsz,
+              dim_embed,
+              dim_feedforward,
+              num_expert,
+              static_cast<phi::ActivationType>(default_act),
+              dev_ctx.stream());
 #endif
-          // linear2 matmul & add
-          // VLOG(0) << "moe, Expert Computation, linear2 matmul & add";
-          Tensor expert_out2 = all_expert_out.Slice(last_index, end);
-          phi::MatMulAndAdd<T>(dev_ctx,
-                               expert_weights2[expert_idx],
-                               &expert_out1,
-                               expert_biases2[expert_idx],
-                               false,
-                               false,
-                               true,  //  compute bias
-                               &expert_out2,
-                               &expert_out2);
-          last_index = end;
+        } else {
+          int last_index = 0;
+          int64_t *csum_len = fwd_expert_csum_len_cpu.data<int64_t>();
+          for (int idx = 0; idx < num_expert; idx++) {
+            int end = csum_len[idx + 1];
+            int cur_expert_count = end - last_index;
+            if (cur_expert_count <= 0) {
+              continue;
+            }
+
+            expert_out1.Resize({{cur_expert_count, dim_feedforward}});
+            dev_ctx.Alloc<T>(&expert_out1, expert_out1.numel() * sizeof(T));
+
+            Tensor tmp_inp = global_scatter_out.Slice(last_index, end);
+            int expert_idx = i * num_expert + idx;
+            // cuda 11.4
+#if (CUDA_VERSION >= 11040)
+            phi::MatMulAndAddGelu<T>(dev_ctx,
+                                     expert_weights1[expert_idx],
+                                     &tmp_inp,
+                                     expert_biases1[expert_idx],
+                                     false,
+                                     false,
+                                     false,  // dont compute bias
+                                     &expert_out1);
+#else
+            // linear1 matmul
+            // VLOG(0) << "moe, Expert Computation, linear1 mul";
+            phi::MatMulAndAdd<T>(dev_ctx,
+                                 expert_weights1[expert_idx],
+                                 &tmp_inp,
+                                 nullptr,
+                                 false,
+                                 false,
+                                 false,  // dont compute bias
+                                 &expert_out1,
+                                 nullptr);
+            // bias gelu
+            FusedDropoutHelper<T, uint8_t> fused_act_dropout_helper(
+                dev_ctx, cur_expert_count, dim_feedforward, dropout_param);
+            // VLOG(0) << "moe, Expert Computation, add bias & gelu";
+            // inplace
+            fused_act_dropout_helper.DropoutActBias(
+                dev_ctx,
+                expert_out1.data<T>(),
+                expert_biases1[expert_idx]->data<T>(),
+                "gelu",
+                expert_out1.data<T>(),
+                nullptr,
+                1.0,
+                nullptr,
+                0,
+                1.0,
+                1,
+                127.0,
+                -127.0,
+                approximate);
+#endif
+            // linear2 matmul & add
+            // VLOG(0) << "moe, Expert Computation, linear2 matmul & add";
+            Tensor expert_out2 = all_expert_out.Slice(last_index, end);
+            phi::MatMulAndAdd<T>(dev_ctx,
+                                 expert_weights2[expert_idx],
+                                 &expert_out1,
+                                 expert_biases2[expert_idx],
+                                 false,
+                                 false,
+                                 true,  //  compute bias
+                                 &expert_out2,
+                                 &expert_out2);
+            last_index = end;
+          }
         }
         // at last, concat all expert out
       } else {
         all_expert_out = global_scatter_out;
       }
-
+#ifdef DEBUG_MOE_TMPROFILE
+      dev_ctx.Wait();
+      expert_tm.Pause();
+      gather_tm.Resume();
+#endif
       // step7. MOEGather
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
       VLOG(0) << "moe, MOEGather";
 #endif
       if (world_size > 1) {
-        // auto map =
-        // paddle::distributed::ProcessGroupMapFromGid::getInstance(); step 7.1,
-        // global_gather
-        if (map->has(moe_ring_id)) {
-          phi::GlobalGatherProcessGroupFunctor<T>(dev_ctx,
-                                                  &all_expert_out,
-                                                  &local_expert_count,
-                                                  &global_expert_count,
-                                                  moe_ring_id,
-                                                  true,
-                                                  &global_gather_out);
-        } else {
-          phi::GlobalGatherFunctor<T>(dev_ctx,
-                                      &all_expert_out,
-                                      &local_expert_count,
-                                      &global_expert_count,
-                                      moe_ring_id,
-                                      false,
-                                      &global_gather_out);
-        }
+        moe_pg.Gather<T>(&all_expert_out, &global_gather_out);
       } else {
         global_gather_out = all_expert_out;
       }
+#ifdef DEBUG_MOE_TMPROFILE
+      dev_ctx.Wait();
+      gather_tm.Pause();
+#endif
       // step 7.2, local_gather or scatter
       // suppose pos->shape != [0]
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
@@ -702,7 +808,7 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
 #endif
       phi::funcs::GPUScatterAssign<T, int64_t>(
           dev_ctx, global_gather_out, pos, &moe_gather_out, true);
-      
+
       // step 8, reshape & bmm
       // moe gather out reshape
 #ifdef _DEBUG_FUSED_MULTI_TRANSFORMER
@@ -719,7 +825,7 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
 #endif
       if (mp_size > 1) {
         // all gather
-        phi::AllGather<T>(bmm_out, all_gather_out, moe_ring_id, dev_ctx);
+        moe_pg.AllGather<T>(bmm_out, all_gather_out);
       } else {
         all_gather_out = bmm_out;
       }
@@ -729,6 +835,10 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
 #endif
       if (i < layers - 1) {
         // add residual & next layer norm
+#ifdef DEBUG_MOE_TMPROFILE
+        dev_ctx.Wait();
+        ln_tm.Resume();
+#endif
         auto *ln_scale_data = ln_scales[i + 1]->data<U>();
         auto *ln_bias_data = ln_biases[i + 1]->data<U>();
         fused_dropout_layernorm_helper.LayernormResidualDropoutBias(
@@ -743,14 +853,40 @@ class FusedMultiTransformerMoeOpKernel : public framework::OpKernel<T> {
             buf0.data<T>(),  // out, after layernorm
             ln_mean_data,
             ln_var_data);
+#ifdef DEBUG_MOE_TMPROFILE
+        dev_ctx.Wait();
+        ln_tm.Pause();
+#endif
       } else {
         // last layer, only add residual
         phi::AddKernel<T, phi::GPUContext>(
             dev_ctx, all_gather_out, bias_dropout_residual_out, &moe_out);
       }
       x_data = moe_out.data<T>();
+#ifdef DEBUG_MOE_TMPROFILE
+      dev_ctx.Wait();
+      trans_tm.Pause();
+#endif
     }  // layers loop end
     out->Resize({{bsz, seq_len, dim_embed}});
+#ifdef DEBUG_MOE_TMPROFILE
+    dev_ctx.Wait();
+    all_tm.Pause();
+    VLOG(0) << "gpu=" << static_cast<int>(dev_ctx.GetPlace().GetDeviceId())
+            << ", bsz=" << bsz << ", seq_len=" << seq_len
+            << ", total span=" << all_tm.ElapsedMS()
+            << ", input=" << other_tm.ElapsedMS()
+            << ", transformer=" << trans_tm.ElapsedMS()
+            << ", [qkv=" << qkv_tm.ElapsedMS()
+            << ", fmha=" << fmha_tm.ElapsedMS()
+            << ", out_linear=" << out_linear_tm.ElapsedMS()
+            << ", expert=" << expert_tm.ElapsedMS()
+            << ", ln=" << ln_tm.ElapsedMS()
+            << ", gate/all2all=" << gate_tm.ElapsedMS() << "/"
+            << gate_nccl_tm.ElapsedMS()
+            << ", scatter=" << scatter_tm.ElapsedMS()
+            << ", gather=" << gather_tm.ElapsedMS() << "]";
+#endif
   }
 };
 

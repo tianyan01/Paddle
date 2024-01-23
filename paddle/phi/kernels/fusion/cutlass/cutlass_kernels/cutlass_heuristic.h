@@ -30,7 +30,7 @@ limitations under the License. */
 
 #pragma once
 
-#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/ft_gemm_configs.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/gemm_configs.h"
 
 namespace phi {
 
@@ -39,37 +39,39 @@ struct TileShape {
   int n;
 };
 
-static TileShape get_cta_shape_for_config(CutlassTileConfig tile_config) {
+inline TileShape get_cta_shape_for_config(CutlassTileConfig tile_config) {
   switch (tile_config) {
     case CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
       return TileShape{32, 128};
+    case CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64:
+      return TileShape{64, 64};
     case CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64:
     case CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64:
       return TileShape{64, 128};
+    case CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64:
+      return TileShape{128, 64};
     case CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8:
     case CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64:
+    case CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64:
     case CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64:
       return TileShape{128, 128};
-    // TODO(wangbojun) check the Tile Shape here,
-    // {256, 128} have better performance than 128, 128
     case CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64:
-      return TileShape{256, 128};
-    // TODO(wangbojun) CtaShape256x128x64_WarpShape64x64x64 is not a
+      return TileShape{128, 256};
     case CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64:
       return TileShape{256, 128};
     default:
       throw std::runtime_error(
-          "[FT Error][get_grid_shape_for_config] Invalid config");
+          "[TensorRT-LLm Error][get_grid_shape_for_config] Invalid config");
   }
 }
 
-static bool is_valid_split_k_factor(const int64_t m,
-                                    const int64_t n,
-                                    const int64_t k,
-                                    const TileShape tile_shape,
-                                    const int split_k_factor,
-                                    const size_t workspace_bytes,
-                                    const bool is_weight_only) {
+inline bool is_valid_split_k_factor(const int64_t m,
+                             const int64_t n,
+                             const int64_t k,
+                             const TileShape tile_shape,
+                             const int split_k_factor,
+                             const size_t workspace_bytes,
+                             const bool is_weight_only) {
   // All tile sizes have a k_tile of 64.
   static constexpr int k_tile = 64;
 
@@ -103,77 +105,85 @@ static bool is_valid_split_k_factor(const int64_t m,
   return true;
 }
 
-static std::vector<CutlassTileConfig> get_candidate_tiles(
+inline std::vector<CutlassTileConfig> get_candidate_tiles(
+    const int sm,
     const bool is_weight_only,
-    const bool is_weight_only_encoder,
     const bool simt_configs_only,
-    const int sm) {
-  std::vector<CutlassTileConfig> simt_configs{
-      CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8};
+    const bool int8_configs_only) {
+  enum class CutlassGemmType : char { Default, WeightOnly, Simt, Int8 };
 
-  std::vector<CutlassTileConfig> square_configs{
-      CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
-      CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64,
-      CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64,
-  };
-
-  std::vector<CutlassTileConfig> quant_B_configs_sm70{
-      CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
-      CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
-  };
-  std::vector<CutlassTileConfig> quant_B_configs_sm80{
-      CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
-      CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
-      CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64};
-
-  std::vector<CutlassTileConfig> quant_B_configs;
-  switch (sm) {
-    case 80:
-      quant_B_configs = quant_B_configs_sm80;
-      break;
-    case 75:
-    case 70:
-      quant_B_configs = quant_B_configs_sm70;
-      break;
-    default:
-      quant_B_configs = quant_B_configs_sm70;
-      break;
+  CutlassGemmType gemm_type = CutlassGemmType::Default;
+  if (simt_configs_only) {
+    gemm_type = CutlassGemmType::Simt;
+  } else if (is_weight_only) {
+    gemm_type = CutlassGemmType::WeightOnly;
+  } else if (int8_configs_only) {
+    gemm_type = CutlassGemmType::Int8;
   }
 
-  std::vector<CutlassTileConfig> encoder_quant_B_configs{
-      CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64
-      //    CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64
-  };
-  const std::vector<CutlassTileConfig> allowed_quant_B_configs =
-      is_weight_only_encoder ? encoder_quant_B_configs : quant_B_configs;
-  const std::vector<CutlassTileConfig> allowed_configs =
-      is_weight_only ? allowed_quant_B_configs : square_configs;
-  return simt_configs_only ? simt_configs : allowed_configs;
+  std::vector<CutlassTileConfig> base_configs{
+      CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+      CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64};
+  if (sm >= 75) {
+    base_configs.push_back(
+        CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64);
+  }
+
+  switch (gemm_type) {
+    case CutlassGemmType::Simt:
+      return {CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8};
+    case CutlassGemmType::WeightOnly:
+      if (sm >= 75) {
+        return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+                CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
+                CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64};
+      } else {
+        return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+                CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64};
+      }
+    case CutlassGemmType::Int8:
+      return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+              CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
+              CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
+              CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
+              CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
+              CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64};
+    default:
+      return base_configs;
+  }
 }
 
-static std::vector<CutlassGemmConfig> get_candidate_configs(
+inline std::vector<CutlassGemmConfig> get_candidate_configs(
     int sm,
     const bool is_weight_only,
-    const bool is_weight_only_encoder,
-    const bool simt_configs_only) {
+    const bool simt_configs_only,
+    const bool int8_configs_only,
+    const int max_split_k) {
   std::vector<CutlassTileConfig> tiles = get_candidate_tiles(
-      is_weight_only, is_weight_only_encoder, simt_configs_only, sm);
+      sm, is_weight_only, simt_configs_only, int8_configs_only);
 
   std::vector<CutlassGemmConfig> candidate_configs;
-  const int min_stages = 2;
-  const int max_stages = sm >= 80 ? 4 : 2;
-
+  const int min_stages = int8_configs_only ? 3 : 2;
+  const int max_stages = int8_configs_only ? 6 : (sm >= 80 ? 4 : 2);
   for (const auto& tile_config : tiles) {
     for (int stages = min_stages; stages <= max_stages; ++stages) {
       CutlassGemmConfig config{tile_config, SplitKStyle::NO_SPLIT_K, 1, stages};
       candidate_configs.push_back(config);
+      if (sm >= 75) {
+        for (int split_k_factor = 2; split_k_factor <= max_split_k;
+             ++split_k_factor) {
+          auto config = CutlassGemmConfig{
+              tile_config, SplitKStyle::SPLIT_K_SERIAL, split_k_factor, stages};
+          candidate_configs.push_back(config);
+        }
+      }
     }
   }
 
   return candidate_configs;
 }
 
-static CutlassGemmConfig estimate_best_config_from_occupancies(
+inline CutlassGemmConfig estimate_best_config_from_occupancies(
     const std::vector<CutlassGemmConfig>& candidate_configs,
     const std::vector<int>& occupancies,
     const int64_t m,
@@ -186,7 +196,8 @@ static CutlassGemmConfig estimate_best_config_from_occupancies(
     const int is_weight_only) {
   if (occupancies.size() != candidate_configs.size()) {
     throw std::runtime_error(
-        "[FT Error][estimate_best_config_from_occupancies] occpancies and "
+        "[TensorRT-LLm Error][estimate_best_config_from_occupancies] "
+        "occpancies and "
         "candidate configs vectors must have equal length.");
   }
 
@@ -203,6 +214,7 @@ static CutlassGemmConfig estimate_best_config_from_occupancies(
     TileShape tile_shape =
         get_cta_shape_for_config(candidate_config.tile_config);
     int occupancy = occupancies[ii];
+
     if (occupancy == 0) {
       continue;
     }
@@ -232,9 +244,9 @@ static CutlassGemmConfig estimate_best_config_from_occupancies(
         const int num_waves_total =
             (ctas_for_problem + ctas_per_wave - 1) / ctas_per_wave;
         const float num_waves_fractional =
-            ctas_for_problem / static_cast<float>(ctas_per_wave);
+            ctas_for_problem / float(ctas_per_wave);
         const float current_score =
-            static_cast<float>(num_waves_total) - num_waves_fractional;
+            float(num_waves_total) - num_waves_fractional;
 
         const float score_slack = 0.1f;
         if (current_score < config_score ||
@@ -271,7 +283,7 @@ static CutlassGemmConfig estimate_best_config_from_occupancies(
 
   if (best_config.tile_config == CutlassTileConfig::ChooseWithHeuristic) {
     throw std::runtime_error(
-        "[FT Error] Heurisitc failed to find a valid config.");
+        "[TensorRT-LLm Error] Heurisitc failed to find a valid config.");
   }
 
   return best_config;

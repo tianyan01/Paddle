@@ -20,14 +20,16 @@ limitations under the License. */
 #include "paddle/phi/common/float16.h"
 #include "paddle/phi/core/kernel_registry.h"
 #include "paddle/phi/kernels/funcs/aligned_vector.h"
+#if defined(PADDLE_WITH_CUTLASS)
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm_template.h"
+#endif
 #include "paddle/phi/kernels/matmul_kernel.h"
 
 namespace phi {
 
 template <typename T, int WeightBit>
 struct FastWeightOnlyHalfConverter;
-
+#if defined(PADDLE_WITH_CUTLASS)
 template <>
 struct FastWeightOnlyHalfConverter<half, 8> {
   using Converter =
@@ -39,13 +41,12 @@ struct FastWeightOnlyHalfConverter<half, 8> {
 
   __device__ static inline void convert(half halves[kHalfLength],
                                         uint8_t chars[kWeightOnlyLength],
-                                        float scale) {
+                                        half scale) {
     *reinterpret_cast<Converter::result_type*>(halves) =
         Converter::convert(*reinterpret_cast<Converter::source_type*>(chars));
 #pragma unroll
     for (int i = 0; i < kHalfLength; ++i) {
-      float dequant_value = __half2float(halves[i]) * scale;
-      halves[i] = __float2half_rn(dequant_value);
+      halves[i] = halves[i] * scale;
     }
   }
 };
@@ -61,17 +62,16 @@ struct FastWeightOnlyHalfConverter<half, 4> {
 
   __device__ static inline void convert(half halves[kHalfLength],
                                         uint8_t chars[kWeightOnlyLength],
-                                        float scale) {
+                                        half scale) {
     *reinterpret_cast<Converter::result_type*>(halves) =
         Converter::convert(*reinterpret_cast<Converter::source_type*>(chars));
 #pragma unroll
     for (int i = 0; i < kHalfLength; ++i) {
-      float dequant_value = __half2float(halves[i]) * scale;
-      halves[i] = __float2half_rn(dequant_value);
+      halves[i] = halves[i] * scale;
     }
   }
 };
-
+#endif
 #if defined(PADDLE_CUDA_BF16)
 template <>
 struct FastWeightOnlyHalfConverter<__nv_bfloat16, 8> {
@@ -84,13 +84,12 @@ struct FastWeightOnlyHalfConverter<__nv_bfloat16, 8> {
 
   __device__ static inline void convert(__nv_bfloat16 halves[kHalfLength],
                                         uint8_t chars[kWeightOnlyLength],
-                                        float scale) {
+                                        __nv_bfloat16 scale) {
     *reinterpret_cast<Converter::result_type*>(halves) =
         Converter::convert(*reinterpret_cast<Converter::source_type*>(chars));
 #pragma unroll
     for (int i = 0; i < kHalfLength; ++i) {
-      float dequant_value = __bfloat162float(halves[i]) * scale;
-      halves[i] = __float2bfloat16_rn(dequant_value);
+      halves[i] = halves[i] * scale;
     }
   }
 };
@@ -106,13 +105,12 @@ struct FastWeightOnlyHalfConverter<__nv_bfloat16, 4> {
 
   __device__ static inline void convert(__nv_bfloat16 halves[kHalfLength],
                                         uint8_t chars[kWeightOnlyLength],
-                                        float scale) {
+                                        __nv_bfloat16 scale) {
     *reinterpret_cast<Converter::result_type*>(halves) =
         Converter::convert(*reinterpret_cast<Converter::source_type*>(chars));
 #pragma unroll
     for (int i = 0; i < kHalfLength; ++i) {
-      float dequant_value = __bfloat162float(halves[i]) * scale;
-      halves[i] = __float2bfloat16_rn(dequant_value);
+      halves[i] = halves[i] * scale;
     }
   }
 };
@@ -120,7 +118,7 @@ struct FastWeightOnlyHalfConverter<__nv_bfloat16, 4> {
 
 template <typename T>
 __global__ void int8_weight_only_dequant(const uint8_t* weight,
-                                         const float* scale_list,
+                                         const T* scale_list,
                                          T* output,
                                          const int n,
                                          const int k) {
@@ -145,7 +143,7 @@ __global__ void int8_weight_only_dequant(const uint8_t* weight,
   int row_id = tile_id * 2 + ((lane_id % 8) > 3 ? 1 : 0);
   weight += tile_id * k * 2;
   output += row_id * k;
-  float scale = scale_list[row_id];
+  T scale = scale_list[row_id];
 #pragma unroll
   for (int i = lane_id * 16; i < k * 2; i += 16 * 32) {
     Load<uint8_t, 16>(&weight[i], &vec_weight);
@@ -175,7 +173,7 @@ __global__ void int8_weight_only_dequant(const uint8_t* weight,
 
 template <typename T>
 __global__ void int4_weight_only_dequant(const uint8_t* weight,
-                                         const float* scale_list,
+                                         const T* scale_list,
                                          T* output,
                                          const int n,
                                          const int k) {
@@ -201,7 +199,7 @@ __global__ void int4_weight_only_dequant(const uint8_t* weight,
   int row_id = tile_id * 4 + ((lane_id % 8) / 2);
   weight += tile_id * k / 2 * 4;
   output += row_id * k;
-  float scale = scale_list[row_id];
+  T scale = scale_list[row_id];
 #pragma unroll
   for (int i = lane_id * 32; i < k * 4; i += 32 * 32) {
     Load<uint8_t, 16>(&weight[i / 2], &vec_weight);
@@ -238,6 +236,7 @@ void WeightDequantize(const Context& dev_ctx,
                       const std::string& algo,
                       const bool transpose,
                       DenseTensor* out) {
+#if defined(PADDLE_WITH_CUTLASS)
   using DataType = typename PDDataTypeTraits<T>::DataType;
 
   int n = scale.dims()[0];
@@ -249,7 +248,7 @@ void WeightDequantize(const Context& dev_ctx,
   if (algo == "weight_only_int8") {
     int8_weight_only_dequant<DataType><<<grid, block, 0, stream>>>(
         reinterpret_cast<const uint8_t*>(x.data<int8_t>()),
-        scale.data<float>(),
+        reinterpret_cast<const DataType*>(scale.data<T>()),
         reinterpret_cast<DataType*>(out->data<T>()),
         n,
         k);
@@ -257,11 +256,12 @@ void WeightDequantize(const Context& dev_ctx,
     grid.x /= 2;
     int4_weight_only_dequant<DataType><<<grid, block, 0, stream>>>(
         reinterpret_cast<const uint8_t*>(x.data<int8_t>()),
-        scale.data<float>(),
+        reinterpret_cast<const DataType*>(scale.data<T>()),
         reinterpret_cast<DataType*>(out->data<T>()),
         n,
         k);
   }
+#endif
 }
 
 }  // namespace phi

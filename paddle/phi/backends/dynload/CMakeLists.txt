@@ -72,10 +72,17 @@ elseif(WITH_ASCEND_CL)
     SRCS warpctc.cc
     DEPS phi_dynamic_loader warpctc npu_hccl)
 else()
-  nv_library(
-    phi_dynload_cuda
-    SRCS ${CUDA_SRCS}
-    DEPS phi_dynamic_loader)
+  if(WITH_FLASHATTN)
+    nv_library(
+      phi_dynload_cuda
+      SRCS ${CUDA_SRCS}
+      DEPS phi_dynamic_loader flashattn)
+  else()
+    nv_library(
+      phi_dynload_cuda
+      SRCS ${CUDA_SRCS}
+      DEPS phi_dynamic_loader)
+  endif()
   cc_library(
     phi_dynload_warpctc
     SRCS warpctc.cc

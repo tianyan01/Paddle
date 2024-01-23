@@ -567,40 +567,6 @@ struct GPUContext::Impl {
   }
 
   inline void CublasCall(const std::function<void(blasHandle_t)>& callback) {
-    std::call_once(flag_cublas_, [&]() {
-      if (!blas_handle_) {
-        if (!blas_handle_creator_) {
-          phi::InitBlasHandle(&blas_handle_, stream());
-        } else {
-          blas_handle_ = blas_handle_creator_();
-        }
-      }
-#ifdef PADDLE_WITH_CUDA
-#if CUDA_VERSION >= 9000
-      if (!blas_tensor_core_handle_) {
-        if (!blas_tensor_core_handle_creator_) {
-          phi::InitBlasHandle(&blas_tensor_core_handle_, stream());
-        } else {
-          blas_tensor_core_handle_ = blas_tensor_core_handle_creator_();
-        }
-        PADDLE_RETRY_CUDA_SUCCESS(phi::dynload::cublasSetMathMode(
-            blas_tensor_core_handle_, CUBLAS_TENSOR_OP_MATH));
-      }
-#endif
-#if CUDA_VERSION >= 11000
-      if (!blas_tf32_tensor_core_handle_) {
-        if (!blas_tf32_tensor_core_handle_creator_) {
-          phi::InitBlasHandle(&blas_tf32_tensor_core_handle_, stream());
-        } else {
-          blas_tf32_tensor_core_handle_ =
-              blas_tf32_tensor_core_handle_creator_();
-        }
-        PADDLE_RETRY_CUDA_SUCCESS(phi::dynload::cublasSetMathMode(
-            blas_tf32_tensor_core_handle_, CUBLAS_TF32_TENSOR_OP_MATH));
-      }
-#endif
-#endif
-    });
     if (blas_tf32_tensor_core_handle_ != nullptr) {
       std::lock_guard<std::mutex> guard(blas_tf32_mtx_);
       callback(blas_tf32_tensor_core_handle_);
@@ -612,40 +578,6 @@ struct GPUContext::Impl {
 
   inline void TensorCoreCublasCallIfAvailable(
       const std::function<void(blasHandle_t)>& callback) {
-    std::call_once(flag_tensorcore_cublas_, [&]() {
-      if (!blas_handle_) {
-        if (!blas_handle_creator_) {
-          phi::InitBlasHandle(&blas_handle_, stream());
-        } else {
-          blas_handle_ = blas_handle_creator_();
-        }
-      }
-#ifdef PADDLE_WITH_CUDA
-#if CUDA_VERSION >= 9000
-      if (!blas_tensor_core_handle_) {
-        if (!blas_tensor_core_handle_creator_) {
-          phi::InitBlasHandle(&blas_tensor_core_handle_, stream());
-        } else {
-          blas_tensor_core_handle_ = blas_tensor_core_handle_creator_();
-        }
-        PADDLE_RETRY_CUDA_SUCCESS(phi::dynload::cublasSetMathMode(
-            blas_tensor_core_handle_, CUBLAS_TENSOR_OP_MATH));
-      }
-#endif
-#if CUDA_VERSION >= 11000
-      if (!blas_tf32_tensor_core_handle_) {
-        if (!blas_tf32_tensor_core_handle_creator_) {
-          phi::InitBlasHandle(&blas_tf32_tensor_core_handle_, stream());
-        } else {
-          blas_tf32_tensor_core_handle_ =
-              blas_tf32_tensor_core_handle_creator_();
-        }
-        PADDLE_RETRY_CUDA_SUCCESS(phi::dynload::cublasSetMathMode(
-            blas_tf32_tensor_core_handle_, CUBLAS_TF32_TENSOR_OP_MATH));
-      }
-#endif
-#endif
-    });
     if (blas_tensor_core_handle_ != nullptr) {
       std::lock_guard<std::mutex> guard(blas_tensor_core_mtx_);
       callback(blas_tensor_core_handle_);
@@ -722,6 +654,14 @@ struct GPUContext::Impl {
       }
     }
   }
+  // get workspace ptr
+  void* GetWorkSpacePtr(const size_t& len) {
+    if (workspace_ptr_ == nullptr || len > workspace_ptr_->size()) {
+      workspace_ptr_.reset();
+      workspace_ptr_ = allocator_->Allocate(len);
+    }
+    return workspace_ptr_->ptr();
+  }
 
   // use one flag for all handles?
   // they should be accessed consistently
@@ -786,6 +726,8 @@ struct GPUContext::Impl {
   Allocator* allocator_{nullptr};  // external resource.
   // A internal resouce to initinalize eigen_device.
   std::unique_ptr<internal::EigenGpuStreamDevice> eigen_stream_{nullptr};
+  // work space
+  phi::Allocator::AllocationPtr workspace_ptr_{nullptr};
 };
 
 GPUContext::GPUContext(GPUContext&&) = default;
@@ -1005,5 +947,10 @@ void GPUContext::SetMaxGridDimSize(const std::array<int, 3>& val) {
 void GPUContext::SetDriverVersion(int val) { impl_->driver_version_ = val; }
 
 void GPUContext::SetRuntimeVersion(int val) { impl_->runtime_version_ = val; }
+
+// Get Work Space
+void* GPUContext::GetWorkSpacePtr(const size_t& len) const {
+  return impl_->GetWorkSpacePtr(len);
+}
 
 }  // namespace phi

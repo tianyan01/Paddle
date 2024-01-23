@@ -11,23 +11,24 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 #include "glog/logging.h"
 
 #include "paddle/phi/core/dense_tensor.h"
 #include "paddle/phi/core/errors.h"
 #include "paddle/phi/core/kernel_registry.h"
+#ifdef PADDLE_WITH_MEMORY_EFFICIENT_ATTENTION
 #include "paddle/phi/kernels/fusion/cutlass/memory_efficient_attention/autogen/memory_efficient_attention.h"
 #include "paddle/phi/kernels/fusion/cutlass/memory_efficient_attention/gemm_kernel_utils.h"
 #include "paddle/phi/kernels/fusion/cutlass/memory_efficient_attention_utils.h"
+#endif
 #include "paddle/fluid/platform/enforce.h"
 
 namespace phi {
 namespace fusion {
 namespace cutlass_internal {
-
+#ifdef PADDLE_WITH_MEMORY_EFFICIENT_ATTENTION
 using gemm_kernel_utils::getMaximumSharedMemoryPerBlockKb;
-
+#endif
 template <typename T, typename Context>
 void MemoryEfficientAttentionForwardKernel(
     const Context& ctx,
@@ -48,6 +49,7 @@ void MemoryEfficientAttentionForwardKernel(
     DenseTensor* output,
     DenseTensor* logsumexp,
     DenseTensor* seed_and_offset) {
+#ifdef PADDLE_WITH_MEMORY_EFFICIENT_ATTENTION
   int compute_capacity = ctx.GetComputeCapability();
   const auto max_shmem =
       getMaximumSharedMemoryPerBlockKb(compute_capacity) * 1024;
@@ -267,6 +269,7 @@ void MemoryEfficientAttentionForwardKernel(
       kernel_launched,
       true,
       phi::errors::InvalidArgument("the kernel should not be launched"));
+#endif
 }
 
 }  // namespace cutlass_internal

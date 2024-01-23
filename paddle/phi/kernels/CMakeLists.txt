@@ -137,27 +137,27 @@ endif()
 file(GLOB kernel_xpu "xpu/*.cc" "selected_rows/xpu/*.cc" "fusion/xpu/*.cc")
 
 if(WITH_CUTLASS)
-  add_definitions("-DPADDLE_WITH_MEMORY_EFFICIENT_ATTENTION")  # for memory_efficient_attention.h
-  execute_process(
-    COMMAND
-      ${PYTHON_EXECUTABLE}
-      ${PADDLE_SOURCE_DIR}/paddle/phi/kernels/fusion/cutlass/memory_efficient_attention/generate_kernels.py
-      --cuda_arch "${NVCC_ARCH_BIN}"
-    RESULT_VARIABLE memory_efficient_attention_gen_res)
+  # add_definitions("-DPADDLE_WITH_MEMORY_EFFICIENT_ATTENTION")  # for memory_efficient_attention.h
+  # execute_process(
+  #   COMMAND
+  #     ${PYTHON_EXECUTABLE}
+  #     ${PADDLE_SOURCE_DIR}/paddle/phi/kernels/fusion/cutlass/memory_efficient_attention/generate_kernels.py
+  #     --cuda_arch "${NVCC_ARCH_BIN}"
+  #   RESULT_VARIABLE memory_efficient_attention_gen_res)
 
-  execute_process(
-    COMMAND
-      ${PYTHON_EXECUTABLE}
-      ${PADDLE_SOURCE_DIR}/paddle/phi/kernels/fusion/cutlass/memory_efficient_attention/generate_variable_forward_kernels.py
-      --cuda_arch "${NVCC_ARCH_BIN}"
-    RESULT_VARIABLE memory_efficient_attention_gen_res)
+  # execute_process(
+  #   COMMAND
+  #     ${PYTHON_EXECUTABLE}
+  #     ${PADDLE_SOURCE_DIR}/paddle/phi/kernels/fusion/cutlass/memory_efficient_attention/generate_variable_forward_kernels.py
+  #     --cuda_arch "${NVCC_ARCH_BIN}"
+  #   RESULT_VARIABLE memory_efficient_attention_gen_res)
 
-  if(NOT memory_efficient_attention_gen_res EQUAL 0)
-    message(
-      FATAL_ERROR
-        "The memory efficient attention kernel generation errors with NVCC_ARCH_BIN=${NVCC_ARCH_BIN}"
-    )
-  endif()
+  # if(NOT memory_efficient_attention_gen_res EQUAL 0)
+  #   message(
+  #     FATAL_ERROR
+  #       "The memory efficient attention kernel generation errors with NVCC_ARCH_BIN=${NVCC_ARCH_BIN}"
+  #   )
+  # endif()
 
   execute_process(
     COMMAND
@@ -168,15 +168,28 @@ if(WITH_CUTLASS)
     WORKING_DIRECTORY
       "${CMAKE_CURRENT_SOURCE_DIR}/fusion/cutlass/cutlass_kernels/fpA_intB_gemm"
   )
+  
+  execute_process(
+    COMMAND
+      ${CMAKE_COMMAND} -E make_directory
+      "${CMAKE_CURRENT_SOURCE_DIR}/fusion/cutlass/cutlass_kernels/moe_gemm/autogen"
+    COMMAND ${PYTHON_EXECUTABLE} generic_moe_gemm_kernelLauncher.py
+            --cuda_arch "${NVCC_ARCH_BIN}"
+    WORKING_DIRECTORY
+      "${CMAKE_CURRENT_SOURCE_DIR}/fusion/cutlass/cutlass_kernels/moe_gemm"
+  )
 
   file(
     GLOB cutlass_cu
     RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
-    "fusion/cutlass/*.cu"
-    "fusion/cutlass/memory_efficient_attention/autogen/impl/*.cu"
-    "fusion/cutlass/memory_efficient_attention/autogen_variable/impl/*.cu"
+    # "fusion/cutlass/*.cu"
+    # "fusion/cutlass/memory_efficient_attention/autogen/impl/*.cu"
+    # "fusion/cutlass/memory_efficient_attention/autogen_variable/impl/*.cu"
+    "fusion/cutlass/cutlass_kernels/*.cu"
     "fusion/cutlass/cutlass_kernels/fpA_intB_gemm/autogen/*.cu"
-    "fusion/cutlass/cutlass_kernels/fpA_intB_gemm/*.cu")
+    "fusion/cutlass/cutlass_kernels/fpA_intB_gemm/*.cu"
+    "fusion/cutlass/cutlass_kernels/moe_gemm/autogen/*.cu"
+    "fusion/cutlass/cutlass_kernels/moe_gemm/*.cu")
   list(APPEND kernel_cu ${cutlass_cu})
 endif()
 

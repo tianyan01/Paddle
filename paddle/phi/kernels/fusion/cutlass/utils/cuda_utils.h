@@ -200,26 +200,34 @@ void check_abs_mean_val(const T* result, const int size);
                            " Assertion fail: " + file + ":" +
                            std::to_string(line) + " \n");
 }
-
+template<class... ARGS>
 inline void myAssert(bool result,
                      const char* const file,
                      int const line,
-                     std::string const& info = "") {
+					 const char *fmt,
+					 ARGS&& ... args) {
   if (!result) {
+    std::string info;
+	int len = snprintf(NULL, 0, fmt, args...);
+    size_t oldlen = info.length();
+    info.resize(oldlen + len + 1);
+    CHECK(snprintf(&info[oldlen], (size_t)len + 1, fmt, args...) == len);
+    info.resize(oldlen + len);
     throwRuntimeError(file, line, info);
   }
 }
 
-#define FT_CHECK(val) myAssert(val, __FILE__, __LINE__)
-#define FT_CHECK_WITH_INFO(val, info)                                        \
+#define FT_CHECK(val) myAssert(val, __FILE__, __LINE__, "")
+#define FT_CHECK_WITH_INFO(val, fmt, args...)                                \
   do {                                                                       \
     bool is_valid_val = (val);                                               \
     if (!is_valid_val) {                                                     \
-      paddle::operators::myAssert(is_valid_val, __FILE__, __LINE__, (info)); \
+      myAssert(is_valid_val, __FILE__, __LINE__, fmt, ##args); 			     \
     }                                                                        \
   } while (0)
 
 #define FT_THROW(info) throwRuntimeError(__FILE__, __LINE__, info)
+#define FT_LOG_DEBUG(info)
 
 #ifdef SPARSITY_ENABLED
 #define CHECK_CUSPARSE(func)                                              \

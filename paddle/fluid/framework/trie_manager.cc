@@ -19,6 +19,45 @@ namespace paddle {
 namespace framework {
 std::shared_ptr<TrieManager> TrieManager::_s_instance = nullptr;
 
+void TrieManager::reset(const std::vector<int>& labels) {
+    VLOG(3) << "trie reset...";
+    std::unique_lock<std::mutex> lock(mtx_);
+
+    size_t root = 0;
+    size_t chs = trie_.child_size(root);
+    std::unordered_map<uint32_t, uint32_t> l2n;
+    for (size_t i = 0; i < chs; ++i) {
+        uint32_t cid = trie_.child_at(root, i);
+        uint32_t lab = trie_.label(cid);
+        l2n.insert({lab, cid});
+    }
+
+    parent_idx_.mutable_data<int64_t>({int(labels.size())}, phi::GPUPinnedPlace());
+    int64_t* parent_idx = parent_idx_.data<int64_t>();
+
+    select_ids_.mutable_data<int64_t>({int(labels.size())}, phi::GPUPinnedPlace());
+    int64_t* select_ids = select_ids_.data<int64_t>();
+
+    label2node_.resize(labels.size());
+    for (size_t i = 0; i < labels.size(); ++i) {
+        auto it = l2n.find(labels[i]);
+        uint32_t label = endid_;
+        uint32_t nodeid = end_nodeid_;
+
+        if (it != l2n.end()) {
+            label = labels[i];
+            nodeid = it->second;
+        }
+
+        parent_idx[i] = i;
+        select_ids[i] = label;
+        label2node_[i].insert({label, nodeid});
+    }
+
+    phase_ = Phase::run;
+    cv_.notify_one();
+}
+
 void TrieManager::reset() {
     VLOG(3) << "trie reset...";
     std::unique_lock<std::mutex> lock(mtx_);
@@ -84,8 +123,8 @@ void TrieManager::run() {
         int64_t* parent_idx = parent_idx_.data<int64_t>();
         int64_t* select_ids = select_ids_.data<int64_t>();
 
-        std::vector<std::unordered_map<uint16_t, uint32_t>> label2node(numel);
-        std::vector<std::vector<uint16_t>> outs(numel);
+        std::vector<std::unordered_map<uint32_t, uint32_t>> label2node(numel);
+        std::vector<std::vector<uint32_t>> outs(numel);
         parallel_run_range(numel, thr_num, [this, parent_idx, select_ids, &outs, &label2node] (
                 uint32_t thr_id, uint32_t start, uint32_t end) {
             for (size_t i = start; i < end; ++i) {
@@ -101,14 +140,19 @@ void TrieManager::run() {
                 auto it = l2n_.find(select_ids[i]);
                 if (it == l2n_.end()) {
                     out.push_back(endid_);
-                    l2n.insert({endid_, 0});
+                    l2n.insert({endid_, end_nodeid_});
+                    continue;
+                }
+                if (it->second == end_nodeid_) {
+                    out.push_back(endid_);
+                    l2n.insert({endid_, end_nodeid_});
                     continue;
                 }
 
                 size_t chs = trie_.child_size(it->second);
                 if (chs == 0 || trie_.aleaf(it->second)) {
                     out.push_back(endid_);
-                    l2n.insert({endid_, 0});
+                    l2n.insert({endid_, end_nodeid_});
                 }
 
                 for (size_t j = 0; j < chs; ++j) {
@@ -141,7 +185,8 @@ void TrieManager::run() {
             next_lod[i+1] = next_lod[i] + int64_t(outs[i].size());
         }
 
-        VLOG(3) << "out " << next_out_ << "\n lod " << next_lod_;
+        VLOG(10) << "out " << next_out_ << "\n lod " << next_lod_;
+        VLOG(3) << "out" << framework::PrintTensor<int64_t>(next_out_, 100);
 
         // 3.
         TensorCopySync(next_out_, place_, &next_out_d_);

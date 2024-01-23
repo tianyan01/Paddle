@@ -499,6 +499,8 @@ void BindTensor(pybind11::module &m) {  // NOLINT
              return DataLayoutToString(self.layout());
            })
       .def("_share_data_with", &framework::Tensor::ShareDataWith)
+      .def("_share_data_buffer", &framework::Tensor::ShareBufferWith)
+      .def("_share_buffer_with_tensors", &framework::Tensor::ShareBufferWithTensors)
       .def("__getitem__", PySliceTensor, py::return_value_policy::reference)
       .def("__str__",
            [](const framework::Tensor &self) {

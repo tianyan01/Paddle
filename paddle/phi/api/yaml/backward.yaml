@@ -251,7 +251,7 @@
     data_type: q
     
 - backward_op : weight_only_linear_grad
-  forward : weight_only_linear(Tensor x, Tensor weight, Tensor bias, Tensor weight_scale, str weight_dtype) -> Tensor(out)
+  forward : weight_only_linear(Tensor x, Tensor weight, Tensor bias, Tensor weight_scale, str weight_dtype, str act_method = "none") -> Tensor(out)
   args : (Tensor x, Tensor weight, Tensor bias, Tensor weight_scale, Tensor out_grad, str weight_dtype)
   output : Tensor(x_grad)
   infer_meta :

@@ -20,6 +20,7 @@
 #include "paddle/phi/core/kernel_registry.h"
 #include "paddle/phi/core/tensor_utils.h"
 #include "paddle/phi/kernels/fusion/beam_search_softmax.h"
+#include "paddle/phi/kernels/fusion/gpu/beam_search_topk.cu.h"
 
 namespace phi {
 namespace fusion {
@@ -27,36 +28,37 @@ namespace fusion {
 #define FLT_MAX 1e38
 // #define DEBUG_BEAM_SEARCH_SOFTMAX
 
-#define CASE_K(K)                                                   \
-  case K:                                                           \
-    invokeTopKSoftMaxLauncher<T, 2 * K, Context>(dev_ctx,           \
-                                                 log_probs,         \
-                                                 stop_flags,        \
-                                                 sequence_lengths,  \
-                                                 cum_log_probs,     \
-                                                 step_ids,          \
-                                                 last_cache_ids,    \
-                                                 last_beam_offsets, \
-                                                 end_ids,           \
-                                                 out_cum_log_probs, \
-                                                 stop_flags_out,    \
-                                                 seq_lens_out,      \
-                                                 step_ids_out,      \
-                                                 ids,               \
-                                                 tmp_ids,           \
-                                                 tmp_vals,          \
-                                                 parent_idx,        \
-                                                 cache_ids,         \
-                                                 beam_offsets,      \
-                                                 batch_size,        \
-                                                 beam_size,         \
-                                                 vocab_size,        \
-                                                 max_seq_len,       \
-                                                 max_dec_len,       \
-                                                 fuse_softmax,      \
-                                                 early_stop,        \
-                                                 length_penalty,    \
-                                                 stream);           \
+#define CASE_K(K)                                               \
+  case K:                                                       \
+    invokeTopKSoftMaxLauncher<T, K, Context>(dev_ctx,           \
+                                             log_probs,         \
+                                             stop_flags,        \
+                                             sequence_lengths,  \
+                                             cum_log_probs,     \
+                                             step_ids,          \
+                                             last_cache_ids,    \
+                                             last_beam_offsets, \
+                                             end_ids,           \
+                                             out_cum_log_probs, \
+                                             stop_flags_out,    \
+                                             seq_lens_out,      \
+                                             step_ids_out,      \
+                                             ids,               \
+                                             tmp_ids,           \
+                                             tmp_vals,          \
+                                             parent_idx,        \
+                                             cache_ids,         \
+                                             beam_offsets,      \
+                                             batch_size,        \
+                                             beam_size,         \
+                                             vocab_size,        \
+                                             max_seq_len,       \
+                                             max_dec_len,       \
+                                             fuse_softmax,      \
+                                             early_stop,        \
+                                             length_penalty,    \
+                                             one_stage_topk,    \
+                                             stream);           \
     break
 
 struct __align__(8) DySoftMaxStruct {
@@ -165,7 +167,7 @@ __global__ void batch_topk(const int *topk_tmp_id_buf,
                            int *step_ids_out) {
   int thread_id = threadIdx.x;
   int block_id = blockIdx.x; // bs
-  const int beam_size = K / 2;
+  const int beam_size = K;
   TopK<T, beam_size> partial;
   if (thread_id == 0) {
     for (int i = 0; i < beam_size; ++i) {
@@ -220,7 +222,7 @@ __global__ void batch_topk(const int *topk_tmp_id_buf,
                            int *step_ids_out) {
   int thread_id = threadIdx.x;
   int block_id = blockIdx.x; // bs
-  const int beam_size = K / 2;
+  const int beam_size = K;
   TopK<T, beam_size> partial;
   if (thread_id == 0) {
     for (int i = 0; i < beam_size; ++i) {
@@ -665,6 +667,197 @@ void invokeUpdateCacheIds(const int *last_cache_ids,
 }
 
 template <typename T, int K, typename Context>
+void invokeTwoStageTopK(const Context &dev_ctx,
+                        const T *log_probs,
+                        const bool *stop_flags,
+                        const float *cum_log_probs,
+                        const int *step_ids,
+                        const int *end_ids,
+                        int *tmp_ids,
+                        T *tmp_vals,
+                        const int batch_size,
+                        const int beam_size,
+                        const int vocab_size,
+                        const bool fuse_softmax,
+                        const float length_penalty) {
+  const int block_size = 128;
+  int voc_parts = vocab_size / 1024;
+  voc_parts = std::min(128, voc_parts);
+  int packed_top_kmd_size = 2 * K;
+  if (fuse_softmax) {
+    packed_top_kmd_size += 2;
+  }
+  const int tmp_buffer_size =
+      batch_size * beam_size * voc_parts * packed_top_kmd_size;
+  DenseTensor tmp_buffer_tensor;
+  tmp_buffer_tensor.Resize(phi::make_ddim({tmp_buffer_size}));
+  dev_ctx.template Alloc<float>(&tmp_buffer_tensor);
+  float *tmp_buffer = tmp_buffer_tensor.data<float>();
+
+  dim3 grid(batch_size * beam_size, voc_parts);
+  if (fuse_softmax) {
+    cudaFuncSetAttribute(beam_search_softmax_topk_stage1<T, K, block_size, 2 * K + 2>,
+                         cudaFuncAttributePreferredSharedMemoryCarveout,
+                         cudaSharedmemCarveoutMaxL1);
+    // （bs, bm, voc_parts, 2 * K + 2）
+    beam_search_softmax_topk_stage1<T, K, block_size, 2 * K + 2>
+        <<<grid, block_size, 0, dev_ctx.stream()>>>(
+            log_probs, stop_flags, end_ids, tmp_buffer, vocab_size, fuse_softmax);
+  } else {
+    cudaFuncSetAttribute(beam_search_softmax_topk_stage1<T, K, block_size, 2 * K>,
+                         cudaFuncAttributePreferredSharedMemoryCarveout,
+                         cudaSharedmemCarveoutMaxL1);
+    // （bs, bm, voc_parts, 2 * K）
+    beam_search_softmax_topk_stage1<T, K, block_size, 2 * K>
+        <<<grid, block_size, 0, dev_ctx.stream()>>>(
+            log_probs, stop_flags, end_ids, tmp_buffer, vocab_size, fuse_softmax);
+  }
+  // (bs, bm, K)
+  invokeBeamSearchSoftmaxTopKStage2<T, K>(tmp_buffer,
+                                          cum_log_probs,
+                                          tmp_ids,
+                                          tmp_vals,
+                                          batch_size,
+                                          beam_size,
+                                          voc_parts,
+                                          packed_top_kmd_size,
+                                          fuse_softmax,
+                                          length_penalty,
+                                          step_ids,
+                                          dev_ctx.stream());
+}
+
+template <typename T, int K, typename Context>
+void invokeOneStageTopK(const Context &dev_ctx,
+                        const T *log_probs,
+                        const bool *stop_flags,
+                        const float *cum_log_probs,
+                        const int *step_ids,
+                        const int *end_ids,
+                        int *tmp_ids,
+                        T *tmp_vals,
+                        const int batch_size,
+                        const int beam_size,
+                        const int vocab_size,
+                        const float length_penalty) {
+  int input_height = batch_size * beam_size;
+  int input_width = vocab_size;
+  int k = beam_size;
+
+  if (k > input_width) {
+    PADDLE_THROW(paddle::platform::errors::Unavailable(
+          "Calculation error occurred in TopK Operator's CUDA Kernel."));
+  }
+
+  const int kMaxHeight = 2048;
+  int gridx = input_height < kMaxHeight ? input_height : kMaxHeight;
+
+  switch (GetDesiredBlockDim(input_width)) {
+    FIXED_BLOCK_DIM(
+      BeamSearchTopK<T, 2, kBlockDim>
+        <<<gridx, kBlockDim, 0, dev_ctx.stream()>>>(tmp_vals,
+                                                    k,
+                                                    tmp_ids,
+                                                    log_probs,
+                                                    input_width,
+                                                    input_width,
+                                                    k,
+                                                    gridx,
+                                                    input_height,
+                                                    cum_log_probs,
+                                                    stop_flags,
+                                                    step_ids,
+                                                    end_ids,
+                                                    length_penalty));
+    default:
+      PADDLE_THROW(paddle::platform::errors::Unavailable(
+          "Calculation error occurred in TopK Operator's CUDA Kernel."));
+  }
+}
+
+template <typename T, int K>
+void invokeBatchTopK(int *tmp_ids,
+                     T *tmp_vals,
+                     const float *cum_log_probs,
+                     const int *step_ids,
+                     const bool *stop_flags, // bs * beam_size
+                     const int *sequence_lengths,
+                     const int *end_ids,
+                     int *ids,
+                     T *out_cum_log_probs,
+                     int *parent_idx,
+                     bool *stop_flags_out,
+                     int *seq_lens_out,
+                     int *step_ids_out,
+                     const int batch_size,
+                     const bool early_stop,
+                     cudaStream_t stream) {
+  if (early_stop) {
+    if (K > 10) {
+      reduced_batch_topk<T, K, 32><<<batch_size, 32, 0, stream>>>(
+        tmp_ids,
+        tmp_vals,
+        cum_log_probs,
+        step_ids,
+        stop_flags,
+        sequence_lengths,
+        end_ids,
+        ids,
+        out_cum_log_probs,
+        parent_idx,
+        stop_flags_out,
+        seq_lens_out,
+        step_ids_out);
+    } else {
+      batch_topk<T, K, 32><<<batch_size, 32, 0, stream>>>(
+        tmp_ids,
+        tmp_vals,
+        cum_log_probs,
+        step_ids,
+        stop_flags,
+        sequence_lengths,
+        end_ids,
+        ids,
+        out_cum_log_probs,
+        parent_idx,
+        stop_flags_out,
+        seq_lens_out,
+        step_ids_out);
+    }
+  } else {
+    if (K > 10) {
+      reduced_batch_topk<T, K, 32><<<batch_size, 32, 0, stream>>>(
+        tmp_ids,
+        tmp_vals,
+        step_ids,
+        stop_flags,
+        sequence_lengths,
+        end_ids,
+        ids,
+        out_cum_log_probs,
+        parent_idx,
+        stop_flags_out,
+        seq_lens_out,
+        step_ids_out);
+    } else {
+      batch_topk<T, K, 32><<<batch_size, 32, 0, stream>>>(
+        tmp_ids,
+        tmp_vals,
+        step_ids,
+        stop_flags,
+        sequence_lengths,
+        end_ids,
+        ids,
+        out_cum_log_probs,
+        parent_idx,
+        stop_flags_out,
+        seq_lens_out,
+        step_ids_out);
+    }
+  }
+}
+
+template <typename T, int K, typename Context>
 void invokeTopKSoftMaxLauncher(const Context &dev_ctx,
                                const T *log_probs,
                                const bool *stop_flags,
@@ -692,84 +885,57 @@ void invokeTopKSoftMaxLauncher(const Context &dev_ctx,
                                const bool fuse_softmax,
                                const bool early_stop,
                                const float length_penalty,
+                               const bool one_stage_topk,
                                cudaStream_t stream) {
-  // K = 2 * beam_size
-  const int block_size = 128;
-  int voc_parts = vocab_size / 1024;
-  voc_parts = std::min(128, voc_parts);
-  int packed_top_kmd_size = 2 * K;
-  if (fuse_softmax) {
-    packed_top_kmd_size += 2;
+  if (one_stage_topk) {
+    if (fuse_softmax) {
+      PADDLE_THROW(paddle::platform::errors::Unavailable(
+          "one stage topk not support fuse softmax."));
+    }
+    invokeOneStageTopK<T, K, Context>(dev_ctx,
+                                      log_probs,
+                                      stop_flags,
+                                      cum_log_probs,
+                                      step_ids,
+                                      end_ids,
+                                      tmp_ids,
+                                      tmp_vals,
+                                      batch_size,
+                                      beam_size,
+                                      vocab_size,
+                                      length_penalty);
+  } else {
+    invokeTwoStageTopK<T, K, Context>(dev_ctx,
+                                      log_probs,
+                                      stop_flags,
+                                      cum_log_probs,
+                                      step_ids,
+                                      end_ids,
+                                      tmp_ids,
+                                      tmp_vals,
+                                      batch_size,
+                                      beam_size,
+                                      vocab_size,
+                                      fuse_softmax,
+                                      length_penalty);
   }
-  const int tmp_buffer_size =
-      batch_size * beam_size * voc_parts * packed_top_kmd_size;
-  DenseTensor tmp_buffer_tensor;
-  tmp_buffer_tensor.Resize(phi::make_ddim({tmp_buffer_size}));
-  dev_ctx.template Alloc<float>(&tmp_buffer_tensor);
-  float *tmp_buffer = tmp_buffer_tensor.data<float>();
 
-  dim3 grid(batch_size * beam_size, voc_parts);
-  if (fuse_softmax) {
-    cudaFuncSetAttribute(beam_search_softmax_topk_stage1<T, K, block_size, 2 * K + 2>,
-                         cudaFuncAttributePreferredSharedMemoryCarveout,
-                         cudaSharedmemCarveoutMaxL1);
-    // （bs, bm, voc_parts, 2 * K + 2）
-    beam_search_softmax_topk_stage1<T, K, block_size, 2 * K + 2>
-        <<<grid, block_size, 0, stream>>>(
-            log_probs, stop_flags, end_ids, tmp_buffer, vocab_size, fuse_softmax);
-  } else {
-    cudaFuncSetAttribute(beam_search_softmax_topk_stage1<T, K, block_size, 2 * K>,
-                         cudaFuncAttributePreferredSharedMemoryCarveout,
-                         cudaSharedmemCarveoutMaxL1);
-    // （bs, bm, voc_parts, 2 * K）
-    beam_search_softmax_topk_stage1<T, K, block_size, 2 * K>
-        <<<grid, block_size, 0, stream>>>(
-            log_probs, stop_flags, end_ids, tmp_buffer, vocab_size, fuse_softmax);
-  }
-  // (bs, bm, K)
-  invokeBeamSearchSoftmaxTopKStage2<T, K>(tmp_buffer,
-                                          cum_log_probs,
-                                          tmp_ids,
-                                          tmp_vals,
-                                          batch_size,
-                                          beam_size,
-                                          voc_parts,
-                                          packed_top_kmd_size,
-                                          fuse_softmax,
-                                          length_penalty,
-                                          step_ids,
-                                          stream);
-  // (bs, bm)
-  if (early_stop) {
-    batch_topk<T, K, 32><<<batch_size, 32, 0, stream>>>(
-      tmp_ids, 
-      tmp_vals, 
-      cum_log_probs,
-      step_ids, 
-      stop_flags,
-      sequence_lengths,
-      end_ids,
-      ids, 
-      out_cum_log_probs, 
-      parent_idx,
-      stop_flags_out,
-      seq_lens_out,
-      step_ids_out);
-  } else {
-    batch_topk<T, K, 32><<<batch_size, 32, 0, stream>>>(
-      tmp_ids, 
-      tmp_vals, 
-      step_ids, 
-      stop_flags,
-      sequence_lengths,
-      end_ids,
-      ids, 
-      out_cum_log_probs, 
-      parent_idx,
-      stop_flags_out,
-      seq_lens_out,
-      step_ids_out);
-  }
+  invokeBatchTopK<T, K>(tmp_ids,
+                        tmp_vals,
+                        cum_log_probs,
+                        step_ids,
+                        stop_flags,
+                        sequence_lengths,
+                        end_ids,
+                        ids,
+                        out_cum_log_probs,
+                        parent_idx,
+                        stop_flags_out,
+                        seq_lens_out,
+                        step_ids_out,
+                        batch_size,
+                        early_stop,
+                        stream);
   invokeUpdateBeamOffset(last_beam_offsets,
                          parent_idx,
                          sequence_lengths,
@@ -822,6 +988,7 @@ void invokeTopkSoftMax(const Context &dev_ctx,
                        const bool fuse_softmax,
                        const bool early_stop,
                        const float length_penalty,
+                       const bool one_stage_topk,
                        cudaStream_t stream) {
   switch (beam_size) {
     CASE_K(1);
@@ -840,6 +1007,8 @@ void invokeTopkSoftMax(const Context &dev_ctx,
     CASE_K(14);
     CASE_K(15);
     CASE_K(16);
+    CASE_K(20);
+    CASE_K(30);
     CASE_K(50);
     default:
       PADDLE_THROW(paddle::platform::errors::Unimplemented(
@@ -863,6 +1032,7 @@ void BeamSearchSoftmaxKernel(const Context &dev_ctx,
                              bool fuse_softmax,
                              bool early_stop,
                              float length_penalty,
+                             bool one_stage_topk,
                              DenseTensor *ids_this_time,
                              DenseTensor *out_cum_scores,
                              DenseTensor *cache_ids,
@@ -895,7 +1065,12 @@ void BeamSearchSoftmaxKernel(const Context &dev_ctx,
   phi::Copy(
       dev_ctx, step_ids, dev_ctx.GetPlace(), false, step_ids_out);
 
-  const int tmp_size = batch_size * beam_size * beam_size * 2;
+  if (max_seq_len == 0) { // dynamic max_seq_len
+    const DDim& dims = last_beam_offsets.dims(); // bs, beam_size, max_seq_len + max_dec_len
+    max_seq_len = dims[2] - max_dec_len;
+  }
+
+  const int tmp_size = batch_size * beam_size * beam_size;
   DenseTensor tmp_topk_id, tmp_topk_val;
   tmp_topk_id.Resize(phi::make_ddim({tmp_size}));
   dev_ctx.template Alloc<int>(&tmp_topk_id);
@@ -929,6 +1104,7 @@ void BeamSearchSoftmaxKernel(const Context &dev_ctx,
                     fuse_softmax,
                     early_stop,
                     length_penalty,
+                    one_stage_topk,
                     dev_ctx.stream());
 }
 

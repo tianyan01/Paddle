@@ -37,17 +37,19 @@ limitations under the License. */
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/compute_occupancy.h"
 
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/epilogue_helpers.h"
-#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/ft_gemm_configs.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/gemm/device/gemm_universal_base_compat.h"
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/gemm/kernel/default_fpA_intB_traits.h"
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/gemm/kernel/fpA_intB_gemm.h"
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/gemm/threadblock/default_mma.h"
-
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/gemm_configs.h"
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/weight_only_quant_op.h"
 #pragma GCC diagnostic pop
 
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/cutlass_heuristic.h"
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/fpA_intB_gemm/autogen/arch_define.h"
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
 #include "paddle/phi/kernels/fusion/cutlass/utils/cuda_utils.h"
+
 namespace phi {
 
 template <typename T,
@@ -59,7 +61,7 @@ template <typename T,
           int Stages>
 void generic_mixed_gemm_kernelLauncher(const T* A,
                                        const WeightType* B,
-                                       const float* weight_scales,
+                                       const T* weight_scales,
                                        const T* biases,
                                        T* C,
                                        int m,
@@ -70,13 +72,14 @@ void generic_mixed_gemm_kernelLauncher(const T* A,
                                        size_t workspace_bytes,
                                        cudaStream_t stream,
                                        int* occupancy) {
+
   static_assert(cutlass::platform::is_same<T, half>::value ||
 #ifdef PADDLE_CUDA_BF16
                     cutlass::platform::is_same<T, __nv_bfloat16>::value ||
 #endif
                     cutlass::platform::is_same<T, float>::value,
                 "Specialized for bfloat16, half, float");
-
+                
   static_assert(
       cutlass::platform::is_same<T, WeightType>::value ||
           cutlass::platform::is_same<WeightType, uint8_t>::value ||
@@ -94,6 +97,8 @@ void generic_mixed_gemm_kernelLauncher(const T* A,
       cutlass::platform::is_same<ElementType_, __nv_bfloat16>::value,
       cutlass::bfloat16_t,
       ElementType_>::type;
+#else
+  using ElementType = ElementType_;
 #endif
   using CutlassWeightType_ = typename cutlass::platform::conditional<
       cutlass::platform::is_same<WeightType, half>::value,
@@ -105,6 +110,8 @@ void generic_mixed_gemm_kernelLauncher(const T* A,
       cutlass::platform::is_same<CutlassWeightType_, __nv_bfloat16>::value,
       cutlass::bfloat16_t,
       CutlassWeightType_>::type;
+#else
+  using CutlassWeightType = CutlassWeightType_;
 #endif
 
   // We need separate config for each architecture since we will target
@@ -117,6 +124,11 @@ void generic_mixed_gemm_kernelLauncher(const T* A,
                                        MixedGemmArchTraits::ElementsPerAccessC,
                                        ElementAccumulator,
                                        EpilogueTag>::Op;
+
+  using Operator = typename MixedGemmArchTraits::Operator;
+  using TaggedOperator = typename cutlass::arch::TagOperator<
+      Operator,
+      cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY>::TaggedOperator;
 
   using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemm<
       ElementType,
@@ -137,7 +149,7 @@ void generic_mixed_gemm_kernelLauncher(const T* A,
       typename cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
       Stages,
       true,
-      typename MixedGemmArchTraits::Operator>::GemmKernel;
+      TaggedOperator>::GemmKernel;
 
   using GemmKernel = cutlass::gemm::kernel::GemmFpAIntB<
       typename GemmKernel_::Mma,
@@ -151,7 +163,7 @@ void generic_mixed_gemm_kernelLauncher(const T* A,
     return;
   }
 
-  using Gemm = cutlass::gemm::device::GemmUniversalBase<GemmKernel>;
+  using Gemm = cutlass::gemm::device::GemmUniversalBaseCompat<GemmKernel>;
 
   const int ldb =
       cutlass::platform::is_same<cutlass::layout::RowMajor,
@@ -159,15 +171,24 @@ void generic_mixed_gemm_kernelLauncher(const T* A,
           ? n
           : k * GemmKernel::kInterleave;
 
+  if (weight_scales == nullptr) {
+    throw std::runtime_error(
+        "Weight scales must always be set to a non-null value.");
+  }
+
+  const int group_size = k;
+  ElementAccumulator output_op_beta =
+      (biases == nullptr) ? ElementAccumulator(0.f) : ElementAccumulator(1.f);
   typename Gemm::Arguments args(
       {m, n, k},
+      group_size,
       {reinterpret_cast<ElementType*>(const_cast<T*>(A)), k},
       {reinterpret_cast<CutlassWeightType*>(const_cast<WeightType*>(B)), ldb},
-      {reinterpret_cast<float*>(const_cast<float*>(weight_scales)), 0},
+      {reinterpret_cast<ElementType*>(const_cast<T*>(weight_scales)), 0},
       {reinterpret_cast<ElementType*>(const_cast<T*>(biases)), 0},
       {reinterpret_cast<ElementType*>(C), n},
       gemm_config.split_k_factor,
-      {ElementAccumulator(1.f), ElementAccumulator(0.f)});
+      {ElementAccumulator(1.f), output_op_beta});
 
   // This assertion is enabled because because for the column interleaved
   // layout, K MUST be a multiple of threadblockK. The reason for this is that
@@ -184,17 +205,12 @@ void generic_mixed_gemm_kernelLauncher(const T* A,
 
   Gemm gemm;
   if (gemm.get_workspace_size(args) > workspace_bytes) {
-    // TODO(wangbojun) here to reset the split-k in gemm args, but no work for
-    // now to run bf16 mixgemm, we have set the split-k factor to 1
     VLOG(1) << "Requested split-k but workspace size insufficient. Falling "
                "back to non-split-k implementation.";
-    VLOG(1) << "need workspace sizoe of: " << gemm.get_workspace_size(args)
-            << ", but got " << workspace_bytes;
-    VLOG(1) << "args.batch_stride_D:" << args.batch_stride_D;
-    VLOG(1) << "args.batch_count:" << args.batch_count;
-    // If requested split-k factor will require more workspace bytes, revert to
-    // standard gemm.
-    //
+    VLOG(1) << "Requested workspace_size: " << gemm.get_workspace_size(args);
+    VLOG(1) << "get workspace_size: " << workspace_bytes;
+    // If requested split-k factor will require more workspace bytes, revert
+    // to standard gemm.
     args.batch_count = 1;
   }
 
@@ -203,7 +219,8 @@ void generic_mixed_gemm_kernelLauncher(const T* A,
     std::string err_msg =
         "fpA_intB cutlass kernel will fail for params. Error: " +
         std::string(cutlassGetStatusString(can_implement));
-    throw std::runtime_error("[fpA_intB Runner] " + err_msg);
+    throw std::runtime_error("[fpA_intB_gemm Error][fpA_intB Runner] " +
+                             err_msg);
   }
 
   auto init_status = gemm.initialize(args, workspace, stream);
@@ -211,14 +228,16 @@ void generic_mixed_gemm_kernelLauncher(const T* A,
     std::string err_msg =
         "Failed to initialize cutlass fpA_intB gemm. Error: " +
         std::string(cutlassGetStatusString(init_status));
-    throw std::runtime_error("[fpA_intB Runner] " + err_msg);
+    throw std::runtime_error("[fpA_intB_gemm Error][fpA_intB Runner] " +
+                             err_msg);
   }
 
   auto run_status = gemm.run(stream);
   if (run_status != cutlass::Status::kSuccess) {
     std::string err_msg = "Failed to run cutlass fpA_intB gemm. Error: " +
                           std::string(cutlassGetStatusString(run_status));
-    throw std::runtime_error("[fpA_intB Runner] " + err_msg);
+    throw std::runtime_error("[fpA_intB_gemm Error][fpA_intB Runner] " +
+                             err_msg);
   }
 }
 
@@ -231,7 +250,7 @@ template <typename T,
           int Stages>
 void generic_mixed_gemm_kernelLauncher_template(const T* A,
                                                 const WeightType* B,
-                                                const float* weight_scales,
+                                                const T* weight_scales,
                                                 const T* biases,
                                                 T* C,
                                                 int m,
@@ -254,7 +273,7 @@ template <typename T,
 struct dispatch_stages {
   static void dispatch(const T* A,
                        const WeightType* B,
-                       const float* weight_scales,
+                       const T* weight_scales,
                        const T* biases,
                        T* C,
                        int m,
@@ -287,7 +306,7 @@ struct dispatch_stages<T,
                        2> {
   static void dispatch(const T* A,
                        const WeightType* B,
-                       const float* weight_scales,
+                       const T* weight_scales,
                        const T* biases,
                        T* C,
                        int m,
@@ -339,7 +358,7 @@ struct dispatch_stages<T,
                        typename std::enable_if<(Stages > 2)>::type> {
   static void dispatch(const T* A,
                        const WeightType* B,
-                       const float* weight_scales,
+                       const T* weight_scales,
                        const T* biases,
                        T* C,
                        int m,
@@ -381,7 +400,7 @@ template <typename T,
           typename WarpShape>
 void dispatch_gemm_config(const T* A,
                           const WeightType* B,
-                          const float* weight_scales,
+                          const T* weight_scales,
                           const T* biases,
                           T* C,
                           int m,
@@ -396,7 +415,7 @@ void dispatch_gemm_config(const T* A,
 template <typename T, typename WeightType, typename arch, typename EpilogueTag>
 void dispatch_gemm_to_cutlass(const T* A,
                               const WeightType* B,
-                              const float* weight_scales,
+                              const T* weight_scales,
                               const T* biases,
                               T* C,
                               int m,

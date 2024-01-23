@@ -29,10 +29,11 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 
 #pragma once
-
-#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/ft_gemm_configs.h"
+#include <unordered_map>
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/gemm_configs.h"
 // #include "src/fastertransformer/utils/allocator.h"
 #include "cuda_runtime_api.h"  // NOLINT
+#include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/activation_types.h"
 
 namespace phi {
 
@@ -52,13 +53,14 @@ namespace phi {
 
 template <typename T, typename WeightType>
 class CutlassFpAIntBGemmRunner {
+  using CutlassGemmConfigCache = typename std::unordered_map<int64_t, CutlassGemmConfig>;
  public:
   CutlassFpAIntBGemmRunner();
   ~CutlassFpAIntBGemmRunner();
 
   void gemm(const T* A,
             const WeightType* B,
-            const float* weight_scales,
+            const T* weight_scales,
             T* C,
             int m,
             int n,
@@ -69,13 +71,13 @@ class CutlassFpAIntBGemmRunner {
 
   void gemm_bias_act(const T* A,
                      const WeightType* B,
-                     const float* weight_scales,
+                     const T* weight_scales,
                      const T* biases,
                      T* C,
                      int m,
                      int n,
                      int k,
-                     std::string activation_type,
+                     ActivationType activation_type,
                      char* workspace_ptr,
                      const size_t workspace_bytes,
                      cudaStream_t stream);
@@ -87,7 +89,7 @@ class CutlassFpAIntBGemmRunner {
   template <typename EpilogueTag>
   void dispatch_to_arch(const T* A,
                         const WeightType* B,
-                        const float* weight_scales,
+                        const T* weight_scales,
                         const T* biases,
                         T* C,
                         int m,
@@ -102,7 +104,7 @@ class CutlassFpAIntBGemmRunner {
   template <typename EpilogueTag>
   void run_gemm(const T* A,
                 const WeightType* B,
-                const float* weight_scales,
+                const T* weight_scales,
                 const T* biases,
                 T* C,
                 int m,
@@ -114,9 +116,9 @@ class CutlassFpAIntBGemmRunner {
 
  private:
   static constexpr int split_k_limit = 7;
-
   int sm_;
   int multi_processor_count_;
+  CutlassGemmConfigCache config_cache_;
 };
 
 // This allocation is present to help with compiling with other structures in

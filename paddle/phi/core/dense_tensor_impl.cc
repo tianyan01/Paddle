@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 
 #include "paddle/fluid/memory/malloc.h"
+#include "paddle/fluid/memory/memcpy.h"
 #include "paddle/phi/common/bfloat16.h"
 #include "paddle/phi/common/complex.h"
 #include "paddle/phi/common/float16.h"
@@ -178,10 +179,41 @@ inline T* DenseTensor::mutable_data(const Place& place, size_t requested_size) {
                    requested_size));
 }
 
-void DenseTensor::ShareBufferWith(const DenseTensor& tensor) {
+void DenseTensor::ShareBufferWith(const DenseTensor& tensor, bool with_dtype) {
   holder_ = tensor.holder_;
   meta_.offset = tensor.meta().offset;
-  meta_.dtype = tensor.dtype();
+  if (with_dtype) {
+    meta_.dtype = tensor.dtype();
+  }
+}
+
+void DenseTensor::ShareBufferWithTensors(const std::vector<DenseTensor>& tensors) {
+  int64_t total_num = 0;
+  for(auto &t : tensors) {
+    PADDLE_ENFORCE_EQ(t.dtype(), tensors[0].meta().dtype, "data type mismatch");
+    total_num += t.numel();
+  }
+
+  size_t dtype_size = SizeOf(dtype());
+  int64_t need_mem_size = total_num * dtype_size;
+
+  auto place = tensors[0].place();
+  if (holder_ == nullptr || !(holder_->place() == place) ||
+      holder_->size() < need_mem_size + meta_.offset) {
+    holder_.reset();
+    holder_ = paddle::memory::AllocShared(place, need_mem_size);
+  }
+
+  char *ptr = reinterpret_cast<char *>(holder_->ptr());
+  int64_t offset = 0;
+  for (size_t i = 0; i < tensors.size(); ++i) {
+    DenseTensor *tensor = const_cast<DenseTensor *>(&tensors[i]);
+    int64_t data_len = tensor->numel() * dtype_size;
+    paddle::memory::Copy(place, (ptr + offset), place, tensor->data(), data_len);
+    tensor->set_offset(offset);
+    tensor->ResetHolder(holder_);
+    offset += data_len;
+  }
 }
 
 #define LEGACY_DATA_MEMBER_FUNC_INSTANTIATION(dtype)                \

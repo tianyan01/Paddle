@@ -7,29 +7,33 @@ if(WITH_NV_JETSON)
   set(paddle_known_gpu_archs "53 62 72")
   set(paddle_known_gpu_archs10 "53 62 72")
   set(paddle_known_gpu_archs11 "53 62 72 87")
+  set(paddle_known_gpu_archs12 "53 62 72 87 90")
 elseif(NEW_RELEASE_ALL)
   message("Using New Release Strategy - All Arches Packge")
   add_definitions(-DNEW_RELEASE_ALL)
-  set(paddle_known_gpu_archs "35 50 52 60 61 70 75 80 86")
-  set(paddle_known_gpu_archs10 "35 50 52 60 61 70 75")
+  set(paddle_known_gpu_archs "50 52 60 61 70 75 80 86 90")
+  set(paddle_known_gpu_archs10 "50 52 60 61 70 75")
   set(paddle_known_gpu_archs11 "50 60 61 70 75 80")
+  set(paddle_known_gpu_archs12 "50 60 61 70 75 80 90")
 elseif(NEW_RELEASE_PYPI)
   message("Using New Release Strategy - Cubin Packge")
   add_definitions(-DNEW_RELEASE_PYPI)
-  set(paddle_known_gpu_archs "35 50 52 60 61 70 75 80 86")
+  set(paddle_known_gpu_archs "50 52 60 61 70 75 80 86 90")
   set(paddle_known_gpu_archs10 "")
-  set(paddle_known_gpu_archs11 "60 61 70 75 80")
+  set(paddle_known_gpu_archs11 "61 70 75 80")
+  set(paddle_known_gpu_archs12 "61 70 75 80 90")
 elseif(NEW_RELEASE_JIT)
   message("Using New Release Strategy - JIT Packge")
   add_definitions(-DNEW_RELEASE_JIT)
-  set(paddle_known_gpu_archs "35 50 52 60 61 70 75 80 86")
-  set(paddle_known_gpu_archs10 "35 50 60 70 75")
-  set(paddle_known_gpu_archs11 "35 50 60 70 75 80")
+  set(paddle_known_gpu_archs "50 52 60 61 70 75 80 86 90")
+  set(paddle_known_gpu_archs10 "50 60 70 75")
+  set(paddle_known_gpu_archs11 "50 60 70 75 80")
+  set(paddle_known_gpu_archs12 "50 60 70 75 80 90")
 else()
-  set(paddle_known_gpu_archs "35 50 52 60 61 70 75 80")
-  set(paddle_known_gpu_archs10 "35 50 52 60 61 70 75")
-  #set(paddle_known_gpu_archs11 "52 60 61 70 75 80")
-  set(paddle_known_gpu_archs11 "70 80")
+  set(paddle_known_gpu_archs "70 80")
+  set(paddle_known_gpu_archs10 "50 52 60 61 70 75")
+  set(paddle_known_gpu_archs11 "52 60 61 70 75 80")
+  set(paddle_known_gpu_archs12 "70 80")
 endif()
 
 ######################################################################################
@@ -100,12 +104,12 @@ endfunction()
 function(select_nvcc_arch_flags out_variable out_arch_bin)
   # List of arch names
   set(archs_names
-      "Kepler"
       "Maxwell"
       "Pascal"
       "Volta"
       "Turing"
       "Ampere"
+      "Hopper"
       "All"
       "Manual")
   set(archs_name_default "Auto")
@@ -144,9 +148,7 @@ function(select_nvcc_arch_flags out_variable out_arch_bin)
     unset(CUDA_ARCH_PTX CACHE)
   endif()
 
-  if(${CUDA_ARCH_NAME} STREQUAL "Kepler")
-    set(cuda_arch_bin "30 35")
-  elseif(${CUDA_ARCH_NAME} STREQUAL "Maxwell")
+  if(${CUDA_ARCH_NAME} STREQUAL "Maxwell")
     if(WITH_NV_JETSON)
       set(cuda_arch_bin "53")
     else()
@@ -176,6 +178,8 @@ function(select_nvcc_arch_flags out_variable out_arch_bin)
         set(cuda_arch_bin "80 86")
       endif()
     endif()
+  elseif(${CUDA_ARCH_NAME} STREQUAL "Hopper")
+    set(cuda_arch_bin "90")
   elseif(${CUDA_ARCH_NAME} STREQUAL "All")
     set(cuda_arch_bin ${paddle_known_gpu_archs})
   elseif(${CUDA_ARCH_NAME} STREQUAL "Auto")
@@ -190,6 +194,13 @@ function(select_nvcc_arch_flags out_variable out_arch_bin)
     detect_installed_gpus(cuda_arch_bin)
   else() # (${CUDA_ARCH_NAME} STREQUAL "Manual")
     set(cuda_arch_bin ${CUDA_ARCH_BIN})
+  endif()
+
+  # cuda11.4
+  if(${CMAKE_CUDA_COMPILER_VERSION} LESS 11.6)
+    set(cuda_arch_bin "70 80")
+  else()
+    set(cuda_arch_bin "70 80 90")
   endif()
 
   if(NEW_RELEASE_JIT)
@@ -258,6 +269,11 @@ elseif(${CMAKE_CUDA_COMPILER_VERSION} LESS 12.0) # CUDA 11.2+
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_MWAITXINTRIN_H_INCLUDED")
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D__STRICT_ANSI__")
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-gpu-targets")
+elseif(${CMAKE_CUDA_COMPILER_VERSION} LESS 13.0) # CUDA 12.0+
+  set(paddle_known_gpu_archs "${paddle_known_gpu_archs12} 90")
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_MWAITXINTRIN_H_INCLUDED")
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D__STRICT_ANSI__")
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-gpu-targets")
 endif()
 
 if(NOT ${CMAKE_CUDA_COMPILER_VERSION} LESS 10.0)
@@ -274,10 +290,10 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${NVCC_FLAGS_EXTRA}")
 message(STATUS "NVCC_FLAGS_EXTRA: ${NVCC_FLAGS_EXTRA}, NVCC_ARCH_BIN: ${NVCC_ARCH_BIN}")
 
 # Set C++14 support
-set(CUDA_PROPAGATE_HOST_FLAGS OFF)
+set(CUDA_PROPAGATE_HOST_FLAGS ON)
 # Release/Debug flags set by cmake. Such as -O3 -g -DNDEBUG etc.
 # So, don't set these flags here.
-set(CMAKE_CUDA_STANDARD 14)
+set(CMAKE_CUDA_STANDARD 17)
 
 # (Note) For windows, if delete /W[1-4], /W1 will be added defaultly and conflic with -w
 # So replace /W[1-4] with /W0
@@ -305,6 +321,7 @@ if(WIN32)
     endforeach()
   endif()
 endif()
+message(STATUS "CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
 
 mark_as_advanced(CUDA_BUILD_CUBIN CUDA_BUILD_EMULATION CUDA_VERBOSE_BUILD)
 mark_as_advanced(CUDA_SDK_ROOT_DIR CUDA_SEPARABLE_COMPILATION)

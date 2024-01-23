@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 #include "paddle/fluid/memory/malloc.h"
 #include "paddle/fluid/platform/errors.h"
 #include "paddle/phi/api/include/tensor.h"
@@ -24,8 +23,10 @@
 #include "paddle/phi/kernels/elementwise_add_kernel.h"
 #include "paddle/phi/kernels/elementwise_multiply_kernel.h"
 #include "paddle/phi/kernels/funcs/get_pad_lse.cu.h"
+#ifdef PADDLE_WITH_MEMORY_EFFICIENT_ATTENTION
 #include "paddle/phi/kernels/fusion/cutlass/memory_efficient_attention/autogen/memory_efficient_attention.h"
 #include "paddle/phi/kernels/fusion/cutlass/memory_efficient_attention_utils.h"
+#endif
 #include "paddle/phi/kernels/matmul_kernel.h"
 #include "paddle/phi/kernels/reduce_sum_kernel.h"
 #include "paddle/phi/kernels/reshape_kernel.h"
@@ -34,9 +35,9 @@
 namespace phi {
 namespace fusion {
 namespace cutlass_internal {
-
+#ifdef PADDLE_WITH_MEMORY_EFFICIENT_ATTENTION
 using gemm_kernel_utils::getMaximumSharedMemoryPerBlockKb;
-
+#endif
 template <typename T, typename Context>
 void MemoryEfficientAttentionBackwardKernel(
     const Context& ctx,
@@ -59,6 +60,7 @@ void MemoryEfficientAttentionBackwardKernel(
     DenseTensor* key_grad,
     DenseTensor* value_grad,
     DenseTensor* bias_grad) {
+#ifdef PADDLE_WITH_MEMORY_EFFICIENT_ATTENTION
   bool kernel_launched = false;
 
   auto launchKernel = [&](auto k_, auto kernel_fn) {
@@ -550,12 +552,13 @@ void MemoryEfficientAttentionBackwardKernel(
                 p.getThreadsGrid(),
                 smem_bytes,
                 ctx.stream()>>>(p);
-  };
+  };f
   dispatch_cutlass_backward<T>(ctx, launchKernel);
   PADDLE_ENFORCE_EQ(kernel_launched,
                     true,
                     paddle::platform::errors::InvalidArgument(
                         "the kernel should not be launched"));
+#endif
 }
 
 }  // namespace cutlass_internal
