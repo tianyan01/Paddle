@@ -144,7 +144,7 @@ public:
       FragmentCompute const& scale, // scale, float
       FragmentSource const& bias, // fp16
       bool is_print_debug) const {
-    // conver accum from int32 to fp32
+    // convert accum from int32 to fp32
     NumericArrayConverter<ElementCompute, ElementAccumulator, kCount, kRound> accumulator_converter;
     FragmentCompute converted_accumulator = accumulator_converter(accumulator);
     FragmentOutput intermediate; // fp16
