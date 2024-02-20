@@ -175,18 +175,6 @@ void FusedGroupedMatMul(const phi::GPUContext& dev_ctx,
     offset += cur_m * k;
   };
 
-  // group_quantize_kernel_launcher(input,
-  //                               input_tmp->data<int8_t>(),
-  //                               quant_in_scale,
-  //                               fwd_expert_count,
-  //                               num_expert,
-  //                               m,
-  //                               k,
-  //                               quant_round_type,
-  //                               quant_max_bound,
-  //                               quant_min_bound,
-  //                               dev_ctx.stream());
-
   using half_dtype = typename phi::PDDataTypeTraits<paddle::platform::float16>::DataType;
   auto moe_gemm_runner = phi::PTQMoeGemmRunner<half_dtype>();
   // int8 gemm & dequant & add biad & act(optional)
