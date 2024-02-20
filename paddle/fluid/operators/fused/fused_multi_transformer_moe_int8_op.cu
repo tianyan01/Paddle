@@ -47,7 +47,7 @@ static void PrintMatrix(const T *mat_d, int num, std::string name) {
   outfile << ss.str();
   outfile.close();
 }
-// #define _DEBUG_FUSED_MULTI_TRANSFORMER
+
 inline bool CheckFlashAttn(const phi::GPUContext &dev_ctx,
                            const phi::DenseTensor &x) {
   int dev = dev_ctx.GetPlace().GetDeviceId();
@@ -113,7 +113,15 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     auto expert_weight2_out_scales =
         ctx.MultiInput<Tensor>("ExpertWeight2OutScale");
 
+    bool encoder_remove_padding = false;
     auto *sequence_lengths = ctx.Input<Tensor>("SeqLengths");
+    if (sequence_lengths && !time_step) {
+      encoder_remove_padding = true;
+    }
+    Tensor d_token_tensor;
+    Tensor padding_offset_tensor;
+    Tensor x_remove_padding;
+    int token_num = 0;
 
     auto *beam_cache_offset = ctx.Input<Tensor>("BeamCacheOffset");
     int beam_size = 1;
@@ -123,6 +131,38 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 
     auto *out = ctx.Output<Tensor>("Out");
     auto *from_data = dev_ctx.Alloc<T>(out, out->numel() * sizeof(T));
+    // Init out & remove padding in encoder
+    if (encoder_remove_padding) {
+      InitValue(dev_ctx, from_data, out->numel(), static_cast<T>(0.));
+      // just for encoder
+      d_token_tensor.Resize({{1}});
+      auto *d_token_num = dev_ctx.Alloc<int>(
+          &d_token_tensor, d_token_tensor.numel() * sizeof(int));
+      // alloc the max size of padding_offset_tensor
+      padding_offset_tensor.Resize({{bsz_seq}});
+      dev_ctx.Alloc<int>(&padding_offset_tensor,
+                         padding_offset_tensor.numel() * sizeof(int));
+      InvokeGetPaddingOffset(dev_ctx,
+                             &token_num,
+                             d_token_num,
+                             padding_offset_tensor.data<int>(),
+                             sequence_lengths->data<int>(),
+                             bsz,
+                             seq_len);
+      padding_offset_tensor.Resize({{token_num}});
+      x_remove_padding.Resize({{token_num, dim_embed}});
+      dev_ctx.Alloc<T>(&x_remove_padding, x_remove_padding.numel() * sizeof(T));
+      InvokeRemovePadding(dev_ctx,
+                          x_remove_padding.data<T>(),
+                          input_x->data<T>(),
+                          padding_offset_tensor.data<int>(),
+                          token_num,
+                          dim_embed);
+    } else {
+      token_num = bsz_seq;
+    }
+    auto *padding_offset_data =
+        encoder_remove_padding ? padding_offset_tensor.data<int>() : nullptr;
 
     // 1. layer norm
     const auto pre_layer_norm = ctx.Attr<bool>("pre_layer_norm");
@@ -136,12 +176,12 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
 
     // in type is T, out type is int8_t
     auto ln_compute =
-        AttnLayerNorm<T, T, int8_t>(dev_ctx, epsilon, bsz_seq, dim_embed);
+        AttnLayerNorm<T, T, int8_t>(dev_ctx, epsilon, token_num, dim_embed);
     Tensor ln_mean, ln_var;
-    ln_mean.Resize({{bsz_seq}});
+    ln_mean.Resize({{token_num}});
     auto *ln_mean_data =
         dev_ctx.Alloc<U>(&ln_mean, ln_mean.numel() * sizeof(U));
-    ln_var.Resize({{bsz_seq}});
+    ln_var.Resize({{token_num}});
     auto *ln_var_data = dev_ctx.Alloc<U>(&ln_var, ln_var.numel() * sizeof(U));
 
     // 2. qkv
@@ -160,9 +200,9 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     bool compute_bias = qkv_biases.size() > 0 && time_step == nullptr;
     // (transA, transB, compute_bias) = (false, trans_qkvw, false)
     AttnMatmulINT8<T> qkv_compute(
-        dev_ctx, bsz_seq, output_size, input_size, compute_bias);
+        dev_ctx, token_num, output_size, input_size, false);
     Tensor qkv_out;
-    qkv_out.Resize({{bsz, seq_len, 3, num_head, dim_head}});
+    qkv_out.Resize({{bsz_seq, 3, num_head, dim_head}}); // token_num
     auto *qkv_out_data =
         dev_ctx.Alloc<T>(&qkv_out, qkv_out.numel() * sizeof(T));
 
@@ -190,6 +230,17 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     transpose_out_2.Resize({{3, bsz, num_head, seq_len, dim_head}});
     auto *transpose_out_2_data =
         dev_ctx.Alloc<T>(&transpose_out_2, transpose_out_2.numel() * sizeof(T));
+    auto *q_transpose_out_data = transpose_out_2_data;
+    auto *kv_transpose_out_data = transpose_out_2_data + bsz * seq_len * dim_embed;
+
+    Tensor q_transpose_out = transpose_out_2.Slice(0, 1);
+
+    if (encoder_remove_padding) {
+      InitValue(dev_ctx,
+                transpose_out_2_data,
+                transpose_out_2.numel(),
+                static_cast<T>(0.));
+    }
 
     Tensor softmax_out;
     Tensor attn_dropout_mask_out, attn_dropout_out;
@@ -206,6 +257,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       auto *qktv_out_data =
           dev_ctx.Alloc<T>(&qktv_out, qktv_out.numel() * sizeof(T));
     }
+
     fmha_out.Resize({{bsz, seq_len, num_head, dim_head}});
     auto *fmha_out_data =
         dev_ctx.Alloc<T>(&fmha_out, fmha_out.numel() * sizeof(T));
@@ -216,7 +268,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     int ring_id = ctx.Attr<int>("ring_id");
     // (transA, transB, compute_bias) = (false, false, false)
     AttnMatmulINT8<T> out_linear_compute(
-        dev_ctx, bsz_seq, dim_embed, hidden_size, false);
+        dev_ctx, token_num, dim_embed, hidden_size, false);
 
     // 5. ln(residual + bias)
     DropoutParam dropout_param(false, 0, true, true, 0.0, nullptr, 0);
@@ -226,7 +278,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     auto ffn_ln_biases = ctx.MultiInput<Tensor>("FFNLnBias");
     Tensor bias_dropout_residual_out, dropout_mask_out;
     T *bias_dropout_residual_out_data = nullptr;
-    bias_dropout_residual_out.Resize({{bsz_seq, dim_embed}});
+    bias_dropout_residual_out.Resize({{token_num, dim_embed}});
     bias_dropout_residual_out_data =
         dev_ctx.Alloc<T>(&bias_dropout_residual_out,
                          bias_dropout_residual_out.numel() * sizeof(T));
@@ -248,15 +300,19 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     int world_size = ctx.Attr<int>("world_size");
     int moe_ring_id = ctx.Attr<int>("moe_ring_id");
     bool approximate = ctx.Attr<bool>("approximate");
+    if (encoder_remove_padding) {
+      PADDLE_ENFORCE_EQ(mp_size, 1,
+                      "When encoder remove padding, mp_size should be 1!");
+    }
 
     int tot_expert = world_size * num_expert;
     // after slice, bsz_seq should be change
-    int sliced_bsz_seq = bsz_seq;
+    int sliced_bsz_seq = token_num;
     int start = 0;
     int end = 0;
     if (mp_size > 1) {
-      start = bsz_seq / world_size * mp_rank;
-      end = std::min(start + bsz_seq / world_size, bsz_seq);
+      start = token_num / world_size * mp_rank;
+      end = std::min(start + token_num / world_size, token_num);
       sliced_bsz_seq = end - start;
     }
     int out_batch_size = sliced_bsz_seq * topk;
@@ -319,7 +375,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     bmm_out.Resize({{sliced_bsz_seq, 1, dim_embed}});
     dev_ctx.Alloc<T>(&bmm_out, bmm_out.numel() * sizeof(T));
     Tensor all_gather_out;
-    all_gather_out.Resize({{bsz_seq, dim_embed}});
+    all_gather_out.Resize({{token_num, dim_embed}});
     dev_ctx.Alloc<T>(&all_gather_out, all_gather_out.numel() * sizeof(T));
 
     // moe nccl
@@ -328,7 +384,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
     // []. init workspace for cublasLt transform
     Tensor input_workspace, output_workspace, cublaslt_workspace;
     // for input and output transform data is CUBLASLT_ORDER_COL32 format,
-    int m_max = bsz_seq, k_max = std::max({dim_embed, dim_feedforward}),
+    int m_max = token_num, k_max = std::max({dim_embed, dim_feedforward}),
         n_max = std::max({output_size, dim_embed, dim_feedforward});
     // maybe need to change the size of workspace here
 
@@ -345,13 +401,20 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
                           cublaslt_workspace.numel() * sizeof(int8_t));
 
     // calc
-    Tensor buf0, moe_out;
-    buf0.Resize({{bsz_seq, dim_embed}});
+    Tensor buf0;
+    buf0.Resize({{token_num, dim_embed}});
     dev_ctx.Alloc<T>(&buf0, buf0.numel() * sizeof(T));
-    moe_out.ShareDataWith(*out);
-    moe_out.Resize({{bsz_seq, dim_embed}});
-    const T *x_data = input_x->data<T>();
-    
+
+    Tensor *moe_out = nullptr;
+    if (encoder_remove_padding) {
+      moe_out = &buf0;
+    } else {
+      moe_out = out;
+      moe_out->Resize({{token_num, dim_embed}});
+    }
+
+    const T *x_data = encoder_remove_padding ? x_remove_padding.data<T>() : input_x->data<T>();
+
 #ifdef DEBUG_MOE_TMPROFILE_INT8
     dev_ctx.Wait();
     other_tm.Pause();
@@ -421,10 +484,10 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       // step3. fmha
       const Tensor *cache_kv = cache_kvs.size() > 0 ? cache_kvs[i] : nullptr;
       Tensor *cache_kv_out = cache_kv ? cache_kv_outs[i] : nullptr;
+      // [2, batch_size, num_head, max_seq_len, head_size]
+      int max_seq_len = cache_kv->dims()[3];
 
       if (time_step) {  // generation decoder stage
-        // [2, batch_size, num_head, max_seq_len, head_size]
-        int max_seq_len = cache_kv->dims()[3];
         fmha<T>(dev_ctx,
                 qkv_out,
                 *qkv_bias,
@@ -442,63 +505,77 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
                 time_step_cpu,
                 0,
                 1. / sqrt(dim_head));
-      } else if (cache_kv_out) {  // generation context stage
-        if (is_support_flash_attn) {
-          fmha_fa_compute.ComputeForward(qkv_out,
-                                         nullptr,
-                                         src_mask,
-                                         &transpose_out_2,
-                                         nullptr,
-                                         &softmax_out,  // softmax_lse_out
-                                         &attn_dropout_mask_out,  // seek_offset
-                                         &attn_dropout_out,       // softmax_out
-                                         &fmha_out);
-          // input: [bs, seq_len, 3, num_head, head_dim]
-          // output: [3, bs, num_head, seq_len, head_dim]
-          std::vector<int> perm_1 = {2, 0, 3, 1, 4};
-          transpose_out_2.Resize({{3, bsz, num_head, seq_len, dim_head}});
-          TransposeGPUKernelDriver<T>(
-              dev_ctx, qkv_out, perm_1, &transpose_out_2);
-        } else {
-          fmha_compute.ComputeForward(qkv_out,
-                                      nullptr,
-                                      src_mask,
-                                      &transpose_out_2,
-                                      nullptr,
-                                      &qk_out,
-                                      nullptr,
-                                      &softmax_out,
-                                      &attn_dropout_mask_out,
-                                      &attn_dropout_out,
-                                      &qktv_out,
-                                      &fmha_out);
-        }
-        // [3, bsz, num_head, seq_len, head_dim]
-        T *qkv_data = transpose_out_2_data;
-        int64_t q_size = bsz * seq_len * num_head * dim_head;
-        int64_t k_size = q_size;
-        const T *q_ptr = qkv_data;
-        const T *k_ptr = q_ptr + q_size;
-        const T *v_ptr = k_ptr + k_size;
+      } else if (cache_kv_out) {  // generation context stage, encoder
+        // transpose(qkv_out + qkv_bias)
+        qkv_bias_add_transpose_split<T>(dev_ctx,
+                                        q_transpose_out_data,
+                                        kv_transpose_out_data,
+                                        qkv_out_data,
+                                        qkv_bias->data<T>(),
+                                        padding_offset_data,
+                                        token_num,
+                                        bsz,
+                                        num_head,
+                                        seq_len,
+                                        dim_head,
+                                        compute_bias);
+        // first write cache kv
+        // const T *q_ptr = q_transpose_out_data;
+        const T *k_ptr = kv_transpose_out_data;
+        const T *v_ptr = k_ptr + bsz * seq_len * num_head * dim_head;;
 
-        // [2, bsz, num_head, max_seq_len, head_dim]
-        int max_seq_len = cache_kv_out->dims()[3];
         T *cache_kv_data = cache_kv_out->data<T>();
         int64_t cache_k_size = bsz * num_head * max_seq_len * dim_head;
 
         T *cache_k_ptr = cache_kv_data;
         T *cache_v_ptr = cache_kv_data + cache_k_size;
 
+        const int *sequence_lengths_data =
+            encoder_remove_padding ? sequence_lengths->data<int>() : nullptr;
         write_cache_kv<T>(dev_ctx,
                           cache_k_ptr,
                           cache_v_ptr,
                           k_ptr,
                           v_ptr,
+                          sequence_lengths_data,
                           bsz,
                           num_head,
                           seq_len,
                           max_seq_len,
                           dim_head);
+        phi::DenseTensor *tmp_padding_offset_tensor =
+            encoder_remove_padding ? &padding_offset_tensor : nullptr;
+        // compute q * kt * v
+        if (is_support_flash_attn) {
+          qkv_out.Resize({{3, bsz, seq_len, num_head, dim_head}});
+          fmha_fa_compute.RemovePaddingComputeForward(src_mask,
+                                                      tmp_padding_offset_tensor,
+                                                      &transpose_out_2,
+                                                      &qkv_out,       // real input
+                                                      &softmax_out,  // softmax_lse_out
+                                                      &attn_dropout_mask_out,  // seek_offset
+                                                      &attn_dropout_out,       // softmax_out
+                                                      &q_transpose_out,        // tmp buf
+                                                      &fmha_out,     // output
+                                                      token_num);
+        } else {
+          // Tensor q_transpose_out = transpose_out_2.Slice(0, 1);
+          Tensor kv_transpose_out = transpose_out_2.Slice(1, 3);
+          fmha_compute.ComputeForwardWithoutTranspose(nullptr,
+                                                      src_mask,
+                                                      tmp_padding_offset_tensor,
+                                                      &q_transpose_out,
+                                                      &kv_transpose_out,
+                                                      nullptr,
+                                                      &qk_out,
+                                                      nullptr,
+                                                      &softmax_out,
+                                                      &attn_dropout_mask_out,
+                                                      &attn_dropout_out,
+                                                      &qktv_out,
+                                                      &fmha_out,
+                                                      token_num);
+        }
       } else {  // not generation
         VLOG(0) << "not support!";
       }
@@ -553,14 +630,14 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
           bias_dropout_residual_out_data,
           0.0f,
           dim_embed);
-      // 改为输出先不做scale，输出是fp16，输出到buf0
+      // 改为输出先不做scale，输出是fp16，输出到buf0 [token_num, dim_emb]
       AffineQuantStore<T, LayerNormComputeType, T, false, true> store(
           buf0.data<T>(), dim_embed, ln_scale_data, ln_bias_data);
       DispatchLayerNorm<decltype(load), decltype(store), LayerNormComputeType>(
           dev_ctx.stream(),
           load,
           store,
-          bsz_seq,
+          token_num,
           dim_embed,
           epsilon,
           ln_mean_data,
@@ -899,7 +976,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
             nullptr,
             bias_dropout_residual_out_data,
             nullptr,
-            moe_out.data<T>(),
+            moe_out->data<T>(),
             0.0f,
             dim_embed);
         AffineQuantStore<int8_t, LayerNormComputeType, T, true, true> store(
@@ -916,7 +993,7 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
                           LayerNormComputeType>(dev_ctx.stream(),
                                                 load,
                                                 store,
-                                                bsz_seq,
+                                                token_num,
                                                 dim_embed,
                                                 epsilon,
                                                 ln_mean_data,
@@ -928,14 +1005,22 @@ class FusedMultiTransformerMoeINT8OpKernel : public framework::OpKernel<T> {
       } else {
         // last layer, only add residual, T
         phi::AddKernel<T, phi::GPUContext>(
-            dev_ctx, all_gather_out, bias_dropout_residual_out, &moe_out);
+            dev_ctx, all_gather_out, bias_dropout_residual_out, moe_out);
       }
-      x_data = moe_out.data<T>();
+      x_data = moe_out->data<T>();
 #ifdef DEBUG_MOE_TMPROFILE_INT8
       dev_ctx.Wait();
       trans_tm.Pause();
 #endif
     }  // end for layer loop
+    if (encoder_remove_padding) {
+      InvokeRebuildPadding(dev_ctx,
+                           from_data,
+                           moe_out->data<T>(),
+                           padding_offset_data,
+                           token_num,
+                           dim_embed);
+    }
     out->Resize({{bsz, seq_len, dim_embed}});
 #ifdef DEBUG_MOE_TMPROFILE_INT8
     dev_ctx.Wait();
